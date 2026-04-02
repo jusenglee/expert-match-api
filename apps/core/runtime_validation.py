@@ -21,8 +21,8 @@ def validate_runtime_settings(settings: Settings) -> None:
     if settings.strict_runtime_validation:
         if settings.llm_backend != "openai_compat":
             raise RuntimeError("운영전용 모드에서는 NTIS_LLM_BACKEND=openai_compat 이어야 합니다.")
-        if settings.embedding_backend != "openai":
-            raise RuntimeError("운영전용 모드에서는 NTIS_EMBEDDING_BACKEND=openai 이어야 합니다.")
+        if settings.embedding_backend not in ("openai", "local"):
+            raise RuntimeError("운영전용 모드에서는 NTIS_EMBEDDING_BACKEND가 openai 또는 local이어야 합니다.")
         if settings.seed_on_startup:
             raise RuntimeError("운영전용 모드에서는 seed_on_startup을 사용할 수 없습니다.")
 
@@ -32,20 +32,26 @@ class RuntimeDependencyValidator:
         self.settings = settings
 
     def validate_backends(self) -> list[BackendCheckResult]:
-        return [
+        results = [
             self._validate_openai_compatible_backend(
                 name="llm_backend",
                 base_url=self.settings.llm_base_url,
                 api_key=self.settings.llm_api_key,
                 model_name=self.settings.llm_model_name,
-            ),
-            self._validate_openai_compatible_backend(
-                name="embedding_backend",
-                base_url=self.settings.embedding_base_url,
-                api_key=self.settings.embedding_api_key,
-                model_name=self.settings.embedding_model_name,
-            ),
+            )
         ]
+        if self.settings.embedding_backend == "openai":
+            results.append(
+                self._validate_openai_compatible_backend(
+                    name="embedding_backend",
+                    base_url=self.settings.embedding_base_url,
+                    api_key=self.settings.embedding_api_key,
+                    model_name=self.settings.embedding_model_name,
+                )
+            )
+        elif self.settings.embedding_backend == "local":
+            results.append(BackendCheckResult(name="embedding_backend", ok=True, detail="local sentence-transformer model in use"))
+        return results
 
     def _validate_openai_compatible_backend(
         self,

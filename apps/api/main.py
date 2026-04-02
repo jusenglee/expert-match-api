@@ -45,6 +45,12 @@ def build_dense_encoder(settings: Settings):
             base_url=settings.embedding_base_url,
             api_key=settings.embedding_api_key,
         )
+    elif settings.embedding_backend == "local":
+        from apps.search.encoders import LocalSentenceTransformerEncoder
+        return LocalSentenceTransformerEncoder(
+            model_name=settings.embedding_model_name,
+            vector_size=settings.embedding_vector_size,
+        )
     return HashingDenseEncoder(
         # 로컬 기본값은 deterministic hashing encoder다.
         # 실제 의미 임베딩을 대체하는 것은 아니고, seed/tests를 외부 모델 없이 돌리기 위한 장치다.

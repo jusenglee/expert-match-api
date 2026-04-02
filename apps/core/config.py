@@ -22,12 +22,12 @@ class Settings(BaseSettings):
     qdrant_cloud_inference: bool = False
 
     llm_backend: Literal["heuristic", "openai_compat"] = "openai_compat"
-    llm_base_url: str = "http://localhost:8010/v1"
+    llm_base_url: str = "http://203.250.234.159:8010/v1"
     llm_api_key: str = "EMPTY"
     llm_model_name: str = "/model"
 
-    embedding_backend: Literal["hashing", "openai"] = "openai"
-    embedding_base_url: str = "http://localhost:8011/v1"
+    embedding_backend: Literal["hashing", "openai", "local"] = "local"
+    embedding_base_url: str = "http://203.250.234.159:8011/v1"
     embedding_api_key: str = "EMPTY"
     embedding_model_name: str = "intfloat/multilingual-e5-large-instruct"
     embedding_vector_size: int = 1024

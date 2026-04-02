@@ -47,3 +47,21 @@ class OpenAIEmbeddingEncoder:
                 f"expected {self.vector_size}, got {len(vector)}"
             )
         return vector
+
+@dataclass(slots=True)
+class LocalSentenceTransformerEncoder:
+    model_name: str
+    vector_size: int
+
+    def __post_init__(self) -> None:
+        from sentence_transformers import SentenceTransformer
+        self._model = SentenceTransformer(self.model_name)
+
+    def embed(self, text: str) -> list[float]:
+        vector = self._model.encode(text).tolist()
+        if len(vector) != self.vector_size:
+            raise ValueError(
+                f"Embedding dimension mismatch for {self.model_name}: "
+                f"expected {self.vector_size}, got {len(vector)}"
+            )
+        return vector
