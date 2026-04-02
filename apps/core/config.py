@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     api_prefix: str = ""
     strict_runtime_validation: bool = True
 
-    qdrant_url: str = "http://localhost:6333"
+    qdrant_url: str = "http://203.250.234.159:8005"
     qdrant_api_key: str | None = None
     qdrant_collection_name: str = "expert_master"
     qdrant_cloud_inference: bool = False
