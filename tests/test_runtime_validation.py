@@ -47,7 +47,7 @@ class FakeQdrantClient:
             for field_name, schema_name in PAYLOAD_INDEX_FIELDS
         }
         if missing_index:
-            payload_schema.pop("pjt[].stan_yr")
+            payload_schema.pop("research_projects[].reference_year")
         self.collection_info = SimpleNamespace(
             config=SimpleNamespace(params=SimpleNamespace(vectors=dense_vectors, sparse_vectors=sparse_vectors)),
             payload_schema=payload_schema,
@@ -61,11 +61,11 @@ class FakeQdrantClient:
         if self.no_points:
             return [], None
         payload = {
-            "doc_id": "11008395",
-            "blng_org_nm_exact": "주식회사미소테크",
-            "art": [{"paper_nm": "테스트 논문", "jrnl_pub_dt": "2024-09-01", "sci_slct_nm": "SCIE"}],
-            "pat": [{"ipr_invention_nm": "테스트 특허", "aply_dt": "2024-06-01"}],
-            "pjt": [{"title1": "테스트 과제", "start_dt": "2019-10-07", "end_dt": "2020-04-06", "stan_yr": 2019}],
+            "basic_info": {"researcher_id": "11008395", "affiliated_organization_exact": "주식회사미소테크"},
+            "researcher_profile": {},
+            "publications": [{"publication_title": "테스트 논문", "publication_year_month": "2024-09-01", "journal_index_type": "SCIE"}],
+            "intellectual_properties": [{"intellectual_property_title": "테스트 특허", "application_date": "2024-06-01"}],
+            "research_projects": [{"project_title_korean": "테스트 과제", "project_start_date": "2019-10-07", "project_end_date": "2020-04-06", "reference_year": 2019}],
         }
         return [SimpleNamespace(id="11008395", payload=payload)], None
 

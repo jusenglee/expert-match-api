@@ -23,42 +23,43 @@ class CandidateCardBuilder:
 
     def _build_card(self, hit: SearchHit, hard_filters: dict[str, object]) -> CandidateCard:
         payload = hit.payload
-        top_papers = sorted(payload.art, key=lambda item: _date_key(item.jrnl_pub_dt), reverse=True)[:2]
-        top_patents = sorted(payload.pat, key=lambda item: _date_key(item.regist_dt or item.aply_dt), reverse=True)[:1]
-        top_projects = sorted(payload.pjt, key=lambda item: _date_key(item.end_dt or item.start_dt), reverse=True)[:2]
+        top_papers = sorted(payload.publications, key=lambda item: _date_key(item.publication_year_month), reverse=True)[:2]
+        top_patents = sorted(payload.intellectual_properties, key=lambda item: _date_key(item.registration_date or item.application_date), reverse=True)[:1]
+        top_projects = sorted(payload.research_projects, key=lambda item: _date_key(item.project_end_date or item.project_start_date), reverse=True)[:2]
 
         matched_filter_summary = []
+        # Fallback dictionary mappings for legacy filters if any
         if hard_filters.get("degree_slct_nm"):
-            matched_filter_summary.append(f"학위 조건 충족: {payload.degree_slct_nm or '미확인'}")
+            matched_filter_summary.append(f"학위 조건 충족: {payload.researcher_profile.highest_degree or '미확인'}")
         if hard_filters.get("art_sci_slct_nm") == "SCIE":
-            matched_filter_summary.append(f"SCIE 수: {payload.scie_cnt}")
+            matched_filter_summary.append(f"SCIE 수: {payload.researcher_profile.scie_publication_count}")
         if hard_filters.get("project_cnt_min") is not None:
-            matched_filter_summary.append(f"과제 수: {payload.project_cnt}")
+            matched_filter_summary.append(f"과제 수: {payload.researcher_profile.research_project_count}")
 
         risks = []
         data_gaps = []
-        if not payload.art:
+        if not payload.publications:
             data_gaps.append("논문 근거 부족")
-        if not payload.pat:
+        if not payload.intellectual_properties:
             data_gaps.append("특허 근거 부족")
-        if not payload.pjt:
+        if not payload.research_projects:
             data_gaps.append("과제 근거 부족")
         if len(data_gaps) >= 2:
             risks.append("근거 영역이 편중되어 있음")
 
         return CandidateCard(
-            expert_id=payload.doc_id,
-            name=payload.hm_nm,
-            organization=payload.blng_org_nm,
-            position=payload.position_nm,
-            degree=payload.degree_slct_nm,
-            major=payload.major_slct_nm,
+            expert_id=payload.basic_info.researcher_id,
+            name=payload.basic_info.researcher_name,
+            organization=payload.basic_info.affiliated_organization,
+            position=payload.basic_info.position_title,
+            degree=payload.researcher_profile.highest_degree,
+            major=payload.researcher_profile.major_field,
             branch_coverage=hit.branch_coverage,
             counts={
-                "article_cnt": payload.article_cnt,
-                "scie_cnt": payload.scie_cnt,
-                "patent_cnt": payload.patent_cnt,
-                "project_cnt": payload.project_cnt,
+                "article_cnt": payload.researcher_profile.publication_count,
+                "scie_cnt": payload.researcher_profile.scie_publication_count,
+                "patent_cnt": payload.researcher_profile.intellectual_property_count,
+                "project_cnt": payload.researcher_profile.research_project_count,
             },
             top_papers=top_papers,
             top_patents=top_patents,

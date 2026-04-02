@@ -21,5 +21,5 @@ def test_filter_compiler_builds_nested_filters_and_org_exclusion():
     assert compiled.must is not None
     assert compiled.must_not is not None
     assert any(isinstance(item, models.NestedCondition) for item in compiled.must)
-    assert any(getattr(item, "key", None) == "degree_slct_nm" for item in compiled.must if hasattr(item, "key"))
-    assert any(getattr(item, "key", None) == "blng_org_nm_exact" for item in compiled.must_not if hasattr(item, "key"))
+    assert any(getattr(item, "key", None) == "researcher_profile.highest_degree" for item in compiled.must if hasattr(item, "key"))
+    assert any(getattr(item, "key", None) == "basic_info.affiliated_organization_exact" for item in compiled.must_not if hasattr(item, "key"))

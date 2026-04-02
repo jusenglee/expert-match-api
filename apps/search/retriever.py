@@ -89,13 +89,13 @@ class QdrantHybridRetriever:
             # 실제 payload 안에 해당 근거가 존재하는지를 coverage로 요약한다.
             branch_coverage = {
                 "basic": True,
-                "art": bool(payload.art),
-                "pat": bool(payload.pat),
-                "pjt": bool(payload.pjt),
+                "art": bool(payload.publications),
+                "pat": bool(payload.intellectual_properties),
+                "pjt": bool(payload.research_projects),
             }
             hits.append(
                 SearchHit(
-                    expert_id=payload.doc_id,
+                    expert_id=payload.basic_info.researcher_id,
                     score=float(getattr(point, "score", 0.0)),
                     payload=payload,
                     branch_coverage=branch_coverage,

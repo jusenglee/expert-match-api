@@ -19,17 +19,23 @@ class QdrantFilterCompiler:
             values = degree if isinstance(degree, list) else [degree]
             must.append(
                 models.FieldCondition(
-                    key="degree_slct_nm",
+                    key="researcher_profile.highest_degree",
                     match=models.MatchAny(any=values),
                 )
             )
 
-        for field_name in ("article_cnt", "scie_cnt", "patent_cnt", "project_cnt"):
+        counts_mapping = {
+            "article_cnt": "researcher_profile.publication_count",
+            "scie_cnt": "researcher_profile.scie_publication_count",
+            "patent_cnt": "researcher_profile.intellectual_property_count",
+            "project_cnt": "researcher_profile.research_project_count",
+        }
+        for field_name, backend_key in counts_mapping.items():
             min_value = hard_filters.get(f"{field_name}_min")
             if min_value is not None:
                 must.append(
                     models.FieldCondition(
-                        key=field_name,
+                        key=backend_key,
                         range=models.Range(gte=min_value),
                     )
                 )
@@ -38,24 +44,22 @@ class QdrantFilterCompiler:
         scie_required = hard_filters.get("art_sci_slct_nm")
         if recent_years or scie_required:
             art_must: list[models.Condition] = []
-            # 논문 조건은 같은 art[] 객체에 동시에 걸려야 한다.
-            # 그래야 "SCIE인 논문"과 "최근 논문"이 서로 다른 항목인 경우를 막을 수 있다.
             if scie_required:
                 art_must.append(
-                    models.FieldCondition(key="sci_slct_nm", match=models.MatchValue(value=scie_required))
+                    models.FieldCondition(key="journal_index_type", match=models.MatchValue(value=scie_required))
                 )
             if recent_years:
                 cutoff = f"{datetime.now(UTC).year - int(recent_years)}-01-01"
                 art_must.append(
                     models.FieldCondition(
-                        key="jrnl_pub_dt",
+                        key="publication_year_month",
                         range=models.DatetimeRange(gte=cutoff),
                     )
                 )
             must.append(
                 models.NestedCondition(
                     nested=models.Nested(
-                        key="art",
+                        key="publications",
                         filter=models.Filter(must=art_must),
                     )
                 )
@@ -68,7 +72,7 @@ class QdrantFilterCompiler:
             if pat_regist_type:
                 pat_must.append(
                     models.FieldCondition(
-                        key="ipr_regist_type_nm",
+                        key="application_registration_type",
                         match=models.MatchValue(value=pat_regist_type),
                     )
                 )
@@ -76,14 +80,14 @@ class QdrantFilterCompiler:
                 cutoff = f"{datetime.now(UTC).year - int(pat_recent_years)}-01-01"
                 pat_must.append(
                     models.FieldCondition(
-                        key="aply_dt",
+                        key="application_date",
                         range=models.DatetimeRange(gte=cutoff),
                     )
                 )
             must.append(
                 models.NestedCondition(
                     nested=models.Nested(
-                        key="pat",
+                        key="intellectual_properties",
                         filter=models.Filter(must=pat_must),
                     )
                 )
@@ -95,11 +99,11 @@ class QdrantFilterCompiler:
             must.append(
                 models.NestedCondition(
                     nested=models.Nested(
-                        key="pjt",
+                        key="research_projects",
                         filter=models.Filter(
                             must=[
                                 models.FieldCondition(
-                                    key="end_dt",
+                                    key="project_end_date",
                                     range=models.DatetimeRange(gte=cutoff),
                                 )
                             ]
@@ -111,10 +115,9 @@ class QdrantFilterCompiler:
         for org in exclude_orgs:
             normalized = normalize_org_name(org)
             if normalized:
-                # 기관 제외는 exact 필터로 처리해야 운영자가 예측 가능하다.
                 must_not.append(
                     models.FieldCondition(
-                        key="blng_org_nm_exact",
+                        key="basic_info.affiliated_organization_exact",
                         match=models.MatchValue(value=normalized),
                     )
                 )

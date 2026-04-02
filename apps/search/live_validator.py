@@ -135,31 +135,31 @@ class LiveContractValidator:
         sample_payload = sample.payload or {}
         sample_point_id = str(getattr(sample, "id", None))
 
-        required_root = {"doc_id", "blng_org_nm_exact"}
+        required_root = {"basic_info", "researcher_profile"}
         checks["sample_root_fields"] = required_root.issubset(sample_payload.keys())
         if not checks["sample_root_fields"]:
             issues.append("sample point의 root 필수 필드가 부족합니다.")
 
-        checks["sample_art_present"] = bool(sample_payload.get("art"))
-        checks["sample_pat_present"] = bool(sample_payload.get("pat"))
-        checks["sample_pjt_present"] = bool(sample_payload.get("pjt"))
-        if not checks["sample_art_present"]:
-            issues.append("sample point에 논문 근거 art[]가 없습니다.")
-        if not checks["sample_pat_present"]:
-            issues.append("sample point에 특허 근거 pat[]가 없습니다.")
-        if not checks["sample_pjt_present"]:
-            issues.append("sample point에 과제 근거 pjt[]가 없습니다.")
+        checks["sample_art_present"] = "publications" in sample_payload
+        checks["sample_pat_present"] = "intellectual_properties" in sample_payload
+        checks["sample_pjt_present"] = "research_projects" in sample_payload
+        if not checks["sample_art_present"] or not sample_payload.get("publications"):
+            issues.append("sample point에 논문 근거 publications[]가 없습니다.")
+        if not checks["sample_pat_present"] or not sample_payload.get("intellectual_properties"):
+            issues.append("sample point에 특허 근거 intellectual_properties[]가 없습니다.")
+        if not checks["sample_pjt_present"] or not sample_payload.get("research_projects"):
+            issues.append("sample point에 과제 근거 research_projects[]가 없습니다.")
 
-        pjt_items = sample_payload.get("pjt") or []
+        pjt_items = sample_payload.get("research_projects") or []
         checks["sample_project_dates_valid"] = bool(
             pjt_items
             and all(
-                all(key in item and item.get(key) not in (None, "") for key in ("start_dt", "end_dt", "stan_yr"))
+                all(key in item and item.get(key) not in (None, "") for key in ("project_start_date", "project_end_date", "reference_year"))
                 for item in pjt_items
             )
         )
         if not checks["sample_project_dates_valid"]:
-            issues.append("sample point의 pjt 날짜 필드(start_dt/end_dt/stan_yr)가 정합하지 않습니다.")
+            issues.append("sample point의 pjt 날짜 필드(project_start_date/project_end_date/reference_year)가 정합하지 않습니다.")
 
         ready = all(checks.values())
         return LiveValidationReport(

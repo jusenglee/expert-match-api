@@ -29,19 +29,23 @@ def test_retriever_always_builds_four_branch_prefetches():
         retrieval_limit=40,
     )
     payload = {
-        "doc_id": "1",
-        "hm_nm": "홍길동",
-        "blng_org_nm": "테스트기관",
-        "blng_org_nm_exact": "테스트기관",
-        "degree_slct_nm": "박사",
-        "major_slct_nm": "AI",
-        "article_cnt": 1,
-        "scie_cnt": 1,
-        "patent_cnt": 1,
-        "project_cnt": 1,
-        "art": [{"paper_nm": "테스트 논문"}],
-        "pat": [{"ipr_invention_nm": "테스트 특허"}],
-        "pjt": [{"title1": "테스트 과제"}],
+        "basic_info": {
+            "researcher_id": "1",
+            "researcher_name": "홍길동",
+            "affiliated_organization": "테스트기관",
+            "affiliated_organization_exact": "테스트기관",
+        },
+        "researcher_profile": {
+            "highest_degree": "박사",
+            "major_field": "AI",
+            "publication_count": 1,
+            "scie_publication_count": 1,
+            "intellectual_property_count": 1,
+            "research_project_count": 1,
+        },
+        "publications": [{"publication_title": "테스트 논문"}],
+        "intellectual_properties": [{"intellectual_property_title": "테스트 특허"}],
+        "research_projects": [{"project_title_korean": "테스트 과제"}],
     }
     client = FakeQdrantClient(payload=payload)
     retriever = QdrantHybridRetriever(

@@ -11,6 +11,13 @@ Qdrant 하이브리드 검색과 LLM 추천 판단을 결합한 평가위원 추
 - `GET /health/ready`: 실데이터 연동 readiness 확인
 - `ntis-validate-live`: 운영 반입 데이터 계약 검증 CLI
 
+## 문서 길잡이
+
+- [SERVICE_FLOW.md](/D:/Project/python_project/Ntis_person_API/docs/SERVICE_FLOW.md): 비개발자도 읽을 수 있는 서비스 동작 설명 문서
+- [CONTRACT.md](/D:/Project/python_project/Ntis_person_API/docs/CONTRACT.md): API, planner, judge, payload 계약 문서
+- [RUNBOOK.md](/D:/Project/python_project/Ntis_person_API/docs/RUNBOOK.md): 실데이터 반입 후 운영 점검 절차
+- [ENVIRONMENT.md](/D:/Project/python_project/Ntis_person_API/docs/ENVIRONMENT.md): 필수 환경변수와 운영 모드 설정
+
 ## 운영 기준
 
 - Qdrant `v1.16.0`
@@ -44,4 +51,3 @@ Qdrant 하이브리드 검색과 LLM 추천 판단을 결합한 평가위원 추
 8. `/search/candidates`, `/recommend` smoke test
 
 세부 절차는 [RUNBOOK.md](/D:/Project/python_project/Ntis_person_API/docs/RUNBOOK.md)를 참고한다.
-
