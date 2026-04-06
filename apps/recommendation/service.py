@@ -8,6 +8,7 @@ from apps.domain.models import CandidateCard, JudgeOutput, PlannerOutput, Recomm
 from apps.recommendation.cards import CandidateCardBuilder
 from apps.recommendation.judge import Judge
 from apps.recommendation.planner import Planner
+from apps.core.timer import Timer
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import BRANCHES
@@ -43,18 +44,19 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
-        logger.info("전문가 후보 검색 단계 시작: 질의=%r", query)
-        plan = await self.planner.plan(
-            query=query,
-            filters_override=filters_override,
-            exclude_orgs=exclude_orgs,
-            top_k=top_k,
-        )
-        logger.info("질의 분석 완료: 의도=%r 필터=%r", plan.intent_summary, plan.hard_filters)
+        with Timer() as t_plan:
+            plan = await self.planner.plan(
+                query=query,
+                filters_override=filters_override,
+                exclude_orgs=exclude_orgs,
+                top_k=top_k,
+            )
+        logger.info("질의 분석 완료: 소요시간=%.2fms 의도=%r 필터=%r", t_plan.elapsed_ms, plan.intent_summary, plan.hard_filters)
         
         query_filter = self.filter_compiler.compile(plan.hard_filters, plan.exclude_orgs)
-        retrieval = await self.retriever.search(query=query, plan=plan, query_filter=query_filter)
-        logger.info("검색 완료: 검색된 히트 수=%d", len(retrieval.hits))
+        with Timer() as t_search:
+            retrieval = await self.retriever.search(query=query, plan=plan, query_filter=query_filter)
+        logger.info("검색 완료: 소요시간=%.2fms 검색된 히트 수=%d", t_search.elapsed_ms, len(retrieval.hits))
         
         cards = self.card_builder.build_small_cards(retrieval.hits, plan)
         return {
@@ -75,12 +77,13 @@ class RecommendationService:
         top_k: int | None = None,
     ) -> dict[str, Any]:
         logger.info("전체 추천 프로세스 시작: 질의=%r", query)
-        search_result = await self.search_candidates(
-            query=query,
-            filters_override=filters_override,
-            exclude_orgs=exclude_orgs,
-            top_k=top_k,
-        )
+        with Timer() as t_total:
+            search_result = await self.search_candidates(
+                query=query,
+                filters_override=filters_override,
+                exclude_orgs=exclude_orgs,
+                top_k=top_k,
+            )
 
         plan: PlannerOutput = search_result["planner"]
         candidate_cards: list[CandidateCard] = search_result["candidates"]
@@ -107,7 +110,8 @@ class RecommendationService:
             )
 
         logger.info("최종 판정(Judging) 단계 시작: 압축 후보 수=%d", len(shortlist))
-        judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
+        with Timer() as t_judge:
+            judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
         
         evidence_less_count = sum(1 for item in judge_output.recommended if not item.evidence)
         recommendations = [item for item in judge_output.recommended if item.evidence]
@@ -124,10 +128,10 @@ class RecommendationService:
                 ["근거가 충분한 추천 결과를 생성하지 못했습니다."],
             )
 
-        logger.info("추천 프로세스 완료: 질의=%r 최종 추천=%d명 (근거 부족 제외=%d명)", 
-                    query, len(recommendations), evidence_less_count)
+        logger.info("추천 프로세스 완료: 질의=%r 최종 추천=%d명 (근거 부족 제외=%d명) 소요시간(Judge)=%.2fms", 
+                    query, len(recommendations), evidence_less_count, t_judge.elapsed_ms)
 
-        return self._build_recommendation_response(
+        result = self._build_recommendation_response(
             plan=plan,
             candidate_cards=candidate_cards,
             query_payload=search_result["query_payload"],
@@ -137,6 +141,8 @@ class RecommendationService:
             data_gaps=judge_output.data_gaps,
             not_selected_reasons=not_selected_reasons,
         )
+        logger.info("전체 추천 프로세스 종료: 총 소요시간=%.2fms", t_total.elapsed_ms)
+        return result
 
     def save_feedback(
         self,

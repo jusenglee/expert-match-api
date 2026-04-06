@@ -132,7 +132,16 @@ class QdrantFilterCompiler:
                 )
             )
 
-        # 6. 제외 기관 명단 처리 (정확한 기관명 매칭을 통한 제외)
+        # 6. 전공(major_nm) 필터 처리 (부분 일치)
+        if major := hard_filters.get("major_nm"):
+            must.append(
+                models.FieldCondition(
+                    key="researcher_profile.major_field",
+                    match=models.MatchText(text=major),
+                )
+            )
+
+        # 7. 제외 기관 명단 처리 (정확한 기관명 매칭을 통한 제외)
         for org in exclude_orgs:
             normalized = normalize_org_name(org)
             if normalized:

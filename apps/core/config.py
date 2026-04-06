@@ -77,12 +77,12 @@ class Settings(BaseSettings):
     hf_hub_offline: bool = True
 
     # 검색 및 추천 오케스트레이션 파라미터
-    branch_prefetch_limit: int = 80  # 각 브랜치별 초기 검색 수
+    branch_prefetch_limit: int = 200  # 각 브랜치별 초기 검색 수
     branch_output_limit: int = 50  # RRF 결합 후 브랜치별 출력 수
-    retrieval_limit: int = 40  # 최종 리트리벌 결과 수
-    shortlist_limit: int = 10  # 심사에 전달할 후보자 수
-    final_recommendation_min: int = 3  # 최소 추천 인원
-    final_recommendation_max: int = 5  # 최대 추천 인원
+    retrieval_limit: int = 80  # 최종 리트리벌 결과 수
+    shortlist_limit: int = 40  # 심사에 전달할 후보자 수
+    final_recommendation_min: int = 1  # 최소 추천 인원
+    final_recommendation_max: int = 20  # 최대 추천 인원
 
     # 런타임 저장소 및 피드백 DB 설정
     runtime_dir: Path = Field(default_factory=lambda: Path("runtime"))

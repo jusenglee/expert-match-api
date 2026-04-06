@@ -89,13 +89,19 @@ def build_source_texts(payload: ExpertPayload) -> tuple[str, str, str, str]:
     전문가 페이로드를 바탕으로 4가지 브랜치(기본, 논문, 특허, 과제)별 벡터화용 텍스트를 생성합니다.
     각 텍스트는 해당 브랜치의 Dense/Sparse 벡터 생성을 위한 원천 데이터로 사용됩니다.
     """
-    # 1. 기본 정보 텍스트 (이름, 소속, 전공 등)
+    # 1. 기본 정보 텍스트 (이름, 소속, 전공, 평가위원 활동 등)
+    eval_activities = [
+        f"위원회: {act.committee_nm or ''} (기관: {act.appoint_org_nm or ''})"
+        for act in payload.evaluation_activities
+    ]
     basic_parts = [
         f"이름: {payload.basic_info.researcher_name}",
         f"소속기관: {payload.basic_info.affiliated_organization or ''}",
         f"직위: {payload.basic_info.position_title or ''}",
         f"학위: {payload.researcher_profile.highest_degree or ''}",
         f"전공: {payload.researcher_profile.major_field or ''}",
+        f"심사평가위원 활동: {', '.join(eval_activities)}",
+        f"심사참여건수: {payload.evaluation_activity_cnt}",
     ]
     # 2. 논문 실적 요약 텍스트
     art_parts = [

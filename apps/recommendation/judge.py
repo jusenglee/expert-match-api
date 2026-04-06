@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from apps.core.config import Settings
 from apps.core.openai_compat_llm import OpenAICompatChatModel
+from apps.core.timer import Timer
 from apps.domain.models import CandidateCard, EvidenceItem, JudgeOutput, PlannerOutput, RecommendationDecision
 
 logger = logging.getLogger(__name__)
@@ -147,12 +148,12 @@ def _normalize_judge_payload(payload: Any, shortlist: list[CandidateCard]) -> tu
                 normalized_item["fit"] = stripped_fit
                 normalized_applied = True
 
-        relevance_score = normalized_item.get("relevance_score")
-        if relevance_score is None and expert_id:
+        rank_score = normalized_item.get("rank_score")
+        if rank_score is None and expert_id:
             # 카드에서 점수 복원
             card = next((c for c in shortlist if c.expert_id == expert_id), None)
             if card:
-                normalized_item["relevance_score"] = card.relevance_score
+                normalized_item["rank_score"] = card.rank_score
                 normalized_applied = True
 
         normalized_recommended.append(normalized_item)
@@ -176,8 +177,8 @@ class HeuristicJudge:
             reasons: list[str] = []
             evidence: list[EvidenceItem] = []
 
-            if card.branch_coverage.get("art"):
-                reasons.append("논문 근거가 확인됩니다.")
+            if card.branch_presence_flags.get("art"):
+                reasons.append("논문실적(데이터) 존재가 확인됩니다.")
                 if card.top_papers:
                     evidence.append(
                         EvidenceItem(
@@ -188,8 +189,8 @@ class HeuristicJudge:
                         )
                     )
 
-            if card.branch_coverage.get("pat"):
-                reasons.append("특허 근거가 확인됩니다.")
+            if card.branch_presence_flags.get("pat"):
+                reasons.append("특허실적(데이터) 존재가 확인됩니다.")
                 if card.top_patents:
                     evidence.append(
                         EvidenceItem(
@@ -200,8 +201,8 @@ class HeuristicJudge:
                         )
                     )
 
-            if card.branch_coverage.get("pjt"):
-                reasons.append("과제 수행 근거가 확인됩니다.")
+            if card.branch_presence_flags.get("pjt"):
+                reasons.append("과제수행(데이터) 존재가 확인됩니다.")
                 if card.top_projects:
                     evidence.append(
                         EvidenceItem(
@@ -212,8 +213,8 @@ class HeuristicJudge:
                         )
                     )
 
-            if card.branch_coverage.get("basic"):
-                reasons.append("전문가 프로필 적합성이 확인됩니다.")
+            if card.branch_presence_flags.get("basic"):
+                reasons.append("전문가 프로필(데이터) 존재가 확인됩니다.")
                 evidence.append(
                     EvidenceItem(
                         type="profile",
@@ -234,7 +235,7 @@ class HeuristicJudge:
                     fit=fit,
                     reasons=reasons[:3],
                     evidence=evidence[:4],
-                    relevance_score=card.relevance_score,
+                    rank_score=card.rank_score,
                 )
             )
 
@@ -281,7 +282,7 @@ class OpenAICompatJudge:
                     }
                   ],
                   "risks": ["risk"],
-                  "relevance_score": 0.0
+                  "rank_score": 0.0
                 }
               ],
               "not_selected_reasons": ["reason"],
@@ -289,6 +290,8 @@ class OpenAICompatJudge:
             }
 
             Rules:
+            - IMPORTANT: `rank_score` is a RELATIVE score within this search result (RRF-based), not an absolute suitability percentage. Do not misuse it as a probability.
+            - IMPORTANT: `branch_presence_flags` only indicate that data exists in that branch. It does not guarantee a perfect match. Verify exact suitability from `top_papers`, `top_patents`, etc.
             - Copy `expert_id` exactly from the shortlist input.
             - Every recommendation must include `rank`, `expert_id`, `name`, `fit`, `reasons`, `evidence`, and `risks`.
             - `reasons`, `risks`, `not_selected_reasons`, and `data_gaps` must always be arrays of strings, never a single string.
@@ -305,11 +308,13 @@ class OpenAICompatJudge:
         normalized_recommendation_count = 0
         try:
             logger.info("LLM 최종 판정(Judging) 시작: 후보 수=%d", len(shortlist))
-            result = await self.model.ainvoke_non_stream(
-                [SystemMessage(content=system_prompt), HumanMessage(content=json.dumps(user_payload, ensure_ascii=False))]
-            )
+            with Timer() as t:
+                result = await self.model.ainvoke_non_stream(
+                    [SystemMessage(content=system_prompt), HumanMessage(content=json.dumps(user_payload, ensure_ascii=False))]
+                )
             json_text = _extract_json_object_text(result.content)
-            logger.debug("LLM 응답 텍스트(추출됨): %s", json_text)
+            logger.info("LLM 응답 수신 완료: 소요시간=%.2fms", t.elapsed_ms)
+            logger.info("LLM 응답 텍스트(추출됨): %s", json_text)
             
             raw_payload = json.loads(json_text)
             normalized_payload, normalized_applied = _normalize_judge_payload(raw_payload, shortlist)

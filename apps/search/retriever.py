@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
 from apps.core.config import Settings
+from apps.core.timer import Timer
 from apps.domain.models import ExpertPayload, PlannerOutput, SearchHit
 from apps.search.encoders import DenseEncoder
 from apps.search.query_builder import QueryTextBuilder
@@ -77,12 +78,21 @@ class QdrantHybridRetriever:
 
         # 2. 각 데이터 브랜치별로 Prefetch 쿼리 조립
         for branch in BRANCHES:
+            # 브랜치 가중치가 0이면 아예 검색에서 제외 (데이터 노이즈 제거)
+            weight = plan.branch_weights.get(branch, 1.0)
+            if weight <= 0.0:
+                logger.info("브랜치 검색 스킵 (가중치 0): %s", branch)
+                continue
+
             # 의미론적 검색을 위한 Dense 임베딩 생성
             dense_query = self.dense_encoder.embed(branch_queries[branch])
             # 키워드 검색을 위한 Sparse 쿼리 구성 (BM25 로컬 인코딩)
             sparse_query = models.Document(
                 text=branch_queries[branch], model=self.settings.bm25_model_name
             )
+
+            # 가중치에 따라 브랜치별 노출 제한 조정 (RRF 특성상 가중치 부여가 어려우므로 limit으로 조절)
+            branch_limit = max(1, int(self.settings.branch_output_limit * weight))
 
             # 브랜치 레벨 RRF: Dense와 Sparse 결과를 합침
             prefetches.append(
@@ -100,7 +110,7 @@ class QdrantHybridRetriever:
                         ),
                     ],
                     query=models.FusionQuery(fusion=models.Fusion.RRF),
-                    limit=self.settings.branch_output_limit,
+                    limit=branch_limit,
                 )
             )
 
@@ -121,7 +131,9 @@ class QdrantHybridRetriever:
             self.settings.qdrant_collection_name,
             "예" if query_filter else "아니오",
         )
-        points = await asyncio.to_thread(self.client.query_points, **query_payload)
+        with Timer() as t:
+            points = await asyncio.to_thread(self.client.query_points, **query_payload)
+        logger.info("Qdrant 검색 완료: 소요시간=%.2fms", t.elapsed_ms)
 
         hits: list[SearchHit] = []
         skipped_invalid_payloads = 0
@@ -149,8 +161,8 @@ class QdrantHybridRetriever:
                 )
                 continue
 
-            # 브랜치 커버리지 분석: 실제 데이터 유무 확인
-            branch_coverage = {
+            # 브랜치별 데이터 존재 여부 확인 (실제 검색 기여도와는 다를 수 있음에 유의)
+            data_presence_flags = {
                 "basic": True,
                 "art": bool(payload.publications),
                 "pat": bool(payload.intellectual_properties),
@@ -162,7 +174,7 @@ class QdrantHybridRetriever:
                     expert_id=payload.basic_info.researcher_id,
                     score=float(getattr(point, "score", 0.0)),
                     payload=payload,
-                    branch_coverage=branch_coverage,
+                    data_presence_flags=data_presence_flags,
                 )
             )
 

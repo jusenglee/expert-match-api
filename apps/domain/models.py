@@ -195,6 +195,7 @@ class PlannerOutput(BaseModel):
     exclude_orgs: list[str] = Field(default_factory=list)
     soft_preferences: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
+    branch_weights: dict[BranchName, float] = Field(default_factory=dict)
     branch_query_hints: dict[BranchName, str] = Field(default_factory=dict)
     top_k: int = 5
 
@@ -203,7 +204,7 @@ class SearchHit(BaseModel):
     expert_id: str
     score: float
     payload: ExpertPayload
-    branch_coverage: dict[BranchName, bool] = Field(default_factory=dict)
+    data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
 
 class EvidenceItem(BaseModel):
@@ -220,7 +221,7 @@ class CandidateCard(BaseModel):
     position: str | None = None
     degree: str | None = None
     major: str | None = None
-    branch_coverage: dict[BranchName, bool] = Field(default_factory=dict)
+    branch_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
     keyword_matched_counts: dict[str, int] = Field(default_factory=dict)
     top_papers: list[PublicationEvidence] = Field(default_factory=list)
@@ -230,7 +231,7 @@ class CandidateCard(BaseModel):
     risks: list[str] = Field(default_factory=list)
     data_gaps: list[str] = Field(default_factory=list)
     shortlist_score: float = 0.0
-    relevance_score: float = 0.0
+    rank_score: float = 0.0
 
 
 class RecommendationDecision(BaseModel):
@@ -241,7 +242,7 @@ class RecommendationDecision(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
-    relevance_score: float = 0.0
+    rank_score: float = 0.0
 
 
 class JudgeOutput(BaseModel):

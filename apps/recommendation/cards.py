@@ -21,27 +21,29 @@ class CandidateCardBuilder:
     """
     def build_small_cards(self, hits: list[SearchHit], plan: PlannerOutput) -> list[CandidateCard]:
         """
-        검색된 히트 리스트를 카드 리스트로 변환하고, 적합도 점수(relevance_score)를 정규화하여 부여합니다.
+        검색된 히트 리스트를 카드 리스트로 변환하고, 순위 점수(rank_score)를 정규화하여 부여합니다.
+        
+        주의: rank_score는 절대적인 적합도 점수가 아니라, 현재 검색 결과 내에서의 상대적인 순위 점수(RRF 기반)입니다.
         """
         if not hits:
             return []
 
         cards = [self._build_card(hit, plan) for hit in hits]
         
-        # 1. 적합도 정규화 (최대 점수 = 100점)
+        # 1. 순위 점수 정규화 (최대 점수 = 100점)
         max_rrf_score = max(hit.score for hit in hits) if hits else 0
         
         for i, card in enumerate(cards):
-            # Qdrant RRF 점수를 100점 만점으로 환산
+            # Qdrant RRF 점수를 100점 만점으로 환산 (상대적 서열)
             raw_score = hits[i].score
             normalized_score = (raw_score / max_rrf_score * 100) if max_rrf_score > 0 else 0
             
-            card.relevance_score = round(float(normalized_score), 1)
-            # 현재는 적합도만 제공하기로 했으므로 shortlist_score도 적합도로 통일
-            card.shortlist_score = card.relevance_score
+            card.rank_score = round(float(normalized_score), 1)
+            # 숏리스트 산정용 점수도 현재는 순위 점수를 그대로 사용
+            card.shortlist_score = card.rank_score
             
-        # 적합도 점수 높은 순으로 정렬
-        return sorted(cards, key=lambda item: item.relevance_score, reverse=True)
+        # 점수 높은 순으로 정렬
+        return sorted(cards, key=lambda item: item.rank_score, reverse=True)
 
     def shortlist(self, cards: list[CandidateCard], limit: int) -> list[CandidateCard]:
         """정렬된 카드 목록에서 상위 N명을 추출하여 숏리스트를 구성합니다."""
@@ -73,8 +75,6 @@ class CandidateCardBuilder:
                     for kw in keywords:
                         if kw in content:
                             score += 1
-                            # 이미 제목에서 카운트했더라도 통계에는 합산 (혹은 중복 제거 전략 선택 가능)
-                            # 여기서는 단순히 해당 기술 키워드가 얼마나 언급되는지 빈도로 집계
                 
                 # 날짜 키 추출
                 date_val = ""
@@ -132,7 +132,7 @@ class CandidateCardBuilder:
             position=payload.basic_info.position_title,
             degree=payload.researcher_profile.highest_degree,
             major=payload.researcher_profile.major_field,
-            branch_coverage=hit.branch_coverage,
+            branch_presence_flags=hit.data_presence_flags,
             counts={
                 "article_cnt": payload.researcher_profile.publication_count,
                 "scie_cnt": payload.researcher_profile.scie_publication_count,

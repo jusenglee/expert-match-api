@@ -92,6 +92,13 @@ class HeuristicPlanner:
             "pat": "특허와 사업화 키워드 중심으로 질의를 정제한다.",
             "pjt": "과제수행과 전문기관 경험 중심으로 질의를 정제한다.",
         }
+        # 기본 가중치는 모두 1.0
+        branch_weights = {
+            "basic": 1.0,
+            "art": 1.0,
+            "pat": 1.0,
+            "pjt": 1.0,
+        }
         soft_preferences: list[str] = []
 
         # '최근 N년' 패턴 매칭
@@ -99,6 +106,7 @@ class HeuristicPlanner:
         if recent_match:
             years = int(recent_match.group(1))
             hard_filters.setdefault("art_recent_years", years)
+            hard_filters.setdefault("pat_recent_years", years)  # 특허도 명시적으로 포함
             hard_filters.setdefault("pjt_recent_years", years)
             soft_preferences.append(f"최근 {years}년 실적")
 
@@ -113,21 +121,25 @@ class HeuristicPlanner:
         elif "석사" in query:
             hard_filters.setdefault("degree_slct_nm", ["석사", "박사"])
 
-        # 특정 실적 존재 여부 매칭 및 브랜치 힌트 보강
+        # 특정 실적 존재 여부 매칭 및 브랜치 가중치 조정
         if "특허" in query:
             hard_filters.setdefault("patent_cnt_min", 1)
             branch_hints["pat"] = "발명명, 등록 특허, 사업화 가능성 중심으로 정제한다."
+            branch_weights["pat"] = 1.0
+            branch_weights["art"] = 0.5  # 특허 강조 시 논문 비중 축소
             soft_preferences.append("특허 근거 선호")
 
         if "논문" in query:
             hard_filters.setdefault("article_cnt_min", 1)
             branch_hints["art"] = "논문명, 키워드, 초록, 학술지 중심으로 정제한다."
+            branch_weights["art"] = 1.0
 
         if "과제" in query or "연구수행" in query:
             hard_filters.setdefault("project_cnt_min", 1)
             branch_hints["pjt"] = "과제명, 목표, 내용, 수행기관 중심으로 정제한다."
+            branch_weights["pjt"] = 1.0
 
-        # '~제외' 패턴을 통한 제외 기관 추출
+        # '~제외' 패턴을 통한 제외 기관 추출 (강한 배제)
         exclude_patterns = re.findall(r"([A-Za-z가-힣0-9()주식회사㈜]+)\s*제외", query)
         for item in exclude_patterns:
             if item not in exclude_list:
@@ -145,6 +157,7 @@ class HeuristicPlanner:
             hard_filters=hard_filters,
             exclude_orgs=exclude_list,
             soft_preferences=soft_preferences,
+            branch_weights=branch_weights,
             branch_query_hints=branch_hints,
             top_k=top_k or 5,
         )
@@ -180,47 +193,42 @@ class OpenAICompatPlanner:
             네 역할은 사용자의 자연어 질의를 분석하여, 검색 엔진이 즉시 실행 가능한 정밀한 검색 플랜(PlannerOutput)을 JSON 형태로 단 한 번에 생성하는 것이다.
             
             ### [제약 사항 및 필터링 규칙]
-            1. **부정어와 긍정어의 엄격한 분리**: 
-               - "~제외", "~안 봐도 됨", "~소속 제외"와 같은 표현이 나오면 해당 대상은 반드시 `exclude_orgs` 리스트에 넣는다.
-               - 긍정적인 조건(예: "~소속인", "~특허가 있는")은 `hard_filters`의 해당 필드에 매핑한다. 
-               - 동일한 대상이 긍정과 부정에 동시에 존재해서는 안 된다.
+            1. **배제(Exclusion)와 무관(Irrelevance)의 구분**: 
+               - "X 제외", "X 소속 빼고", "X는 안 됨" -> `exclude_orgs`에 추가 (강력한 필터링).
+               - "X는 안 봐도 됨", "X는 중요하지 않음", "X는 상관없음" -> `exclude_orgs`에 넣지 마라. 대신 `soft_preferences`에 기록하거나 무시하라.
             
-            2. **수치 및 기간 표현의 정규화**:
-               - "작년부터", "최근 2년" 등 상대적 기간은 현재 연도를 기준으로 정수형(Integer) 값으로 변환하여 `art_recent_years` 또는 `pjt_recent_years`에 할당한다. (예: "최근 3년" -> 3)
-               - "최근"이라는 모호한 표현만 있고 수치가 없으면 기본값인 5를 할당한다.
+            2. **데이터 브랜치별 가중치 결정 (branch_weights)**:
+               - 질의의 의도에 따라 4개 브랜치(basic, art, pat, pjt)의 가중치(0.0 ~ 1.0)를 결정하라.
+               - 기본값은 모든 브랜치 1.0이다.
+               - 예: "특허 위주로" -> pat: 1.0, art: 0.3, basic: 0.5, pjt: 0.3
             
-            3. **증거 필터링용 핵심 키워드 추출 (core_keywords)**:
-               - 질의에서 실적(논문/특허/과제) 필터링에 사용할 가장 핵심적인 기술/분야 명사 키워드 2~3개를 추출하여 `core_keywords` 배열에 담는다. (예: ["자율주행", "인공지능"])
-               - 이 키워드들은 나중에 실적 데이터의 제목이나 초록에서 부분 일치(Substring) 매칭용으로 사용되므로, 너무 길지 않은 핵심 명사 위주로 뽑는다.
+            3. **수치 및 기간 표현의 정규화**:
+               - "최근 3년" 등 상대적 기간은 현재 연도를 기준으로 정수형 값(3)으로 변환하여 `art_recent_years`, `pat_recent_years`, `pjt_recent_years` 중 해당하는 필드에 할당한다. 
+               - 특정 브랜치 언급이 없으면 실적 관련(art, pat, pjt) 3개 필드 모두에 할당하라.
 
             4. **추가 조건 및 검색 힌트**:
                - 사용자가 명시하지 않은 조건(성별, 나이, 특정 지역 등)을 추측하여 `hard_filters`에 추가하지 마라.
                - `hard_filters`에는 오직 `art_recent_years`, `pjt_recent_years`, `patent_cnt_min`, `article_cnt_min`, `project_cnt_min`, `degree_slct_nm`, `major_nm` 키만 사용 가능하다.
                - 각 브랜치(basic, art, pat, pjt)의 특성에 맞는 전문 용어와 동의어를 사용하여 검색어 보정 힌트를 생성하라.
 
-            ### [출력 스키마 가이드]
-            - `intent_summary`: 사용자의 전체 질의 의도를 한 문장으로 요약.
-            - `core_keywords`: 실적 필터링용 핵심 기술 명사 리스트.
-            - `hard_filters`: 필수 조건들을 key-value 쌍으로 구성.
-            - `exclude_orgs`: 제외할 기관명들에서 조사를 제거한 순수 명사 리스트.
-            - `soft_preferences`: 사용자가 선호하는 특징 리스트.
-            - `branch_query_hints`: 각 브랜치별 검색 품질을 높이기 위한 확장 키워드 문자열.
-            - `top_k`: 추천 인원수. 기본값 5.
+            ### [출력 스키마]
+            - `intent_summary`: 질의 요약.
+            - `core_keywords`: 기술 키워드 리스트.
+            - `hard_filters`: 필수 조건.
+            - `exclude_orgs`: 강제 배제 기관 리스트.
+            - `branch_weights`: 브랜치별 가중치 (basic, art, pat, pjt).
+            - `branch_query_hints`: 브랜치별 검색어 확장 힌트.
+            - `top_k`: 인원수.
             
-            ### [입력 질의 처리 예시]
-            질의: "서울대학교 소속은 제외하고, 인공지능 분야에서 최근 3년간 특허가 2건 이상 있는 박사급 전문가 10명 추천해줘."
+            ### [입력 예시]
+            질의: "서울대 제외하고, 인공지능 분야에서 최근 3년간 특허가 있는 박사 10명 추천해."
             결과: {
-              "intent_summary": "서울대를 제외한 인공지능 분야의 최근 3년 내 2건 이상 특허를 보유한 박사급 전문가 추천",
-              "core_keywords": ["인공지능", "머신러닝"],
-              "hard_filters": {"degree_slct_nm": "박사", "patent_cnt_min": 2, "art_recent_years": 3},
+              "intent_summary": "서울대를 제외한 AI 분야 최근 3년 특허 보유 박사 추천",
+              "core_keywords": ["인공지능", "AI"],
+              "hard_filters": {"degree_slct_nm": "박사", "patent_cnt_min": 1, "pat_recent_years": 3, "art_recent_years": 3},
               "exclude_orgs": ["서울대학교"],
-              "soft_preferences": ["인공지능 분야 전문성"],
-              "branch_query_hints": {
-                "basic": "인공지능 전문가 박사",
-                "art": "AI, Machine Learning, Deep Learning 연구",
-                "pat": "인공지능 알고리즘, 신경망 시스템, 데이터 처리 특허",
-                "pjt": "인공지능 국가 과제, R&D 프로젝트"
-              },
+              "branch_weights": {"pat": 1.0, "art": 0.6, "basic": 0.8, "pjt": 0.4},
+              "branch_query_hints": {"pat": "AI, 신경망 특허", "art": "컴퓨터 비전, 자연어 처리 논문", "basic": "인공지능 전공", "pjt": "IT R&D 과제"},
               "top_k": 10
             }
             
