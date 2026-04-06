@@ -56,6 +56,10 @@ Planner behavior:
 }
 ```
 
+Judge behavior:
+
+- If the LLM judge output is not valid `JudgeOutput`, the runtime falls back to the heuristic judge.
+
 ## API
 
 ### `POST /recommend`

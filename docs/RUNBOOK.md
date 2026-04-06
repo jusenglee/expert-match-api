@@ -97,6 +97,7 @@ Useful runtime logs include:
 
 - planner JSON
 - planner fallback activation details
+- judge fallback activation details
 - branch query text
 - applied hard filters
 - exclude_orgs

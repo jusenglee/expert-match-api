@@ -1,3 +1,9 @@
+"""
+사용자의 자연어 질의를 분석하여 검색 계획(Plan)을 수립하는 모듈입니다.
+LLM을 사용하여 의도를 파악하고 적절한 검색 필터와 힌트를 생성하거나,
+LLM 사용이 불가능할 경우 규칙 기반(Heuristic)으로 대안을 제시합니다.
+"""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_json_object_text(content: Any) -> str:
+    """
+    LLM 응답 텍스트에서 JSON 객체 부분만 추출합니다.
+    마크다운 코드 블록(```json ... ```)이나 불필요한 앞뒤 텍스트를 제거합니다.
+    """
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -32,10 +42,12 @@ def _extract_json_object_text(content: Any) -> str:
         text = str(content)
 
     text = text.strip()
+    # 마크다운 코드 블록 제거
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
 
+    # 가장 바깥쪽 중괄호({}) 찾기
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and start < end:
@@ -44,6 +56,7 @@ def _extract_json_object_text(content: Any) -> str:
 
 
 class Planner(Protocol):
+    """검색 계획을 수립하는 플래너의 인터페이스 정의입니다."""
     async def plan(
         self,
         *,
@@ -52,10 +65,15 @@ class Planner(Protocol):
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> PlannerOutput:
+        """자연어 질의를 분석하여 검색 파라미터를 생성합니다."""
         ...
 
 
 class HeuristicPlanner:
+    """
+    규칙 기반(정규표현식 등)으로 검색 계획을 수립하는 플래너입니다.
+    주로 테스트용이거나 LLM 장애 시 Fallback용으로 사용됩니다.
+    """
     async def plan(
         self,
         *,
@@ -76,6 +94,7 @@ class HeuristicPlanner:
         }
         soft_preferences: list[str] = []
 
+        # '최근 N년' 패턴 매칭
         recent_match = re.search(r"최근\s*(\d+)\s*년", query)
         if recent_match:
             years = int(recent_match.group(1))
@@ -83,15 +102,18 @@ class HeuristicPlanner:
             hard_filters.setdefault("pjt_recent_years", years)
             soft_preferences.append(f"최근 {years}년 실적")
 
+        # 'SCIE' 등 특정 논문 조건 매칭
         if "SCIE" in query.upper():
             hard_filters.setdefault("art_sci_slct_nm", "SCIE")
             soft_preferences.append("SCIE 논문 선호")
 
+        # 학위 조건 매칭
         if "박사" in query:
             hard_filters.setdefault("degree_slct_nm", "박사")
         elif "석사" in query:
             hard_filters.setdefault("degree_slct_nm", ["석사", "박사"])
 
+        # 특정 실적 존재 여부 매칭 및 브랜치 힌트 보강
         if "특허" in query:
             hard_filters.setdefault("patent_cnt_min", 1)
             branch_hints["pat"] = "발명명, 등록 특허, 사업화 가능성 중심으로 정제한다."
@@ -105,6 +127,7 @@ class HeuristicPlanner:
             hard_filters.setdefault("project_cnt_min", 1)
             branch_hints["pjt"] = "과제명, 목표, 내용, 수행기관 중심으로 정제한다."
 
+        # '~제외' 패턴을 통한 제외 기관 추출
         exclude_patterns = re.findall(r"([A-Za-z가-힣0-9()주식회사㈜]+)\s*제외", query)
         for item in exclude_patterns:
             if item not in exclude_list:
@@ -121,6 +144,10 @@ class HeuristicPlanner:
 
 
 class OpenAICompatPlanner:
+    """
+    OpenAI 호환 API(LLM)를 사용하여 정교한 검색 계획을 수립하는 플래너입니다.
+    사용자의 복잡한 의도를 파악하여 최적의 검색 필터와 보정 힌트를 생성합니다.
+    """
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.fallback = HeuristicPlanner()
@@ -138,6 +165,7 @@ class OpenAICompatPlanner:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> PlannerOutput:
+        """LLM을 호출하여 질의를 분석하고 계획을 수립합니다."""
         # LLM planner는 branch on/off를 하지 않고,
         # hard filter와 branch별 질의 보정 힌트만 생성한다.
         system_prompt = """
@@ -198,12 +226,15 @@ class OpenAICompatPlanner:
             ensure_ascii=False,
         )
         try:
+            # 모델 호출
             result = await self.model.ainvoke_non_stream(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
+            # 결과 텍스트에서 JSON 추출 및 파싱
             payload = json.loads(_extract_json_object_text(result.content))
             return PlannerOutput.model_validate(payload)
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            # LLM 장애 또는 파싱 에러 시 HeuristicPlanner로 대체
             logger.warning("Planner fallback activated: %s", exc)
             return await self.fallback.plan(
                 query=query,

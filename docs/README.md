@@ -35,10 +35,11 @@ FastAPI service for NTIS reviewer discovery and recommendation. The service comb
 - Retrieval normalizes legacy Qdrant payloads that encode missing optional list or numeric fields as empty strings (`""`).
 - Strict runtime validation blocks heuristic/hash fallbacks from serving live traffic.
 
-## Planner Notes
+## Planner / Judge Notes
 
 - The OpenAI-compatible planner is expected to emit a single JSON object matching `PlannerOutput`.
 - Invalid planner output falls back to the heuristic planner instead of failing the request immediately.
+- Invalid judge output falls back to the heuristic judge instead of failing the request immediately.
 
 ## Quick Start
 
