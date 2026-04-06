@@ -5,9 +5,7 @@ Raw 데이터를 사용자에게 보여주기 적합한 형태로 가공하고, 
 
 from __future__ import annotations
 
-from datetime import datetime
-
-from apps.domain.models import CandidateCard, ExpertPayload, SearchHit
+from apps.domain.models import CandidateCard, SearchHit
 
 
 def _date_key(value: str | None) -> str:

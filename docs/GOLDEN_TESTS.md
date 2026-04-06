@@ -1,53 +1,63 @@
 # Golden Tests
 
-## 시나리오
+## Scenarios
 
-### 1. 논문 중심 질의
+### 1. Publication-focused Query
 
-- 입력: `최근 5년 SCIE 논문이 있는 AI 반도체 평가위원 추천`
-- 기대:
+- Input: `Recommend AI semiconductor reviewers with recent SCIE publications in the last 5 years`
+- Expect:
   - `art_sci_slct_nm=SCIE`
   - `art_recent_years=5`
-  - 추천 상위권에 논문 evidence 존재
+  - recommendation evidence includes at least one paper item
 
-### 2. 특허 중심 질의
+### 2. Patent-focused Query
 
-- 입력: `사업화 경험과 등록 특허가 있는 전문가 추천`
-- 기대:
+- Input: `Recommend experts with registered patents and commercialization experience`
+- Expect:
   - `patent_cnt_min >= 1`
-  - 특허 evidence 존재
+  - recommendation evidence includes at least one patent item
 
-### 3. 과제 중심 질의
+### 3. Project-focused Query
 
-- 입력: `AI 반도체 과제 수행 경험이 많은 평가위원 추천`
-- 기대:
+- Input: `Recommend reviewers with strong AI semiconductor project delivery experience`
+- Expect:
   - `project_cnt_min >= 1`
-  - 과제 evidence 존재
+  - recommendation evidence includes at least one project item
 
-### 4. 기관 제외 질의
+### 4. Excluded Organization Query
 
-- 입력: `A기관 제외하고 추천`
-- 기대:
-  - `blng_org_nm_exact` 기반 exclude 동작
-  - 제외기관 후보 미포함
+- Input: `Recommend reviewers but exclude A Organization`
+- Expect:
+  - exclude filtering is applied
+  - excluded organizations do not appear in the final response
 
-### 5. 근거 부족 질의
+### 5. Partial-evidence Query
 
-- 입력: `특허와 논문이 모두 강한 전문가 추천`
-- 기대:
-  - 근거 부족 후보는 `data_gaps` 또는 `risks`로 표기
+- Input: `Recommend experts who are strong in both patents and papers`
+- Expect:
+  - gaps are surfaced through `data_gaps` or `risks`
+  - recommendations without evidence are removed from the final response
 
-### 6. 빈 추천 결과
+### 6. Empty Recommendation Result
 
-- 입력: hard filter가 강하거나 근거가 부족하여 최종 추천이 비는 질의
-- 기대:
-  - `POST /recommend`는 `200`
+- Input: a query whose hard filters are too strict or whose evidence coverage is insufficient
+- Expect:
+  - `POST /recommend` returns `200`
   - `recommendations=[]`
-  - 사유가 `not_selected_reasons` 또는 `data_gaps`에 명시
+  - the reason is surfaced in `not_selected_reasons` and/or `data_gaps`
 
-## 수용 기준
+### 7. Zero-hit Retrieval
 
-- hard filter 위반 0건
-- `searched_branches`는 항상 `basic/art/pat/pjt`
-- 추천 사유와 evidence가 payload와 충돌하지 않음
-- `POST /search/candidates`와 `POST /recommend`가 모두 응답 가능
+- Input: a query that retrieves zero candidates
+- Expect:
+  - `POST /recommend` returns `200`
+  - the judge stage is skipped
+  - `recommendations=[]`
+  - `not_selected_reasons` includes a no-candidate explanation
+
+## Acceptance Criteria
+
+- hard-filter violations are excluded from the final response
+- `searched_branches` remains `basic`, `art`, `pat`, `pjt`
+- recommendation reasons and evidence do not contradict the payload
+- both `POST /search/candidates` and `POST /recommend` return valid response shapes

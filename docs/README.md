@@ -33,13 +33,15 @@ FastAPI service for NTIS reviewer discovery and recommendation. The service comb
 - Retrieval mode: dense + sparse + RRF
 - Startup bootstrap attempts to repair sparse vector modifiers to `IDF` on existing collections before readiness validation runs.
 - Retrieval normalizes legacy Qdrant payloads that encode missing optional list or numeric fields as empty strings (`""`).
-- Strict runtime validation blocks heuristic/hash fallbacks from serving live traffic.
+- Strict runtime validation forbids configuring the heuristic LLM backend, hashing embedding backend, or startup seeding for live traffic. Planner and judge still retain internal heuristic fallback handling if an OpenAI-compatible call fails at runtime.
 
 ## Planner / Judge Notes
 
 - The OpenAI-compatible planner is expected to emit a single JSON object matching `PlannerOutput`.
 - Invalid planner output falls back to the heuristic planner instead of failing the request immediately.
-- Invalid judge output falls back to the heuristic judge instead of failing the request immediately.
+- `POST /recommend` skips the judge stage and returns a structured empty result when retrieval produces no candidates or the shortlist is empty.
+- The judge extracts the first JSON object from the LLM response and normalizes recoverable list/string mismatches before validation.
+- Invalid or incomplete judge output still falls back to the heuristic judge instead of failing the request immediately.
 
 ## Quick Start
 

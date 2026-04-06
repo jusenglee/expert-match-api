@@ -58,7 +58,11 @@ Planner behavior:
 
 Judge behavior:
 
-- If the LLM judge output is not valid `JudgeOutput`, the runtime falls back to the heuristic judge.
+- Each `recommended[]` item must include `rank`, `expert_id`, `name`, `fit`, `reasons`, `evidence`, and `risks`.
+- `reasons`, `risks`, `not_selected_reasons`, and `data_gaps` must be arrays of strings.
+- The runtime extracts the first JSON object from the judge response and normalizes recoverable string/list mismatches before validation.
+- If `expert_id` is missing but `name` matches exactly one shortlist candidate, the runtime backfills `expert_id` from that shortlist entry.
+- If the normalized judge output is still not valid `JudgeOutput`, the runtime falls back to the heuristic judge.
 
 ## API
 
@@ -92,6 +96,7 @@ Response fields:
 Behavior:
 
 - `POST /recommend` returns `200` even when no final recommendation can be produced.
+- If retrieval finds no candidates or the shortlist is empty, the runtime skips the judge stage and returns a structured empty result immediately.
 - In that case `recommendations` is an empty list and the reason is described in `not_selected_reasons` and/or `data_gaps`.
 - Recommendations without evidence are excluded from the final response instead of causing a server error.
 

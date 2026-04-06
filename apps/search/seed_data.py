@@ -1,14 +1,22 @@
+"""
+개발 및 테스트 단계에서 사용할 가상의 전문가(Seed) 데이터를 생성하는 모듈입니다.
+실제 외부 데이터 연동 없이도 시스템의 검색 및 추천 로직을 검증할 수 있도록
+다양한 프로필(논문 중심, 특허 중심, 과제 중심 등)의 데이터를 제공합니다.
+"""
+
 from __future__ import annotations
 
 from copy import deepcopy
 
-from apps.domain.models import BasicInfo, ResearcherProfile, PublicationEvidence, IntellectualPropertyEvidence, ResearchProjectEvidence, EvaluationActivity, ExpertPayload, SeedExpertRecord
+from apps.domain.models import BasicInfo, ResearcherProfile, PublicationEvidence, IntellectualPropertyEvidence, ResearchProjectEvidence, ExpertPayload, SeedExpertRecord
 from apps.search.text_utils import normalize_org_name
 
 
 def build_canonical_payload_fixture() -> ExpertPayload:
-    # 개발 seed는 외부 엑셀이나 DB를 직접 읽지 않고,
-    # 서비스가 기대하는 최종 payload shape를 코드 안에서 명시적으로 만든다.
+    """
+    가장 표준적이고 완성도가 높은 전문가 데이터(김영찬 박사)의 페이로드를 생성합니다.
+    이 데이터는 다른 합성 데이터 생성을 위한 기본 템플릿으로 활용됩니다.
+    """
     return ExpertPayload(
         basic_info=BasicInfo(
             researcher_id="11008395",
@@ -77,6 +85,11 @@ def build_canonical_payload_fixture() -> ExpertPayload:
 
 
 def build_source_texts(payload: ExpertPayload) -> tuple[str, str, str, str]:
+    """
+    전문가 페이로드를 바탕으로 4가지 브랜치(기본, 논문, 특허, 과제)별 벡터화용 텍스트를 생성합니다.
+    각 텍스트는 해당 브랜치의 Dense/Sparse 벡터 생성을 위한 원천 데이터로 사용됩니다.
+    """
+    # 1. 기본 정보 텍스트 (이름, 소속, 전공 등)
     basic_parts = [
         f"이름: {payload.basic_info.researcher_name}",
         f"소속기관: {payload.basic_info.affiliated_organization or ''}",
@@ -84,14 +97,17 @@ def build_source_texts(payload: ExpertPayload) -> tuple[str, str, str, str]:
         f"학위: {payload.researcher_profile.highest_degree or ''}",
         f"전공: {payload.researcher_profile.major_field or ''}",
     ]
+    # 2. 논문 실적 요약 텍스트
     art_parts = [
         f"{paper.publication_title} {paper.journal_name or ''} {paper.abstract or ''} {', '.join(paper.korean_keywords)} {', '.join(paper.english_keywords)}"
         for paper in payload.publications
     ]
+    # 3. 특허 실적 요약 텍스트
     pat_parts = [
         f"{patent.intellectual_property_title} {patent.application_registration_type or ''} {patent.application_country or ''}"
         for patent in payload.intellectual_properties
     ]
+    # 4. 연구 과제 요약 텍스트
     pjt_parts = [
         f"{project.project_title_korean or ''} {project.project_title_english or ''} {project.research_content_summary or ''} "
         f"{project.performing_organization or ''} {project.managing_agency or ''}"
@@ -106,6 +122,7 @@ def build_source_texts(payload: ExpertPayload) -> tuple[str, str, str, str]:
 
 
 def record_from_payload(payload: ExpertPayload) -> SeedExpertRecord:
+    """단일 전문가 페이로드를 Qdrant에 삽입 가능한 Seed 레코드 형태로 변환합니다."""
     basic_text, art_text, pat_text, pjt_text = build_source_texts(payload)
     return SeedExpertRecord(
         point_id=payload.basic_info.researcher_id,
@@ -118,8 +135,13 @@ def record_from_payload(payload: ExpertPayload) -> SeedExpertRecord:
 
 
 def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
+    """
+    표준 템플릿을 변형하여 다양한 특징을 가진 여러 전문가 레코드를 생성합니다.
+    검색 랭킹 점수 차이, 필터링 로직, 브랜치별 가중치 테스트 등을 수행하기 위함입니다.
+    """
     records: list[SeedExpertRecord] = [record_from_payload(canonical)]
 
+    # 1. 밸런스형 전문가 (논문, 특허, 과제 고루 분포)
     balanced = deepcopy(canonical)
     balanced.basic_info.researcher_id = "11008396"
     balanced.basic_info.researcher_name = "박균형"
@@ -139,6 +161,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     )
     records.append(record_from_payload(balanced))
 
+    # 2. 논문 실적 중심 전문가
     paper_heavy = deepcopy(canonical)
     paper_heavy.basic_info.researcher_id = "11008397"
     paper_heavy.basic_info.researcher_name = "최논문"
@@ -170,6 +193,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     paper_heavy.researcher_profile.scie_publication_count = 3
     records.append(record_from_payload(paper_heavy))
 
+    # 3. 특허 실적 중심 전문가
     patent_heavy = deepcopy(canonical)
     patent_heavy.basic_info.researcher_id = "11008398"
     patent_heavy.basic_info.researcher_name = "한특허"
@@ -195,6 +219,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     patent_heavy.researcher_profile.intellectual_property_count = len(patent_heavy.intellectual_properties)
     records.append(record_from_payload(patent_heavy))
 
+    # 4. 연구 과제 중심 전문가
     project_heavy = deepcopy(canonical)
     project_heavy.basic_info.researcher_id = "11008399"
     project_heavy.basic_info.researcher_name = "윤과제"
@@ -225,6 +250,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     project_heavy.researcher_profile.research_project_count = len(project_heavy.research_projects)
     records.append(record_from_payload(project_heavy))
 
+    # 5. 특정 기관(제외 대상) 소속 전문가 테스트용
     excluded_org = deepcopy(canonical)
     excluded_org.basic_info.researcher_id = "11008400"
     excluded_org.basic_info.researcher_name = "오제외"
@@ -232,6 +258,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     excluded_org.basic_info.affiliated_organization_exact = normalize_org_name("A기관")
     records.append(record_from_payload(excluded_org))
 
+    # 6. 실적 정보가 매우 부족한 전문가 (낮은 순위 노출 테스트)
     weak_evidence = deepcopy(canonical)
     weak_evidence.basic_info.researcher_id = "11008401"
     weak_evidence.basic_info.researcher_name = "임부족"

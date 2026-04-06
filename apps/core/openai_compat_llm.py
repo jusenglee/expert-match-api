@@ -1,4 +1,9 @@
-﻿import inspect
+"""
+OpenAI 호환 API(vLLM, Solar 등)를 LangChain 프레임워크와 연결하는 어댑터 모듈입니다.
+스트리밍 응답 처리, 사고 과정(Reasoning) 추출, 트레이싱(Tracing) 메타데이터 관리 등을 담당합니다.
+"""
+
+import inspect
 import logging
 import time
 from typing import Any, AsyncIterator, List, Optional
@@ -46,23 +51,28 @@ _ensure_langchain_global_compat()
 
 
 class OpenAICompatStreamError(RuntimeError):
-    """OpenAI 호환 스트림에서 구조가 깨지거나 필수 필드가 비었을 때 쓰는 예외다.
-    상위 호출자는 이 예외를 통해 provider 응답이 무효했다는 사실을 일반 타임아웃과 구분할 수 있다.
+    """
+    OpenAI 호환 스트림 응답의 구조가 깨지거나 필드가 비었을 때 발생하는 예외입니다.
+    일반적인 타임아웃과 구분하여 Provider 응답 자체의 무효성을 나타냅니다.
     """
 
 
 class EmptyStreamContentError(OpenAICompatStreamError):
-    """streaming 응답이 끝났는데도 사용자에게 발행할 content가 전혀 없을 때 발생시키는 예외다.
-    이유와 trace id를 함께 보존해 stream triage에서 빈 응답의 원인을 따로 추적할 수 있게 한다.
+    """
+    스트리밍 응답이 종료되었으나 사용자에게 보여줄 실제 콘텐츠가 전혀 없을 때 발생하는 예외입니다.
+    원인 추적을 위해 Trace ID 등을 보존합니다.
     """
 
 
 class OpenAICompatChatModel(BaseChatModel):
-    """LangChain ChatModel 계약을 OpenAI 호환 provider 위에 얹은 어댑터다.
-    non-stream, stream, reasoning content 분리, trace id 수집, provider별 extra body 구성을 한 곳에서 다룬다.
     """
-    """OpenAI 호환 API(vLLM 등)용 LangChain 래퍼"""
+    LangChain의 BaseChatModel 인터페이스를 OpenAI 호환 서버(vLLM 등)에 맞춰 구현한 모델입니다.
 
+    주요 기능:
+    - 비동기 비스트리밍(ainvoke_non_stream) 및 스트리밍(astream) 호출 지원
+    - 사고 과정(Reasoning Content)과 최종 답변 분리 처리
+    - 요청별 트레이싱을 위한 request_id 헤더 주입 및 로깅
+    """
     # 기본 연결 설정
     model_name: str = "/model"
     base_url: str = "http://vllm_solar:8010/v1"
@@ -88,7 +98,8 @@ class OpenAICompatChatModel(BaseChatModel):
 
     # ---- LangChain required ----
     def _generate(self, messages: List[BaseMessage], **kwargs: Any) -> ChatResult:
-        """LangChain의 동기 generate 계약을 non-stream invoke 경로로 연결한다.
+        """
+        LangChain의 동기 generate 계약을 non-stream invoke 경로로 연결한다.
         내부적으로는 `ainvoke_non_stream`을 호출하고, 반환된 text와 trace 정보를 `ChatResult` 형태로 재포장한다.
         """
         raise NotImplementedError("Use ainvoke/astream")

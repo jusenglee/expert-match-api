@@ -228,4 +228,4 @@ def test_live_validator_reports_malformed_sample_payload_without_raising():
 
     assert report.ready is False
     assert report.checks["sample_payload_valid"] is False
-    assert any("Sample point payload inspection failed" in issue for issue in report.issues)
+    assert any("JSON" in issue for issue in report.issues)

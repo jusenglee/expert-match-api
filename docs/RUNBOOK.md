@@ -44,6 +44,7 @@ Notes:
 
 - `NTIS_EMBEDDING_BACKEND=local` requires the bundled `multilingual-e5-large-instruct` directory to include `modules.json`, `1_Pooling/config.json`, and `2_Normalize/`.
 - Legacy Qdrant payloads that store missing optional list or numeric values as `""` are normalized during retrieval. Malformed required fields are still treated as invalid payloads and skipped.
+- If retrieval returns zero candidates or produces an empty shortlist, `POST /recommend` skips the judge call and returns a structured empty result immediately.
 - If startup fails after the process begins listening, `POST /recommend`, `POST /search/candidates`, and `POST /feedback` remain unavailable until the startup issue is resolved.
 
 ## 5. Browser Playground
@@ -97,6 +98,8 @@ Useful runtime logs include:
 
 - planner JSON
 - planner fallback activation details
+- judge skipped details for `no_candidates`
+- judge response normalized before validation
 - judge fallback activation details
 - branch query text
 - applied hard filters

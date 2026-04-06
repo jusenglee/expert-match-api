@@ -1,3 +1,9 @@
+"""
+사용자 질의 분석 결과(Hard Filters)를 Qdrant 검색 엔진이 이해할 수 있는
+실행 가능한 필터 조건(models.Filter)으로 변환하는 모듈입니다.
+학위, 실적 건수, 최근 연도, 제외 기관 등 다양한 조건을 처리합니다.
+"""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -9,12 +15,21 @@ from apps.search.text_utils import normalize_org_name
 
 
 class QdrantFilterCompiler:
+    """
+    고수준의 검색 조건을 저수준의 Qdrant 필터 객체로 컴파일하는 클래스입니다.
+    """
     def compile(self, hard_filters: dict[str, Any], exclude_orgs: list[str]) -> models.Filter | None:
-        # hard filter는 LLM이 바꾸지 못하게 하고, 이 컴파일러가 Qdrant 조건으로 확정한다.
-        # 즉, planner가 뽑은 조건을 검색 친화적 문장 수준이 아니라 실행 가능한 DB 필터로 낮춘다.
+        """
+        주어진 하드 필터와 제외 기관 목록을 바탕으로 Qdrant 필터 객체를 생성합니다.
+        
+        - 'must': 모든 조건을 만족해야 함 (AND)
+        - 'must_not': 해당 조건에 맞으면 제외함 (NOT)
+        """
+        # planner는 질의 의도 위주로 조건을 뽑고, 이 컴파일러는 이를 실제 DB 스키마 필드와 매핑하여 확정한다.
         must: list[models.Condition] = []
         must_not: list[models.Condition] = []
 
+        # 1. 학위 조건 처리 (최고 학위 필드 매핑)
         if degree := hard_filters.get("degree_slct_nm"):
             values = degree if isinstance(degree, list) else [degree]
             must.append(
@@ -24,6 +39,7 @@ class QdrantFilterCompiler:
                 )
             )
 
+        # 2. 통계성 실적 건수 조건 처리 (최소 건수 이상인 전문가만 선별)
         counts_mapping = {
             "article_cnt": "researcher_profile.publication_count",
             "scie_cnt": "researcher_profile.scie_publication_count",
@@ -40,6 +56,7 @@ class QdrantFilterCompiler:
                     )
                 )
 
+        # 3. 논문 관련 상세 조건 (최근 연도 및 SCIE 여부 - Nested 구조 지원)
         recent_years = hard_filters.get("art_recent_years")
         scie_required = hard_filters.get("art_sci_slct_nm")
         if recent_years or scie_required:
@@ -56,6 +73,7 @@ class QdrantFilterCompiler:
                         range=models.DatetimeRange(gte=cutoff),
                     )
                 )
+            # 전문가 하위의 'publications' 리스트 내부에 조건 적용
             must.append(
                 models.NestedCondition(
                     nested=models.Nested(
@@ -65,6 +83,7 @@ class QdrantFilterCompiler:
                 )
             )
 
+        # 4. 특허 관련 상세 조건 (등록 유형 및 최근 연도 - Nested 구조 지원)
         pat_regist_type = hard_filters.get("pat_ipr_regist_type_nm")
         pat_recent_years = hard_filters.get("pat_recent_years")
         if pat_regist_type or pat_recent_years:
@@ -93,6 +112,7 @@ class QdrantFilterCompiler:
                 )
             )
 
+        # 5. 과제 관련 최근성 조건 (Nested 구조 지원)
         pjt_recent_years = hard_filters.get("pjt_recent_years")
         if pjt_recent_years:
             cutoff = f"{datetime.now(UTC).year - int(pjt_recent_years)}-01-01"
@@ -112,6 +132,7 @@ class QdrantFilterCompiler:
                 )
             )
 
+        # 6. 제외 기관 명단 처리 (정확한 기관명 매칭을 통한 제외)
         for org in exclude_orgs:
             normalized = normalize_org_name(org)
             if normalized:
@@ -122,6 +143,7 @@ class QdrantFilterCompiler:
                     )
                 )
 
+        # 설정된 조건이 하나도 없으면 필터 미적용
         if not must and not must_not:
             return None
         return models.Filter(must=must or None, must_not=must_not or None)

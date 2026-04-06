@@ -149,18 +149,18 @@
 
 | 레벨 | 영역 | 예시 필드 | 설계 포인트 |
 |---|---|---|---|
-| Root | 기본정보 | `doc_id`, `hm_nm`, `blng_org_nm`, `degree_slct_nm`, `major_slct_nm` | 검색 결과의 최종 단위와 필터 중심 |
-| Root | 집계값 | `article_cnt`, `scie_cnt`, `patent_cnt`, `project_cnt` | 정량 조건 필터에 사용 |
-| Nested | `art[]` | `paper_nm`, `jrnl_nm`, `sci_slct_nm`, `jrnl_pub_dt`, `keywords` | 논문 근거와 최근성 판단 |
-| Nested | `pat[]` | `ipr_invention_nm`, `ipr_regist_type_nm`, `ipr_regist_nat_nm`, `dates` | 특허 근거와 상태 필터 |
-| Nested | `pjt[]` | `title`, `content`, `pjt_prfrm_org_nm`, `rsch_mgnt_org_nm`, `start_dt`, `end_dt` | 과제 근거와 기간 필터 |
+| Root | `basic_info` | `researcher_id`, `researcher_name`, `affiliated_organization_exact` | 검색 결과의 최종 단위와 필터 중심 |
+| Root | `researcher_profile` | `highest_degree`, `major_field`, `publication_count`, `scie_publication_count`, `intellectual_property_count`, `research_project_count` | 정량 조건 필터와 프로필 요약에 사용 |
+| Nested | `publications[]` | `publication_title`, `journal_name`, `journal_index_type`, `publication_year_month`, `korean_keywords`, `english_keywords` | 논문 근거와 최근성 판단 |
+| Nested | `intellectual_properties[]` | `intellectual_property_title`, `application_registration_type`, `application_country`, `application_date`, `registration_date` | 특허 근거와 상태 필터 |
+| Nested | `research_projects[]` | `project_title_korean`, `project_title_english`, `research_content_summary`, `performing_organization`, `managing_agency`, `project_start_date`, `project_end_date` | 과제 근거와 기간 필터 |
 
 ### 5.4 구현 전 정합성 확인 포인트
 
 > **업로드 설계안 기준 구현 전 확인 필요**
 >
 > - 정정: 과제 영역 sparse vector 컬럼명은 `pjt_vector_bm25`를 사용한다.
-> - 정정: 과제 날짜 매핑은 `start_dt = TOT_RSCH_START_DT`, `end_dt = TOT_RSCH_END_DT`, `stan_yr = STAN_YR`로 구현한다.
+> - 정정: 과제 날짜 매핑은 `project_start_date = TOT_RSCH_START_DT`, `project_end_date = TOT_RSCH_END_DT`, `reference_year = STAN_YR`로 구현한다.
 > - 권장: 기술분류는 최소한 `basic_vector` source text에는 반드시 합성한다.
 > - 권장: IRIS 계열 데이터는 1차 검색 스키마와 분리하고, candidate card enrichment 용도로 결합한다.
 
@@ -253,10 +253,10 @@ result = client.query_points(
 
 > **권장 인덱스 후보**
 >
-> - root: `doc_id`, `degree_slct_nm`, `article_cnt`, `scie_cnt`, `patent_cnt`, `project_cnt`
-> - `art[]`: `sci_slct_nm`, `jrnl_pub_dt`
-> - `pat[]`: `ipr_regist_type_nm`, `ipr_regist_nat_nm`, `aply_dt`, `regist_dt`
-> - `pjt[]`: `start_dt`, `end_dt`, `stan_yr`, `pjt_prfrm_org_nm`, `rsch_mgnt_org_nm`
+> - root: `basic_info.researcher_id`, `researcher_profile.highest_degree`, `researcher_profile.publication_count`, `researcher_profile.scie_publication_count`, `researcher_profile.intellectual_property_count`, `researcher_profile.research_project_count`
+> - `publications[]`: `journal_index_type`, `publication_year_month`
+> - `intellectual_properties[]`: `application_registration_type`, `application_country`, `application_date`, `registration_date`
+> - `research_projects[]`: `project_start_date`, `project_end_date`, `reference_year`, `performing_organization`, `managing_agency`
 
 ---
 
@@ -464,7 +464,7 @@ result = client.query_points(
 | 항목 | 관찰 내용 | 판단 |
 |---|---|---|
 | 과제 sparse vector명 | 구현 기준은 `pjt_vector_bm25`로 확정 | 정정 반영 |
-| 과제 날짜 매핑 | 구현 기준은 `start_dt = TOT_RSCH_START_DT`, `end_dt = TOT_RSCH_END_DT`, `stan_yr = STAN_YR` | 정정 반영 |
+| 과제 날짜 매핑 | 구현 기준은 `project_start_date = TOT_RSCH_START_DT`, `project_end_date = TOT_RSCH_END_DT`, `reference_year = STAN_YR` | 정정 반영 |
 | 기술분류 반영 | 기술분류 시트는 있으나 메인 스키마 반영이 약함 | 권장 보완 |
 | IRIS 결합 방식 | IRIS payload는 많지만 retrieval 스키마로 바로 넣기엔 복잡도 큼 | enrichment 용도 권장 |
 

@@ -20,7 +20,7 @@ All environment variables use the `NTIS_` prefix.
 |---|---|---|
 | `NTIS_QDRANT_URL` | `http://203.250.234.159:8005` | Qdrant base URL |
 | `NTIS_QDRANT_API_KEY` | unset | Qdrant API key |
-| `NTIS_QDRANT_COLLECTION_NAME` | `expert_master` | collection name |
+| `NTIS_QDRANT_COLLECTION_NAME` | `researcher_recommend_test` | collection name |
 | `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | Qdrant cloud inference toggle |
 
 ## LLM Backend
@@ -69,5 +69,5 @@ The default local embedding path points at the repository bundle `multilingual-e
   - `NTIS_LLM_BACKEND=openai_compat`
   - `NTIS_EMBEDDING_BACKEND=openai` or `local`
   - `NTIS_SEED_ON_STARTUP=false`
-- With strict runtime validation enabled, heuristic/hash fallbacks are not allowed to serve live traffic.
+- With strict runtime validation enabled, live configuration must use `NTIS_LLM_BACKEND=openai_compat`, `NTIS_EMBEDDING_BACKEND=openai|local`, and `NTIS_SEED_ON_STARTUP=false`. Planner and judge still retain internal heuristic fallback handling if an OpenAI-compatible call fails at runtime.
 - If strict validation or dependency initialization fails, the process may still start in degraded mode. Inspect `GET /health/ready` before sending recommendation traffic.
