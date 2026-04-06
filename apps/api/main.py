@@ -4,8 +4,10 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from qdrant_client import QdrantClient
 
+from apps.api.playground import PLAYGROUND_HTML
 from apps.api.schemas import (
     FeedbackRequest,
     FeedbackResponse,
@@ -129,25 +131,49 @@ def create_app(
         app.state.settings = active_settings
         app.state.recommendation_service = service
         app.state.live_validator = validator
+        app.state.startup_error = None
         if app.state.recommendation_service is None:
-            built_service, built_validator = await build_app_runtime(active_settings)
-            app.state.recommendation_service = built_service
-            app.state.live_validator = built_validator
+            try:
+                built_service, built_validator = await build_app_runtime(active_settings)
+            except Exception as exc:
+                app.state.startup_error = f"Application startup failed: {exc}"
+                logger.exception("Application startup failed; readiness will report degraded state")
+            else:
+                app.state.recommendation_service = built_service
+                app.state.live_validator = built_validator
         yield
 
     app = FastAPI(title=active_settings.app_name, lifespan=lifespan)
 
+    def get_startup_error() -> str | None:
+        return getattr(app.state, "startup_error", None)
+
+    def build_readiness_response(
+        *,
+        ready: bool,
+        checks: dict[str, bool],
+        issues: list[str],
+        sample_point_id: str | None = None,
+    ) -> ReadinessResponse:
+        return ReadinessResponse(
+            ready=ready,
+            checks=checks,
+            issues=issues,
+            collection_name=active_settings.qdrant_collection_name,
+            sample_point_id=sample_point_id,
+        )
+
     def get_service() -> RecommendationService:
         service = app.state.recommendation_service
         if service is None:
+            startup_error = get_startup_error()
+            if startup_error is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Recommendation service is not ready: {startup_error}",
+                )
             raise HTTPException(status_code=503, detail="Recommendation service is not ready")
         return service
-
-    def get_validator() -> LiveContractValidator:
-        validator = app.state.live_validator
-        if validator is None:
-            raise HTTPException(status_code=503, detail="Live validator is not ready")
-        return validator
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -157,11 +183,44 @@ def create_app(
             "searched_branches": list(BRANCHES),
         }
 
+    @app.get("/playground", include_in_schema=False, response_class=HTMLResponse)
+    def playground() -> HTMLResponse:
+        return HTMLResponse(PLAYGROUND_HTML)
+
     @app.get("/health/ready", response_model=ReadinessResponse)
-    def readiness() -> ReadinessResponse:
-        report = get_validator().validate()
+    def readiness() -> ReadinessResponse | JSONResponse:
+        startup_error = get_startup_error()
+        if startup_error is not None:
+            report = build_readiness_response(
+                ready=False,
+                checks={"startup_runtime_initialized": False},
+                issues=[startup_error],
+            )
+            return JSONResponse(status_code=503, content=report.model_dump(mode="json"))
+
+        validator = app.state.live_validator
+        if validator is None:
+            report = build_readiness_response(
+                ready=False,
+                checks={"validator_initialized": False},
+                issues=["Live validator is not ready"],
+            )
+            return JSONResponse(status_code=503, content=report.model_dump(mode="json"))
+
+        try:
+            report = validator.validate()
+        except Exception as exc:
+            logger.exception("Readiness validation crashed")
+            degraded_report = build_readiness_response(
+                ready=False,
+                checks={"readiness_check_completed": False},
+                issues=[f"Readiness validation crashed: {exc}"],
+            )
+            return JSONResponse(status_code=503, content=degraded_report.model_dump(mode="json"))
+
         if not report.ready:
-            raise HTTPException(status_code=503, detail=report.to_dict())
+            payload = ReadinessResponse.model_validate(report.to_dict())
+            return JSONResponse(status_code=503, content=payload.model_dump(mode="json"))
         return ReadinessResponse.model_validate(report.to_dict())
 
     @app.post("/recommend", response_model=RecommendationResponse)

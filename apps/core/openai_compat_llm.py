@@ -3,6 +3,11 @@ import logging
 import time
 from typing import Any, AsyncIterator, List, Optional
 
+try:
+    import langchain
+except ImportError:
+    langchain = None
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -23,6 +28,21 @@ logger = logging.getLogger(__name__)
 
 STREAM_FIELD_KEY = "stream_field"          # "content" | "reasoning"
 STREAM_REASONING_KEY = "reasoning_text"    # additional_kwargs에만 저장
+
+
+def _ensure_langchain_global_compat() -> None:
+    """Backfill globals expected by langchain-core 0.3 when langchain 1.x is installed."""
+    if langchain is None:
+        return
+    if not hasattr(langchain, "verbose"):
+        langchain.verbose = False
+    if not hasattr(langchain, "debug"):
+        langchain.debug = False
+    if not hasattr(langchain, "llm_cache"):
+        langchain.llm_cache = None
+
+
+_ensure_langchain_global_compat()
 
 
 class OpenAICompatStreamError(RuntimeError):

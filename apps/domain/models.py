@@ -2,10 +2,59 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 BranchName = Literal["basic", "art", "pat", "pjt"]
+
+
+def _is_blank_string(value: Any) -> bool:
+    return isinstance(value, str) and not value.strip()
+
+
+def _normalize_string_list(value: Any) -> Any:
+    if value is None or _is_blank_string(value):
+        return []
+    if isinstance(value, str):
+        return [value.strip()]
+    if isinstance(value, (list, tuple, set)):
+        normalized: list[str] = []
+        for item in value:
+            if item is None or _is_blank_string(item):
+                continue
+            normalized.append(item.strip() if isinstance(item, str) else str(item))
+        return normalized
+    return value
+
+
+def _normalize_nested_list(value: Any) -> Any:
+    if value is None or _is_blank_string(value):
+        return []
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _normalize_int(value: Any) -> Any:
+    if value is None or _is_blank_string(value):
+        return 0
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
+def _normalize_optional_int(value: Any) -> Any:
+    if value is None or _is_blank_string(value):
+        return None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    return value
 
 
 class BasicInfo(BaseModel):
@@ -26,6 +75,17 @@ class ResearcherProfile(BaseModel):
     intellectual_property_count: int = 0
     research_project_count: int = 0
 
+    @field_validator(
+        "publication_count",
+        "scie_publication_count",
+        "intellectual_property_count",
+        "research_project_count",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_counts(cls, value: Any) -> Any:
+        return _normalize_int(value)
+
 
 class PublicationEvidence(BaseModel):
     journal_index_type: str | None = None
@@ -35,6 +95,11 @@ class PublicationEvidence(BaseModel):
     abstract: str | None = None
     korean_keywords: list[str] = Field(default_factory=list)
     english_keywords: list[str] = Field(default_factory=list)
+
+    @field_validator("korean_keywords", "english_keywords", mode="before")
+    @classmethod
+    def _normalize_keyword_lists(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
 
 
 class IntellectualPropertyEvidence(BaseModel):
@@ -58,6 +123,11 @@ class ResearchProjectEvidence(BaseModel):
     managing_agency: str | None = None
     research_objective_summary: str | None = None
     research_content_summary: str | None = None
+
+    @field_validator("reference_year", mode="before")
+    @classmethod
+    def _normalize_reference_year(cls, value: Any) -> Any:
+        return _normalize_optional_int(value)
 
     @computed_field
     @property
@@ -84,6 +154,27 @@ class ExpertPayload(BaseModel):
     evaluation_activity_cnt: int = 0
     external_activity_cnt: int = 0
     evaluation_activities: list[EvaluationActivity] = Field(default_factory=list)
+
+    @field_validator(
+        "publications",
+        "intellectual_properties",
+        "research_projects",
+        "evaluation_activities",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_nested_lists(cls, value: Any) -> Any:
+        return _normalize_nested_list(value)
+
+    @field_validator("technical_classifications", mode="before")
+    @classmethod
+    def _normalize_string_lists(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
+
+    @field_validator("evaluation_activity_cnt", "external_activity_cnt", mode="before")
+    @classmethod
+    def _normalize_root_counts(cls, value: Any) -> Any:
+        return _normalize_int(value)
 
     def to_payload_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")

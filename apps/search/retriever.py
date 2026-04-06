@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
 from apps.core.config import Settings
@@ -11,6 +13,8 @@ from apps.domain.models import ExpertPayload, PlannerOutput, SearchHit
 from apps.search.encoders import DenseEncoder
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -82,9 +86,22 @@ class QdrantHybridRetriever:
         }
         points = await asyncio.to_thread(self.client.query_points, **query_payload)
         hits: list[SearchHit] = []
+        skipped_invalid_payloads = 0
         for point in getattr(points, "points", points):
+            point_id = getattr(point, "id", None)
+            if point_id is None and isinstance(point, dict):
+                point_id = point.get("id")
             payload_data = point.payload if hasattr(point, "payload") else point.get("payload", {})
-            payload = ExpertPayload.model_validate(payload_data)
+            try:
+                payload = ExpertPayload.model_validate(payload_data)
+            except ValidationError as exc:
+                skipped_invalid_payloads += 1
+                logger.warning(
+                    "Skipping invalid Qdrant payload during retrieval: point_id=%s errors=%s",
+                    point_id,
+                    exc.errors(include_url=False),
+                )
+                continue
             # MVP에서는 branch별 세부 점수 분해 대신,
             # 실제 payload 안에 해당 근거가 존재하는지를 coverage로 요약한다.
             branch_coverage = {
@@ -101,4 +118,6 @@ class QdrantHybridRetriever:
                     branch_coverage=branch_coverage,
                 )
             )
+        if skipped_invalid_payloads:
+            logger.info("Skipped %d invalid Qdrant payload(s) during retrieval.", skipped_invalid_payloads)
         return RetrievalResult(hits=hits, query_payload=query_payload, branch_queries=branch_queries)

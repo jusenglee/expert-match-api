@@ -1,31 +1,37 @@
-# 계약 문서
+# Contract
 
-## Planner 출력
+## Planner Output
 
 `PlannerOutput`
 
 ```json
 {
-  "intent_summary": "AI 반도체 평가위원 추천",
+  "intent_summary": "Recommend AI semiconductor reviewers",
   "hard_filters": {
     "degree_slct_nm": "박사",
     "art_sci_slct_nm": "SCIE",
     "art_recent_years": 5,
     "project_cnt_min": 1
   },
-  "exclude_orgs": ["A기관"],
-  "soft_preferences": ["최근 5년 실적"],
+  "exclude_orgs": ["A Organization"],
+  "soft_preferences": ["recent achievements"],
   "branch_query_hints": {
-    "basic": "전공 학위 소속유형 중심",
-    "art": "논문 키워드와 초록 중심",
-    "pat": "특허와 사업화 중심",
-    "pjt": "과제명과 전문기관 중심"
+    "basic": "profile-focused query",
+    "art": "publication-focused query",
+    "pat": "patent-focused query",
+    "pjt": "project-focused query"
   },
   "top_k": 5
 }
 ```
 
-## Judge 출력
+Planner behavior:
+
+- The LLM planner must return a single JSON object matching `PlannerOutput`.
+- `branch_query_hints` must be an object with `basic`, `art`, `pat`, and `pjt` keys, not a list.
+- If the LLM output is not valid `PlannerOutput`, the runtime falls back to the heuristic planner.
+
+## Judge Output
 
 `JudgeOutput`
 
@@ -35,18 +41,18 @@
     {
       "rank": 1,
       "expert_id": "11008395",
-      "name": "홍길동",
+      "name": "Hong Gildong",
       "fit": "높음",
-      "reasons": ["논문 근거가 확인됨", "과제 수행 근거가 확인됨"],
+      "reasons": ["Publication evidence is strong."],
       "evidence": [
-        {"type": "paper", "title": "...", "date": "2024-09", "detail": "Fire"},
-        {"type": "project", "title": "...", "date": "2020-04-06", "detail": "중소기업기술정보진흥원"}
+        {"type": "paper", "title": "Example paper", "date": "2024-09", "detail": "SCIE"},
+        {"type": "project", "title": "Example project", "date": "2020-04-06", "detail": "Lead researcher"}
       ],
-      "risks": ["특허 근거 부족"]
+      "risks": ["Patent evidence is missing."]
     }
   ],
-  "not_selected_reasons": ["상위 추천 대비 근거 다양성 또는 최근성이 상대적으로 약함"],
-  "data_gaps": ["특허 근거 부족"]
+  "not_selected_reasons": ["Other candidates had broader evidence coverage."],
+  "data_gaps": ["Patent evidence is missing."]
 }
 ```
 
@@ -54,21 +60,21 @@
 
 ### `POST /recommend`
 
-request:
+Request:
 
 ```json
 {
-  "query": "AI 반도체 논문과 과제 실적이 좋은 평가위원 추천",
+  "query": "Recommend reviewers with strong AI semiconductor paper and project histories",
   "top_k": 5,
   "filters_override": {
     "degree_slct_nm": "박사",
     "art_sci_slct_nm": "SCIE"
   },
-  "exclude_orgs": ["A기관"]
+  "exclude_orgs": ["A Organization"]
 }
 ```
 
-response 핵심 필드:
+Response fields:
 
 - `intent_summary`
 - `applied_filters`
@@ -79,9 +85,15 @@ response 핵심 필드:
 - `not_selected_reasons`
 - `trace`
 
+Behavior:
+
+- `POST /recommend` returns `200` even when no final recommendation can be produced.
+- In that case `recommendations` is an empty list and the reason is described in `not_selected_reasons` and/or `data_gaps`.
+- Recommendations without evidence are excluded from the final response instead of causing a server error.
+
 ### `POST /search/candidates`
 
-response 핵심 필드:
+Response fields:
 
 - `intent_summary`
 - `applied_filters`
@@ -92,11 +104,11 @@ response 핵심 필드:
 
 ### `POST /feedback`
 
-운영자 선택 결과를 sqlite에 저장한다.
+Stores operator selections and notes in SQLite.
 
 ### `GET /health/ready`
 
-response 핵심 필드:
+Response fields:
 
 - `ready`
 - `checks`
@@ -104,40 +116,47 @@ response 핵심 필드:
 - `collection_name`
 - `sample_point_id`
 
-`ready=false`면 HTTP 503으로 응답한다.
+Behavior:
 
-## Payload 필수 필드
+- `200` means the runtime is ready.
+- `503` means readiness failed, but the body still uses the same top-level fields as the success response.
+- Failure payloads are returned directly as `ReadinessResponse`; they are not wrapped in `detail`.
+- If runtime initialization fails before the live validator exists, `/health/ready` returns `503` with `checks.startup_runtime_initialized=false` and the startup error string in `issues`.
 
-실데이터 sample point는 최소 아래를 포함해야 한다.
+## Required Payload Structure
 
-- root
-  - `doc_id`
-  - `blng_org_nm_exact`
-  - `degree_slct_nm`
-  - `article_cnt`
-  - `scie_cnt`
-  - `patent_cnt`
-  - `project_cnt`
-- nested
-  - `art[]`
-  - `pat[]`
-  - `pjt[]`
-- 교정된 과제 날짜 필드
-  - `pjt[].start_dt`
-  - `pjt[].end_dt`
-  - `pjt[].stan_yr`
+The representative sample point selected by readiness validation must contain at least:
 
-## 운영 실패 조건
+- root fields:
+  - `basic_info`
+  - `researcher_profile`
+- nested evidence arrays:
+  - `publications[]`
+  - `research_projects[]`
+- project date fields on every `research_projects[]` item:
+  - `project_start_date`
+  - `project_end_date`
+  - `reference_year`
 
-아래 중 하나라도 깨지면 운영 readiness 실패로 본다.
+Readiness validation scans a bounded set of collection points and selects the most complete sample payload it can find before evaluating these requirements.
 
-- Qdrant 컬렉션 없음
-- 8개 named vector 누락
-- sparse vector modifier가 IDF가 아님
-- 필수 payload index 누락
-- sample point 없음
-- sample point에 `art[]`, `pat[]`, `pjt[]` 중 하나라도 없음
-- sample point에 `blng_org_nm_exact` 없음
-- sample point의 과제 날짜 필드 누락
-- 추천 결과에 evidence가 비어 있음
+Legacy payload note:
 
+- When Qdrant stores optional list or numeric fields as empty strings (`""`), the runtime normalizes them at read time.
+- Required identifier/title fields are not auto-repaired and may still fail validation if malformed.
+
+## Readiness Failure Conditions
+
+Readiness is considered failed when any of these checks fail:
+
+- LLM backend connectivity
+- embedding backend connectivity
+- Qdrant collection lookup
+- required dense named vectors
+- required sparse named vectors
+- sparse vector IDF modifier
+- required payload indexes
+- representative sample point presence
+- sample payload object shape
+- `publications[]` or `research_projects[]` missing or empty
+- missing project date fields on `research_projects[]`

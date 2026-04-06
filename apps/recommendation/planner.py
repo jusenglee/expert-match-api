@@ -15,6 +15,34 @@ from apps.domain.models import PlannerOutput
 logger = logging.getLogger(__name__)
 
 
+def _extract_json_object_text(content: Any) -> str:
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        text = "".join(parts)
+    else:
+        text = str(content)
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        return text[start : end + 1]
+    return text
+
+
 class Planner(Protocol):
     async def plan(
         self,
@@ -113,9 +141,15 @@ class OpenAICompatPlanner:
         # LLM planner는 branch on/off를 하지 않고,
         # hard filter와 branch별 질의 보정 힌트만 생성한다.
         system_prompt = (
-            "평가위원 추천 planner 역할이다. 반드시 JSON만 출력한다. "
-            "active branch on/off는 결정하지 말고, branch_query_hints만 생성한다. "
-            "hard_filters는 deterministic 조건만 포함한다."
+            "You are a planner for NTIS evaluator recommendation. "
+            "Return exactly one JSON object and no prose. Do not use markdown, code fences, or extra keys. "
+            "The object must contain these keys: "
+            "intent_summary(string), hard_filters(object), exclude_orgs(array of strings), "
+            "soft_preferences(array of strings), branch_query_hints(object), top_k(integer). "
+            "branch_query_hints must be an object with exactly these keys: basic, art, pat, pjt. "
+            "Each branch_query_hints value must be a string. Never return branch_query_hints as a list. "
+            "Do not decide branch on/off; only populate branch_query_hints. "
+            "hard_filters must contain only deterministic filter conditions."
         )
         user_prompt = json.dumps(
             {
@@ -130,7 +164,8 @@ class OpenAICompatPlanner:
             result = await self.model.ainvoke_non_stream(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
-            return PlannerOutput.model_validate(json.loads(result.content))
+            payload = json.loads(_extract_json_object_text(result.content))
+            return PlannerOutput.model_validate(payload)
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("Planner fallback activated: %s", exc)
             return await self.fallback.plan(

@@ -98,7 +98,7 @@
    - prefetch 조립
    - filter 조립
    ↓
-[Qdrant expert_master]
+[Qdrant researcher_recommend_test]
    - basic/art/pat/pjt dense vectors
    - basic/art/pat/pjt sparse vectors
    - root + nested payload
@@ -130,7 +130,7 @@
 
 ### 5.1 컬렉션 단위
 
-권장 컬렉션은 `expert_master` 하나로 시작한다. 한 point는 한 명의 전문가를 의미한다. 이 구조는 추천 단위와 저장 단위를 일치시켜 retrieval 이후 후처리를 단순화한다.
+권장 컬렉션은 `researcher_recommend_test` 하나로 시작한다. 한 point는 한 명의 전문가를 의미한다. 이 구조는 추천 단위와 저장 단위를 일치시켜 retrieval 이후 후처리를 단순화한다.
 
 ### 5.2 named vector 구성
 
@@ -201,7 +201,7 @@
 
 ```python
 result = client.query_points(
-    collection_name="expert_master",
+    collection_name="researcher_recommend_test",
     prefetch=[
         Prefetch(
             prefetch=[

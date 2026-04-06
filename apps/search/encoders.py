@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from openai import OpenAI
@@ -14,6 +16,32 @@ class DenseEncoder(Protocol):
 
     def embed(self, text: str) -> list[float]:
         ...
+
+
+def _resolve_local_model_path(model_name: str) -> Path | None:
+    model_path = Path(model_name).expanduser()
+    if not model_path.exists():
+        return None
+    return model_path.resolve()
+
+
+def _validate_local_sentence_transformer_bundle(model_path: Path) -> None:
+    modules_path = model_path / "modules.json"
+    if not modules_path.is_file():
+        return
+
+    modules = json.loads(modules_path.read_text(encoding="utf-8"))
+    missing_module_dirs = [
+        str(model_path / module_path)
+        for module in modules
+        if (module_path := module.get("path")) and not (model_path / module_path).is_dir()
+    ]
+    if missing_module_dirs:
+        missing_dirs_text = ", ".join(missing_module_dirs)
+        raise FileNotFoundError(
+            "Local sentence-transformer bundle is incomplete. "
+            f"Missing module directories: {missing_dirs_text}"
+        )
 
 
 @dataclass(slots=True)
@@ -33,6 +61,7 @@ class OpenAIEmbeddingEncoder:
     vector_size: int
     base_url: str
     api_key: str
+    _client: OpenAI = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
@@ -48,13 +77,22 @@ class OpenAIEmbeddingEncoder:
             )
         return vector
 
+
 @dataclass(slots=True)
 class LocalSentenceTransformerEncoder:
     model_name: str
     vector_size: int
+    _model: object = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         from sentence_transformers import SentenceTransformer
+
+        local_model_path = _resolve_local_model_path(self.model_name)
+        if local_model_path is not None:
+            _validate_local_sentence_transformer_bundle(local_model_path)
+            self._model = SentenceTransformer(str(local_model_path), local_files_only=True)
+            return
+
         self._model = SentenceTransformer(self.model_name)
 
     def embed(self, text: str) -> list[float]:

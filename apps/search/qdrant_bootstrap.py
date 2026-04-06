@@ -48,7 +48,58 @@ class QdrantBootstrapper:
                     for branch in BRANCHES
                 },
             )
+        self.ensure_sparse_vector_modifiers()
         self.ensure_payload_indexes()
+
+    @staticmethod
+    def _modifier_is_idf(modifier: object) -> bool:
+        if modifier is None:
+            return False
+
+        candidates = [modifier, getattr(modifier, "value", None), getattr(modifier, "name", None)]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            normalized = str(candidate).strip().lower()
+            if normalized == "idf" or "modifier.idf" in normalized:
+                return True
+        return False
+
+    def ensure_sparse_vector_modifiers(self) -> None:
+        try:
+            collection_info = self.client.get_collection(self.settings.qdrant_collection_name)
+        except Exception as exc:
+            logger.warning("Skipping sparse vector modifier repair because collection lookup failed: %s", exc)
+            return
+
+        sparse_config = getattr(collection_info.config.params, "sparse_vectors", None) or {}
+        if not isinstance(sparse_config, dict):
+            logger.warning("Skipping sparse vector modifier repair because sparse vector config is unavailable")
+            return
+
+        updates: dict[str, models.SparseVectorParams] = {}
+        for branch in BRANCHES:
+            vector_name = self.registry.sparse_vector_by_branch[branch]
+            params = sparse_config.get(vector_name)
+            modifier = getattr(params, "modifier", None)
+            if not self._modifier_is_idf(modifier):
+                updates[vector_name] = models.SparseVectorParams(modifier=models.Modifier.IDF)
+
+        if not updates:
+            return
+
+        try:
+            self.client.update_collection(
+                collection_name=self.settings.qdrant_collection_name,
+                sparse_vectors_config=updates,
+            )
+            logger.info(
+                "Updated sparse vector modifiers to IDF for collection %s: %s",
+                self.settings.qdrant_collection_name,
+                sorted(updates.keys()),
+            )
+        except Exception as exc:
+            logger.warning("Failed to update sparse vector modifiers for %s: %s", self.settings.qdrant_collection_name, exc)
 
     def ensure_payload_indexes(self) -> None:
         for field_name, schema_name in PAYLOAD_INDEX_FIELDS:

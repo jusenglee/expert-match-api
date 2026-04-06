@@ -1,53 +1,55 @@
-# NTIS 평가위원 추천 서비스
+# NTIS Evaluator Recommendation Service
 
-Qdrant 하이브리드 검색과 LLM 추천 판단을 결합한 평가위원 추천 API다.
+FastAPI service for NTIS reviewer discovery and recommendation. The service combines Qdrant hybrid retrieval with planner/judge LLM stages and exposes both machine-facing APIs and a local browser playground.
 
-## 현재 상태
+## Current Endpoints
 
-- `POST /recommend`: 검색 + 후보 비교 + 최종 추천
-- `POST /search/candidates`: 검색 디버그용 후보 조회
-- `POST /feedback`: 운영자 피드백 저장
-- `GET /health`: 생존 확인
-- `GET /health/ready`: 실데이터 연동 readiness 확인
-- `ntis-validate-live`: 운영 반입 데이터 계약 검증 CLI
+- `POST /recommend`: return final recommendations, reasons, evidence, and data gaps. If no evidence-backed recommendation is available, the endpoint still returns `200` with `recommendations=[]` and explanatory reasons.
+- `POST /search/candidates`: return shortlist candidates before the final judge step.
+- `POST /feedback`: store operator feedback in SQLite.
+- `GET /health`: lightweight process-level health response.
+- `GET /health/ready`: runtime readiness response for live dependencies and sample data.
+- `GET /playground`: local browser UI for readiness inspection and API smoke testing.
+- `ntis-validate-live`: CLI wrapper around the same live readiness validator.
 
-## 문서 길잡이
+## Readiness Behavior
 
-- [SERVICE_FLOW.md](/D:/Project/python_project/Ntis_person_API/docs/SERVICE_FLOW.md): 비개발자도 읽을 수 있는 서비스 동작 설명 문서
-- [CONTRACT.md](/D:/Project/python_project/Ntis_person_API/docs/CONTRACT.md): API, planner, judge, payload 계약 문서
-- [RUNBOOK.md](/D:/Project/python_project/Ntis_person_API/docs/RUNBOOK.md): 실데이터 반입 후 운영 점검 절차
-- [ENVIRONMENT.md](/D:/Project/python_project/Ntis_person_API/docs/ENVIRONMENT.md): 필수 환경변수와 운영 모드 설정
+- `/health/ready` returns `200` when the runtime is fully ready.
+- `/health/ready` returns `503` when validation fails, but the JSON body still uses the same top-level fields as the success response: `ready`, `checks`, `issues`, `collection_name`, and `sample_point_id`.
+- The live validator scans a bounded set of collection points and selects the most complete sample payload it can find before reporting payload-shape issues. Readiness requires root fields plus publication/project evidence and project date fields; patent evidence remains informational.
+- If startup runtime initialization fails before the live validator is available, the app can still start in degraded mode. In that case `/health/ready` returns `503` with `checks.startup_runtime_initialized=false`, and recommendation endpoints remain unavailable until the startup issue is fixed.
 
-## 운영 기준
+## Docs
 
-- Qdrant `v1.16.0`
-- 컬렉션명 `expert_master`
-- `basic/art/pat/pjt` dense + sparse named vector
-- branch 내부 `dense + sparse -> RRF`
-- 최상위 `4 branch -> RRF`
-- branch on/off 없음, 항상 전 branch 검색
-- hard filter는 코드가 deterministic 하게 보장
-- 운영 경로에서는 heuristic/hash fallback 금지
+- [SERVICE_FLOW.md](/D:/Project/python_project/Ntis_person_API/docs/SERVICE_FLOW.md): pipeline walkthrough.
+- [CONTRACT.md](/D:/Project/python_project/Ntis_person_API/docs/CONTRACT.md): request/response and payload contract.
+- [RUNBOOK.md](/D:/Project/python_project/Ntis_person_API/docs/RUNBOOK.md): local run and troubleshooting checklist.
+- [ENVIRONMENT.md](/D:/Project/python_project/Ntis_person_API/docs/ENVIRONMENT.md): environment variables and runtime defaults.
 
-## 개발과 운영의 차이
+## Runtime Notes
 
-- 개발/테스트:
-  - fake service, hashing encoder, heuristic planner/judge를 테스트 보조용으로만 사용
-- 운영:
-  - 실제 OpenAI 호환 LLM backend
-  - 실제 OpenAI 호환 embedding backend
-  - Qdrant 실데이터
-  - readiness/validate-live 통과 후 API 사용
+- Qdrant collection: `researcher_recommend_test`
+- Search branches: `basic`, `art`, `pat`, `pjt`
+- Retrieval mode: dense + sparse + RRF
+- Startup bootstrap attempts to repair sparse vector modifiers to `IDF` on existing collections before readiness validation runs.
+- Retrieval normalizes legacy Qdrant payloads that encode missing optional list or numeric fields as empty strings (`""`).
+- Strict runtime validation blocks heuristic/hash fallbacks from serving live traffic.
 
-## 빠른 시작
+## Planner Notes
+
+- The OpenAI-compatible planner is expected to emit a single JSON object matching `PlannerOutput`.
+- Invalid planner output falls back to the heuristic planner instead of failing the request immediately.
+
+## Quick Start
 
 1. `python -m pip install -e .[dev]`
-2. Qdrant 실행
-3. 환경변수 설정
-4. 실데이터 insert
-5. `ntis-validate-live`
-6. `uvicorn apps.api.main:app --reload`
-7. `/health/ready` 확인
-8. `/search/candidates`, `/recommend` smoke test
+2. Prepare Qdrant and point the app at the target collection.
+3. Configure the required `NTIS_` environment variables.
+4. Load or verify the collection data.
+5. Run `ntis-validate-live`
+6. Run `uvicorn apps.api.main:app --reload`
+7. Check `GET /health/ready`
+8. Open `http://127.0.0.1:8000/playground`
+9. Run `POST /search/candidates` or `POST /recommend` smoke tests if needed
 
-세부 절차는 [RUNBOOK.md](/D:/Project/python_project/Ntis_person_API/docs/RUNBOOK.md)를 참고한다.
+If `uvicorn` starts but `/health/ready` returns `503`, inspect the structured readiness response before calling recommendation APIs. The browser playground shows the same readiness payload in a details panel.

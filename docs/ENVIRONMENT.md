@@ -1,63 +1,73 @@
-# 환경 변수
+# Environment Variables
 
-모든 환경 변수는 `NTIS_` prefix를 쓴다.
+All environment variables use the `NTIS_` prefix.
 
-## 공통
+## Core
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `NTIS_APP_ENV` | `prod` | 실행 환경 |
-| `NTIS_STRICT_RUNTIME_VALIDATION` | `true` | 운영전용 fail-fast 사용 여부 |
-| `NTIS_QDRANT_URL` | `http://localhost:6333` | Qdrant URL |
-| `NTIS_QDRANT_API_KEY` | 없음 | Qdrant API key |
-| `NTIS_QDRANT_COLLECTION_NAME` | `expert_master` | 컬렉션명 |
-| `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | BM25 inference 사용 환경 |
+| `NTIS_APP_NAME` | `NTIS Evaluator Recommendation API` | FastAPI app title |
+| `NTIS_APP_ENV` | `prod` | runtime environment |
+| `NTIS_API_PREFIX` | `""` | reserved API prefix setting |
+| `NTIS_STRICT_RUNTIME_VALIDATION` | `true` | require production-safe runtime settings before the recommendation runtime becomes available |
+| `NTIS_RUNTIME_DIR` | `runtime` | runtime output directory |
+| `NTIS_FEEDBACK_DB_PATH` | `runtime/feedback.db` | feedback SQLite path |
+| `NTIS_FEEDBACK_TABLE` | `feedback_events` | feedback table name |
 
-## LLM backend
+## Qdrant
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `NTIS_LLM_BACKEND` | `openai_compat` | 운영 경로 backend |
-| `NTIS_LLM_BASE_URL` | `http://localhost:8010/v1` | OpenAI 호환 LLM URL |
-| `NTIS_LLM_API_KEY` | `EMPTY` | OpenAI 호환 키 |
-| `NTIS_LLM_MODEL_NAME` | `/model` | planner/judge용 모델명 |
+| `NTIS_QDRANT_URL` | `http://203.250.234.159:8005` | Qdrant base URL |
+| `NTIS_QDRANT_API_KEY` | unset | Qdrant API key |
+| `NTIS_QDRANT_COLLECTION_NAME` | `expert_master` | collection name |
+| `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | Qdrant cloud inference toggle |
 
-## Embedding backend
+## LLM Backend
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `NTIS_EMBEDDING_BACKEND` | `openai` | 운영 경로 embedding backend |
-| `NTIS_EMBEDDING_BASE_URL` | `http://localhost:8011/v1` | OpenAI 호환 embedding URL |
-| `NTIS_EMBEDDING_API_KEY` | `EMPTY` | OpenAI 호환 키 |
-| `NTIS_EMBEDDING_MODEL_NAME` | `intfloat/multilingual-e5-large-instruct` | dense model 계약명 |
-| `NTIS_EMBEDDING_VECTOR_SIZE` | `1024` | dense vector 크기 |
+| `NTIS_LLM_BACKEND` | `openai_compat` | planner/judge backend |
+| `NTIS_LLM_BASE_URL` | `http://203.250.234.159:8010/v1` | OpenAI-compatible LLM URL |
+| `NTIS_LLM_API_KEY` | `EMPTY` | OpenAI-compatible API key |
+| `NTIS_LLM_MODEL_NAME` | `/model` | planner/judge model name |
 
-## 검색 파라미터
+## Embedding Backend
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
+|---|---|---|
+| `NTIS_EMBEDDING_BACKEND` | `local` | embedding backend |
+| `NTIS_EMBEDDING_BASE_URL` | `http://203.250.234.159:8011/v1` | OpenAI-compatible embedding URL |
+| `NTIS_EMBEDDING_API_KEY` | `EMPTY` | OpenAI-compatible API key |
+| `NTIS_EMBEDDING_MODEL_NAME` | `<repo>/multilingual-e5-large-instruct` | local bundle path or remote model name |
+| `NTIS_EMBEDDING_VECTOR_SIZE` | `1024` | dense vector size |
+
+The default local embedding path points at the repository bundle `multilingual-e5-large-instruct`. When replacing that bundle, keep `modules.json`, `1_Pooling/config.json`, and `2_Normalize/` intact or startup will fail.
+
+## Retrieval Controls
+
+| Variable | Default | Description |
 |---|---|---|
 | `NTIS_BRANCH_PREFETCH_LIMIT` | `80` | branch prefetch limit |
 | `NTIS_BRANCH_OUTPUT_LIMIT` | `50` | branch fusion output limit |
 | `NTIS_RETRIEVAL_LIMIT` | `40` | final retrieval limit |
-| `NTIS_SHORTLIST_LIMIT` | `10` | shortlist 크기 |
-| `NTIS_FINAL_RECOMMENDATION_MIN` | `3` | 최종 추천 최소 인원 |
-| `NTIS_FINAL_RECOMMENDATION_MAX` | `5` | 최종 추천 최대 인원 |
+| `NTIS_SHORTLIST_LIMIT` | `10` | shortlist size |
+| `NTIS_FINAL_RECOMMENDATION_MIN` | `3` | minimum final recommendations |
+| `NTIS_FINAL_RECOMMENDATION_MAX` | `5` | maximum final recommendations |
 
-## 기타
+## Seed Controls
 
-| 변수 | 기본값 | 설명 |
+| Variable | Default | Description |
 |---|---|---|
-| `NTIS_SEED_ON_STARTUP` | `false` | 로컬 개발 seed 수행 여부 |
-| `NTIS_SEED_ALLOW_RECREATE_COLLECTION` | `false` | seed 전에 컬렉션 재생성 여부 |
-| `NTIS_FEEDBACK_DB_PATH` | `runtime/feedback.db` | feedback sqlite 경로 |
+| `NTIS_SEED_ON_STARTUP` | `false` | run the development seed path during startup |
+| `NTIS_SEED_ALLOW_RECREATE_COLLECTION` | `false` | allow seed flow to recreate the collection |
 
-## 운영 기본값
+## Operational Notes
 
-운영 경로에서는 아래를 권장한다.
-
-- `NTIS_STRICT_RUNTIME_VALIDATION=true`
-- `NTIS_LLM_BACKEND=openai_compat`
-- `NTIS_EMBEDDING_BACKEND=openai`
-- `NTIS_SEED_ON_STARTUP=false`
-
-운영전용 모드에서는 heuristic/hash fallback과 seed startup을 허용하지 않는다.
+- Recommended live settings:
+  - `NTIS_STRICT_RUNTIME_VALIDATION=true`
+  - `NTIS_LLM_BACKEND=openai_compat`
+  - `NTIS_EMBEDDING_BACKEND=openai` or `local`
+  - `NTIS_SEED_ON_STARTUP=false`
+- With strict runtime validation enabled, heuristic/hash fallbacks are not allowed to serve live traffic.
+- If strict validation or dependency initialization fails, the process may still start in degraded mode. Inspect `GET /health/ready` before sending recommendation traffic.

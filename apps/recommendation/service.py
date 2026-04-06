@@ -80,21 +80,39 @@ class RecommendationService:
         shortlist = self.card_builder.shortlist(candidate_cards, self.shortlist_limit)
         judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
 
-        # 운영 경로에서는 evidence 없는 추천을 허용하지 않는다.
-        # 추천이 나갔는데 근거가 없다면 품질 문제를 경고가 아니라 실패로 본다.
+        evidence_less_count = sum(1 for item in judge_output.recommended if not item.evidence)
+        recommendations = [item for item in judge_output.recommended if item.evidence]
+        not_selected_reasons = self._merge_unique_strings(judge_output.not_selected_reasons)
+
         if not judge_output.recommended:
-            raise RuntimeError("추천 결과가 비어 있습니다.")
-        if not all(item.evidence for item in judge_output.recommended):
-            raise RuntimeError("evidence가 비어 있는 추천 결과가 포함되어 있습니다.")
+            not_selected_reasons = self._merge_unique_strings(
+                not_selected_reasons,
+                ["조건을 만족하는 추천 후보를 찾지 못했습니다."],
+            )
+        elif evidence_less_count:
+            not_selected_reasons = self._merge_unique_strings(
+                not_selected_reasons,
+                ["근거가 충분한 추천 결과를 생성하지 못했습니다."],
+            )
+
+        if not recommendations:
+            logger.info(
+                "Returning empty recommendation result: query=%r retrieved_count=%d shortlist_count=%d judge_recommended_count=%d evidence_less_filtered_count=%d",
+                query,
+                search_result["retrieved_count"],
+                len(shortlist),
+                len(judge_output.recommended),
+                evidence_less_count,
+            )
 
         return {
             "intent_summary": plan.intent_summary,
             "applied_filters": plan.hard_filters,
             "searched_branches": list(BRANCHES),
             "retrieved_count": search_result["retrieved_count"],
-            "recommendations": judge_output.recommended,
+            "recommendations": recommendations,
             "data_gaps": judge_output.data_gaps,
-            "not_selected_reasons": judge_output.not_selected_reasons,
+            "not_selected_reasons": not_selected_reasons,
             "trace": {
                 "planner": plan.model_dump(mode="json"),
                 "branch_queries": search_result["branch_queries"],
@@ -105,7 +123,7 @@ class RecommendationService:
                         "expert_id": item.expert_id,
                         "evidence_titles": [evidence.title for evidence in item.evidence],
                     }
-                    for item in judge_output.recommended
+                    for item in recommendations
                 ],
                 "query_payload": self._serialize_query_payload(search_result["query_payload"]),
             },
@@ -136,3 +154,16 @@ class RecommendationService:
         serialized["query_filter"] = str(query_filter) if query_filter else None
         serialized["query"] = str(payload.get("query"))
         return serialized
+
+    @staticmethod
+    def _merge_unique_strings(*groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for item in group:
+                normalized = item.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                merged.append(normalized)
+        return merged

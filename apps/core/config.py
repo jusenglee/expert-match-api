@@ -4,12 +4,24 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+try:
+    from pydantic import Field
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError:
+    from pydantic.v1 import BaseSettings, Field
+
+    SettingsConfigDict = None
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="NTIS_", env_file=".env", extra="ignore")
+    # Allow the project to start even when pydantic-settings is unavailable.
+    if SettingsConfigDict is not None:
+        model_config = SettingsConfigDict(env_prefix="NTIS_", env_file=".env", extra="ignore")
+    else:
+        class Config:
+            env_prefix = "NTIS_"
+            env_file = ".env"
+            extra = "ignore"
 
     app_name: str = "NTIS Evaluator Recommendation API"
     app_env: Literal["dev", "test", "prod"] = "prod"
@@ -18,7 +30,7 @@ class Settings(BaseSettings):
 
     qdrant_url: str = "http://203.250.234.159:8005"
     qdrant_api_key: str | None = None
-    qdrant_collection_name: str = "expert_master"
+    qdrant_collection_name: str = "researcher_recommend_test"
     qdrant_cloud_inference: bool = False
 
     llm_backend: Literal["heuristic", "openai_compat"] = "openai_compat"
@@ -29,7 +41,9 @@ class Settings(BaseSettings):
     embedding_backend: Literal["hashing", "openai", "local"] = "local"
     embedding_base_url: str = "http://203.250.234.159:8011/v1"
     embedding_api_key: str = "EMPTY"
-    embedding_model_name: str = "intfloat/multilingual-e5-large-instruct"
+    embedding_model_name: str = Field(
+        default_factory=lambda: str(Path(__file__).resolve().parents[2] / "multilingual-e5-large-instruct")
+    )
     embedding_vector_size: int = 1024
 
     branch_prefetch_limit: int = 80

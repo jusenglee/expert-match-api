@@ -37,10 +37,17 @@
 - 기대:
   - 근거 부족 후보는 `data_gaps` 또는 `risks`로 표기
 
+### 6. 빈 추천 결과
+
+- 입력: hard filter가 강하거나 근거가 부족하여 최종 추천이 비는 질의
+- 기대:
+  - `POST /recommend`는 `200`
+  - `recommendations=[]`
+  - 사유가 `not_selected_reasons` 또는 `data_gaps`에 명시
+
 ## 수용 기준
 
 - hard filter 위반 0건
 - `searched_branches`는 항상 `basic/art/pat/pjt`
 - 추천 사유와 evidence가 payload와 충돌하지 않음
 - `POST /search/candidates`와 `POST /recommend`가 모두 응답 가능
-

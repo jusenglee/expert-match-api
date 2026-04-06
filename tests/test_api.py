@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import apps.api.main as main_module
 from fastapi.testclient import TestClient
 
 from apps.api.main import create_app
@@ -17,10 +20,10 @@ class FakeRecommendationService:
                 RecommendationDecision(
                     rank=1,
                     expert_id="1",
-                    name="홍길동",
+                    name="Hong Gildong",
                     fit="높음",
-                    reasons=["논문 근거가 확인됨"],
-                    evidence=[{"type": "paper", "title": "테스트 논문"}],
+                    reasons=["Publication evidence is available."],
+                    evidence=[{"type": "paper", "title": "Test paper"}],
                     risks=[],
                 )
             ],
@@ -28,10 +31,10 @@ class FakeRecommendationService:
             "not_selected_reasons": [],
             "trace": {
                 "planner": {},
-                "branch_queries": {"basic": "기본", "art": "논문", "pat": "특허", "pjt": "과제"},
+                "branch_queries": {"basic": "basic", "art": "paper", "pat": "patent", "pjt": "project"},
                 "exclude_orgs": [],
                 "candidate_ids": ["1"],
-                "recommendation_evidence_summary": [{"expert_id": "1", "evidence_titles": ["테스트 논문"]}],
+                "recommendation_evidence_summary": [{"expert_id": "1", "evidence_titles": ["Test paper"]}],
                 "query_payload": {},
             },
         }
@@ -44,13 +47,15 @@ class FakeRecommendationService:
             def model_dump(self, mode="json"):
                 return {"intent_summary": self.intent_summary, "hard_filters": self.hard_filters}
 
+        Planner.exclude_orgs = exclude_orgs
+
         class Card:
             expert_id = "1"
-            name = "홍길동"
-            organization = "테스트기관"
+            name = "Hong Gildong"
+            organization = "Test Institute"
             branch_coverage = {"basic": True, "art": True, "pat": False, "pjt": True}
             counts = {"article_cnt": 2, "scie_cnt": 1, "patent_cnt": 0, "project_cnt": 3}
-            data_gaps = ["특허 근거 부족"]
+            data_gaps = ["Patent evidence is missing."]
             risks = []
             shortlist_score = 17.0
 
@@ -58,6 +63,7 @@ class FakeRecommendationService:
             "planner": Planner(),
             "retrieved_count": 1,
             "candidates": [Card()],
+            "branch_queries": {"basic": "basic", "art": "paper", "pat": "patent", "pjt": "project"},
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
         }
 
@@ -79,8 +85,8 @@ class FakeValidator:
         return LiveValidationReport(
             ready=self._ready,
             checks={"collection_exists": self._ready},
-            issues=[] if self._ready else ["컬렉션 누락"],
-            collection_name="expert_master",
+            issues=[] if self._ready else ["Collection is not ready."],
+            collection_name="researcher_recommend_test",
             sample_point_id="1" if self._ready else None,
         )
 
@@ -92,11 +98,28 @@ def test_recommend_endpoint_contract():
         validator=FakeValidator(),
     )
     with TestClient(app) as client:
-        response = client.post("/recommend", json={"query": "AI 반도체 평가위원 추천"})
+        response = client.post("/recommend", json={"query": "Recommend AI semiconductor reviewers"})
 
     assert response.status_code == 200
     parsed = RecommendationResponse.model_validate(response.json())
     assert parsed.searched_branches == ["basic", "art", "pat", "pjt"]
+
+
+def test_playground_route_serves_local_chat_ui():
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=FakeRecommendationService(),
+        validator=FakeValidator(),
+    )
+    with TestClient(app) as client:
+        response = client.get("/playground")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert 'id="chatForm"' in response.text
+    assert "/recommend" in response.text
+    assert "/search/candidates" in response.text
+    assert "Readiness details" in response.text
 
 
 def test_feedback_endpoint_contract():
@@ -109,7 +132,7 @@ def test_feedback_endpoint_contract():
         response = client.post(
             "/feedback",
             json={
-                "query": "AI 반도체 평가위원 추천",
+                "query": "Recommend AI semiconductor reviewers",
                 "selected_expert_ids": ["1"],
                 "rejected_expert_ids": [],
                 "metadata": {"operator": "tester"},
@@ -134,7 +157,7 @@ def test_readiness_endpoint_returns_report_when_ready():
     assert parsed.ready is True
 
 
-def test_readiness_endpoint_returns_503_when_not_ready():
+def test_readiness_endpoint_returns_503_with_same_shape_when_not_ready():
     app = create_app(
         settings=Settings(app_env="test", strict_runtime_validation=False),
         service=FakeRecommendationService(),
@@ -144,3 +167,33 @@ def test_readiness_endpoint_returns_503_when_not_ready():
         response = client.get("/health/ready")
 
     assert response.status_code == 503
+    parsed = ReadinessResponse.model_validate(response.json())
+    assert parsed.ready is False
+    assert "detail" not in response.json()
+
+
+def test_startup_failure_is_reported_by_readiness_and_service_endpoints(monkeypatch):
+    original_build_app_runtime = main_module.build_app_runtime
+
+    async def fail_build_app_runtime(settings):
+        raise RuntimeError("Qdrant bootstrap failed")
+
+    monkeypatch.setattr(main_module, "build_app_runtime", fail_build_app_runtime)
+    try:
+        app = create_app(settings=Settings(app_env="test", strict_runtime_validation=True))
+        with TestClient(app) as client:
+            health_response = client.get("/health")
+            ready_response = client.get("/health/ready")
+            recommend_response = client.post("/recommend", json={"query": "Test query"})
+    finally:
+        monkeypatch.setattr(main_module, "build_app_runtime", original_build_app_runtime)
+
+    assert health_response.status_code == 200
+    assert ready_response.status_code == 503
+    ready_payload = ReadinessResponse.model_validate(ready_response.json())
+    assert ready_payload.ready is False
+    assert ready_payload.checks == {"startup_runtime_initialized": False}
+    assert ready_payload.issues == ["Application startup failed: Qdrant bootstrap failed"]
+
+    assert recommend_response.status_code == 503
+    assert "Qdrant bootstrap failed" in recommend_response.json()["detail"]
