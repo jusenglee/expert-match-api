@@ -26,9 +26,13 @@ class Settings(BaseSettings):
     모든 환경 변수는 'NTIS_' 접두사를 사용하여 재정의할 수 있습니다.
     예) NTIS_QDRANT_URL=http://localhost:6333
     """
+
     if SettingsConfigDict is not None:
-        model_config = SettingsConfigDict(env_prefix="NTIS_", env_file=".env", extra="ignore")
+        model_config = SettingsConfigDict(
+            env_prefix="NTIS_", env_file=".env", extra="ignore"
+        )
     else:
+
         class Config:
             env_prefix = "NTIS_"
             env_file = ".env"
@@ -37,13 +41,15 @@ class Settings(BaseSettings):
     # 기본 앱 정보
     app_name: str = "NTIS Evaluator Recommendation API"
     app_env: Literal["dev", "test", "prod"] = "prod"
+    app_host: str = "0.0.0.0"
+    app_port: int = 8011
     api_prefix: str = ""
     strict_runtime_validation: bool = True
 
     # Qdrant 벡터 데이터베이스 설정
     qdrant_url: str = "http://203.250.234.159:8005"
     qdrant_api_key: str | None = None
-    qdrant_collection_name: str = "researcher_recommend_test"
+    qdrant_collection_name: str = "researcher_recommend_proto"
     qdrant_cloud_inference: bool = False
 
     # LLM (의도의 분석 및 심사) 백엔드 설정
@@ -57,21 +63,32 @@ class Settings(BaseSettings):
     embedding_base_url: str = "http://203.250.234.159:8011/v1"
     embedding_api_key: str = "EMPTY"
     embedding_model_name: str = Field(
-        default_factory=lambda: str(Path(__file__).resolve().parents[2] / "multilingual-e5-large-instruct")
+        default_factory=lambda: str(
+            Path(__file__).resolve().parents[2]
+            / "../../Models/multilingual-e5-large-instruct"
+        )
     )
     embedding_vector_size: int = 1024
 
+    # BM25 (희소 벡터 생성) 모델 설정
+    bm25_model_name: str = "Qdrant/bm25"
+    bm25_cache_dir: str = "../../Models/hub/"
+    bm25_local_files_only: bool = True
+    hf_hub_offline: bool = True
+
     # 검색 및 추천 오케스트레이션 파라미터
-    branch_prefetch_limit: int = 80   # 각 브랜치별 초기 검색 수
-    branch_output_limit: int = 50     # RRF 결합 후 브랜치별 출력 수
-    retrieval_limit: int = 40          # 최종 리트리벌 결과 수
-    shortlist_limit: int = 10          # 심사에 전달할 후보자 수
+    branch_prefetch_limit: int = 80  # 각 브랜치별 초기 검색 수
+    branch_output_limit: int = 50  # RRF 결합 후 브랜치별 출력 수
+    retrieval_limit: int = 40  # 최종 리트리벌 결과 수
+    shortlist_limit: int = 10  # 심사에 전달할 후보자 수
     final_recommendation_min: int = 3  # 최소 추천 인원
     final_recommendation_max: int = 5  # 최대 추천 인원
 
     # 런타임 저장소 및 피드백 DB 설정
     runtime_dir: Path = Field(default_factory=lambda: Path("runtime"))
-    feedback_db_path: Path = Field(default_factory=lambda: Path("runtime") / "feedback.db")
+    feedback_db_path: Path = Field(
+        default_factory=lambda: Path("runtime") / "feedback.db"
+    )
     feedback_table: str = "feedback_events"
 
     # 서버 시작 시 데이터 초기화(Seeding) 옵션

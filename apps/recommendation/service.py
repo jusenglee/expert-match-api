@@ -43,15 +43,20 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
+        logger.info("전문가 후보 검색 단계 시작: 질의=%r", query)
         plan = await self.planner.plan(
             query=query,
             filters_override=filters_override,
             exclude_orgs=exclude_orgs,
             top_k=top_k,
         )
+        logger.info("질의 분석 완료: 의도=%r 필터=%r", plan.intent_summary, plan.hard_filters)
+        
         query_filter = self.filter_compiler.compile(plan.hard_filters, plan.exclude_orgs)
         retrieval = await self.retriever.search(query=query, plan=plan, query_filter=query_filter)
-        cards = self.card_builder.build_small_cards(retrieval.hits, plan.hard_filters)
+        logger.info("검색 완료: 검색된 히트 수=%d", len(retrieval.hits))
+        
+        cards = self.card_builder.build_small_cards(retrieval.hits, plan)
         return {
             "planner": plan,
             "query_filter": query_filter,
@@ -69,6 +74,7 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
+        logger.info("전체 추천 프로세스 시작: 질의=%r", query)
         search_result = await self.search_candidates(
             query=query,
             filters_override=filters_override,
@@ -79,10 +85,12 @@ class RecommendationService:
         plan: PlannerOutput = search_result["planner"]
         candidate_cards: list[CandidateCard] = search_result["candidates"]
         shortlist = self.card_builder.shortlist(candidate_cards, self.shortlist_limit)
+        logger.info("후보자 압축 완료: 초기 후보=%d명 -> 최종 후보(Shortlist)=%d명 (제한=%d)", 
+                    len(candidate_cards), len(shortlist), self.shortlist_limit)
 
         if search_result["retrieved_count"] == 0 or not shortlist:
             logger.info(
-                "Returning empty recommendation result: query=%r retrieved_count=%d shortlist_count=%d judge_skipped_reason=no_candidates",
+                "추천 결과 없음: 질의=%r 검색된 수=%d 압축된 수=%d 사유=적합한 후보 없음",
                 query,
                 search_result["retrieved_count"],
                 len(shortlist),
@@ -98,7 +106,9 @@ class RecommendationService:
                 not_selected_reasons=["조건을 만족하는 추천 후보를 찾지 못했습니다."],
             )
 
+        logger.info("최종 판정(Judging) 단계 시작: 압축 후보 수=%d", len(shortlist))
         judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
+        
         evidence_less_count = sum(1 for item in judge_output.recommended if not item.evidence)
         recommendations = [item for item in judge_output.recommended if item.evidence]
         not_selected_reasons = self._merge_unique_strings(judge_output.not_selected_reasons)
@@ -114,15 +124,8 @@ class RecommendationService:
                 ["근거가 충분한 추천 결과를 생성하지 못했습니다."],
             )
 
-        if not recommendations:
-            logger.info(
-                "Returning empty recommendation result: query=%r retrieved_count=%d shortlist_count=%d judge_recommended_count=%d evidence_less_filtered_count=%d",
-                query,
-                search_result["retrieved_count"],
-                len(shortlist),
-                len(judge_output.recommended),
-                evidence_less_count,
-            )
+        logger.info("추천 프로세스 완료: 질의=%r 최종 추천=%d명 (근거 부족 제외=%d명)", 
+                    query, len(recommendations), evidence_less_count)
 
         return self._build_recommendation_response(
             plan=plan,
@@ -144,6 +147,8 @@ class RecommendationService:
         notes: str | None,
         metadata: dict[str, Any],
     ) -> int:
+        logger.info("사용자 피드백 저장: 질의=%r 선택된 전문가=%d명 거절된 전문가=%d명", 
+                    query, len(selected_expert_ids), len(rejected_expert_ids))
         return self.feedback_store.save_feedback(
             query=query,
             selected_expert_ids=selected_expert_ids,

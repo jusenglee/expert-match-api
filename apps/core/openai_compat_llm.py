@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 # 특히 reasoning delta를 content와 분리해 downstream 스트리밍 계층이
 # 안전하게 필터링할 수 있도록 `stream_field` 규약을 붙여주는 것이 중요하다.
 
-STREAM_FIELD_KEY = "stream_field"          # "content" | "reasoning"
-STREAM_REASONING_KEY = "reasoning_text"    # additional_kwargs에만 저장
+STREAM_FIELD_KEY = "stream_field"  # "content" | "reasoning"
+STREAM_REASONING_KEY = "reasoning_text"  # additional_kwargs에만 저장
 
 
 def _ensure_langchain_global_compat() -> None:
@@ -73,6 +73,7 @@ class OpenAICompatChatModel(BaseChatModel):
     - 사고 과정(Reasoning Content)과 최종 답변 분리 처리
     - 요청별 트레이싱을 위한 request_id 헤더 주입 및 로깅
     """
+
     # 기본 연결 설정
     model_name: str = "/model"
     base_url: str = "http://vllm_solar:8010/v1"
@@ -86,7 +87,7 @@ class OpenAICompatChatModel(BaseChatModel):
     # Solar/vLLM reasoning 제어(기본: thinking 끄기 + reasoning 출력 포함 안 함)
     # - reasoning_effort: "low" | "medium" | "high" | None
     # - include_reasoning: True | False | None  (vLLM 프로토콜에 존재)
-    default_reasoning_effort: Optional[str] = "low"
+    default_reasoning_effort: Optional[str] = "medium"
     default_include_reasoning: Optional[bool] = False
 
     # stream에서 reasoning delta가 먼저 와도 최종 답변(content)에 섞이지 않게:
@@ -144,7 +145,9 @@ class OpenAICompatChatModel(BaseChatModel):
         return getattr(delta, key, None)
 
     @staticmethod
-    def _resolve_trace_ids(kwargs: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    def _resolve_trace_ids(
+        kwargs: dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
         """response header와 body에서 추적 가능한 trace/request id를 수집한다.
         빈 응답이나 provider 오류를 triage할 때 같은 호출을 다시 찾을 수 있게 하는 진단 메타데이터다.
         """
@@ -161,7 +164,9 @@ class OpenAICompatChatModel(BaseChatModel):
             conversation_id = conversation_id or metadata.get("conversation_id")
 
         request_id_str = str(request_id).strip() if request_id is not None else ""
-        conversation_id_str = str(conversation_id).strip() if conversation_id is not None else ""
+        conversation_id_str = (
+            str(conversation_id).strip() if conversation_id is not None else ""
+        )
         return (request_id_str or None, conversation_id_str or None)
 
     def _to_openai_messages(self, messages: List[BaseMessage]) -> List[dict[str, str]]:
@@ -181,11 +186,11 @@ class OpenAICompatChatModel(BaseChatModel):
         return converted
 
     def _build_openai_request_kwargs(
-            self,
-            *,
-            request_id: Optional[str],
-            stop: Optional[List[str]],
-            kwargs: dict[str, Any],
+        self,
+        *,
+        request_id: Optional[str],
+        stop: Optional[List[str]],
+        kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         """model, messages, timeout, streaming 플래그를 provider 요청 kwargs로 조합한다.
         공통 body와 provider-specific extra body를 분리해 reasoning 옵션이 일반 chat payload를 오염시키지 않게 한다.
@@ -220,7 +225,9 @@ class OpenAICompatChatModel(BaseChatModel):
         if reasoning_effort is not None:
             body.setdefault("reasoning_effort", reasoning_effort)
 
-        include_reasoning = kwargs.get("include_reasoning", self.default_include_reasoning)
+        include_reasoning = kwargs.get(
+            "include_reasoning", self.default_include_reasoning
+        )
         if include_reasoning is not None:
             body.setdefault("include_reasoning", include_reasoning)
 
@@ -266,7 +273,9 @@ class OpenAICompatChatModel(BaseChatModel):
             raise
 
     # ---- non-stream ----
-    async def _agenerate(self, messages: List[BaseMessage], **kwargs: Any) -> ChatResult:
+    async def _agenerate(
+        self, messages: List[BaseMessage], **kwargs: Any
+    ) -> ChatResult:
         """LangChain의 비동기 generate 계약을 non-stream invoke 경로로 연결한다.
         `_generate`와 같은 결과 shape를 맞추되, event loop 안에서 직접 await 가능하게 제공한다.
         """
@@ -293,13 +302,15 @@ class OpenAICompatChatModel(BaseChatModel):
         content = (getattr(msg, "content", None) if msg is not None else None) or ""
         # reasoning은 섞지 않고 참고용으로만 (필요시 로그/메트릭으로 사용)
         reasoning = (
-                (getattr(msg, "reasoning", None) if msg is not None else None)
-                or (getattr(msg, "reasoning_content", None) if msg is not None else None)
-                or ""
+            (getattr(msg, "reasoning", None) if msg is not None else None)
+            or (getattr(msg, "reasoning_content", None) if msg is not None else None)
+            or ""
         )
 
         dt_ms = (time.monotonic() - t0) * 1000
-        usage = response.usage.model_dump() if getattr(response, "usage", None) else None
+        usage = (
+            response.usage.model_dump() if getattr(response, "usage", None) else None
+        )
 
         logger.info(
             "[openai_compat_llm] non-stream summary: request_id=%s conversation_id=%s model=%s dt_ms=%.1f message_n=%d content_char_n=%d reasoning_char_n=%d request_max_tokens=%s request_top_k=%s usage=%s base_url=%s",
@@ -315,9 +326,13 @@ class OpenAICompatChatModel(BaseChatModel):
             usage,
             self.base_url,
         )
-        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content=content))]
+        )
 
-    async def ainvoke_non_stream(self, messages: List[BaseMessage], **kwargs: Any) -> AIMessage:
+    async def ainvoke_non_stream(
+        self, messages: List[BaseMessage], **kwargs: Any
+    ) -> AIMessage:
         """streaming을 사용하지 않는 일반 chat completion 호출을 실행한다.
         provider 응답에서 answer text, reasoning text, usage, trace id를 분리해 상위 레이어가 그대로 소비할 수 있는 딕셔너리로 돌려준다.
         """
@@ -328,10 +343,10 @@ class OpenAICompatChatModel(BaseChatModel):
 
     # ---- stream ----
     async def _astream(
-            self,
-            messages: List[BaseMessage],
-            stop: Optional[List[str]] = None,
-            **kwargs: Any,
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         """OpenAI 호환 streaming 응답을 LangChain `ChatGenerationChunk` 흐름으로 바꾼다.
         reasoning content와 user-visible content를 구분해 누적하고, 빈 콘텐츠 종료는 `EmptyStreamContentError`로 변환해 상위에 알린다.
@@ -379,11 +394,15 @@ class OpenAICompatChatModel(BaseChatModel):
                     continue
 
                 choice0 = choices[0]
-                last_finish_reason = getattr(choice0, "finish_reason", None) or last_finish_reason
+                last_finish_reason = (
+                    getattr(choice0, "finish_reason", None) or last_finish_reason
+                )
                 delta = getattr(choice0, "delta", None)
 
                 content = self._delta_get(delta, "content")
-                reasoning = self._delta_get(delta, "reasoning") or self._delta_get(delta, "reasoning_content")
+                reasoning = self._delta_get(delta, "reasoning") or self._delta_get(
+                    delta, "reasoning_content"
+                )
 
                 # ttft_any: content/reasoning 중 뭐든 처음 도착한 시점
                 if ttft_any_ms is None and (content or reasoning):

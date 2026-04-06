@@ -86,7 +86,7 @@ class FakeValidator:
             ready=self._ready,
             checks={"collection_exists": self._ready},
             issues=[] if self._ready else ["Collection is not ready."],
-            collection_name="researcher_recommend_test",
+            collection_name="researcher_recommend_proto",
             sample_point_id="1" if self._ready else None,
         )
 

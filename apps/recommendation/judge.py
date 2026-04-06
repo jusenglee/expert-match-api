@@ -147,6 +147,14 @@ def _normalize_judge_payload(payload: Any, shortlist: list[CandidateCard]) -> tu
                 normalized_item["fit"] = stripped_fit
                 normalized_applied = True
 
+        relevance_score = normalized_item.get("relevance_score")
+        if relevance_score is None and expert_id:
+            # 카드에서 점수 복원
+            card = next((c for c in shortlist if c.expert_id == expert_id), None)
+            if card:
+                normalized_item["relevance_score"] = card.relevance_score
+                normalized_applied = True
+
         normalized_recommended.append(normalized_item)
 
     normalized_payload["recommended"] = normalized_recommended
@@ -217,7 +225,7 @@ class HeuristicJudge:
             if card.data_gaps:
                 global_data_gaps.extend(card.data_gaps)
 
-            fit = "높음" if card.shortlist_score >= 20 else "중간" if card.shortlist_score >= 10 else "보통"
+            fit = "높음" if card.shortlist_score >= 80 else "중간" if card.shortlist_score >= 50 else "보통"
             recommendations.append(
                 RecommendationDecision(
                     rank=rank,
@@ -226,7 +234,7 @@ class HeuristicJudge:
                     fit=fit,
                     reasons=reasons[:3],
                     evidence=evidence[:4],
-                    risks=card.risks + card.data_gaps[:1],
+                    relevance_score=card.relevance_score,
                 )
             )
 
@@ -272,7 +280,8 @@ class OpenAICompatJudge:
                       "detail": "optional detail"
                     }
                   ],
-                  "risks": ["risk"]
+                  "risks": ["risk"],
+                  "relevance_score": 0.0
                 }
               ],
               "not_selected_reasons": ["reason"],
@@ -295,26 +304,34 @@ class OpenAICompatJudge:
 
         normalized_recommendation_count = 0
         try:
+            logger.info("LLM 최종 판정(Judging) 시작: 후보 수=%d", len(shortlist))
             result = await self.model.ainvoke_non_stream(
                 [SystemMessage(content=system_prompt), HumanMessage(content=json.dumps(user_payload, ensure_ascii=False))]
             )
-            raw_payload = json.loads(_extract_json_object_text(result.content))
+            json_text = _extract_json_object_text(result.content)
+            logger.debug("LLM 응답 텍스트(추출됨): %s", json_text)
+            
+            raw_payload = json.loads(json_text)
             normalized_payload, normalized_applied = _normalize_judge_payload(raw_payload, shortlist)
+            
             if isinstance(normalized_payload, dict):
                 recommended = normalized_payload.get("recommended", [])
                 normalized_recommendation_count = len(recommended) if isinstance(recommended, list) else 0
+                
             if normalized_applied:
-                logger.info(
-                    "Judge response normalized before validation: shortlist_count=%d normalized_recommendation_count=%d",
+                logger.debug(
+                    "판정 결과 정규화 적용됨: 후보 수=%d -> 최종 추천 수=%d",
                     len(shortlist),
                     normalized_recommendation_count,
                 )
-            return JudgeOutput.model_validate(normalized_payload)
+            
+            output = JudgeOutput.model_validate(normalized_payload)
+            logger.info("최종 판정 성공: 최종 추천=%d명", len(output.recommended))
+            return output
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(
-                "Judge fallback activated: reason=%s shortlist_count=%d normalized_recommendation_count=%d fallback_used=true",
+                "판정 Fallback 활성화: 사유=%s 후보 수=%d",
                 exc,
                 len(shortlist),
-                normalized_recommendation_count,
             )
             return await self.fallback.judge(query=query, plan=plan, shortlist=shortlist)

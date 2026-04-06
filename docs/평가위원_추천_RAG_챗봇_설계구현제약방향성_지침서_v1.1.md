@@ -2,8 +2,8 @@
 ## 설계 · 구현 · 제한 · 방향성 지침서
 
 **기준선:** Qdrant v1.16.0 / Named Vector + Hybrid Retrieval / LLM Recommendation  
-**문서 버전:** v1.0  
-**기준일:** 2026-03-31
+**문서 버전:** v1.1  
+**기준일:** 2026-04-06
 
 ---
 
@@ -98,7 +98,7 @@
    - prefetch 조립
    - filter 조립
    ↓
-[Qdrant researcher_recommend_test]
+[Qdrant researcher_recommend_proto]
    - basic/art/pat/pjt dense vectors
    - basic/art/pat/pjt sparse vectors
    - root + nested payload
@@ -111,8 +111,12 @@
    - 추천/제외 사유 생성
    - 데이터 공백 명시
    ↓
-[응답 생성기]
-   - 최종 추천 결과 반환
+ [응답 생성기]
+    - 최종 추천 결과 반환
+    ↓
+ [가시성 계층 (Observability Layer)]
+    - Trace ID 생성 및 비동기 컨텍스트 전파
+    - 실시간 로그 캡처 및 UI 콘솔 출력
 ```
 
 | 구성요소 | 역할 | 비고 |
@@ -122,6 +126,7 @@
 | Qdrant | 후보 생성, fusion, 필터 적용 | 최종 추천 판단은 담당하지 않음 |
 | Candidate Card Builder | LLM 입력용 증거 요약 | 토큰 비용과 잡음을 줄이는 단계 |
 | LLM Judge / Recommender | 후보 비교, 최종 추천 생성 | 최종 의사결정의 핵심 |
+| Visibility Layer | Trace ID 부여 및 실시간 한글 로깅 | **(v1.1 추가)** 전 과정 추적성 보장 |
 | Audit Logger | 질의, 필터, 후보, 추천 결과 저장 | 운영 개선과 평가셋 구축에 필수 |
 
 ---
@@ -130,7 +135,7 @@
 
 ### 5.1 컬렉션 단위
 
-권장 컬렉션은 `researcher_recommend_test` 하나로 시작한다. 한 point는 한 명의 전문가를 의미한다. 이 구조는 추천 단위와 저장 단위를 일치시켜 retrieval 이후 후처리를 단순화한다.
+권장 컬렉션은 `researcher_recommend_proto` 하나로 시작한다. 한 point는 한 명의 전문가를 의미한다. 이 구조는 추천 단위와 저장 단위를 일치시켜 retrieval 이후 후처리를 단순화한다.
 
 ### 5.2 named vector 구성
 
@@ -201,7 +206,7 @@
 
 ```python
 result = client.query_points(
-    collection_name="researcher_recommend_test",
+    collection_name="researcher_recommend_proto",
     prefetch=[
         Prefetch(
             prefetch=[
@@ -346,14 +351,15 @@ result = client.query_points(
 | `POST /explain` | 기존 추천 결과 설명 확장 | 추천 사유 상세화 |
 | `POST /feedback` | 운영자 수정/채택 결과 저장 | 후속 평가 데이터 축적 |
 
-### 8.4 권장 운영 로그
+### 8.4 권장 운영 로그 (v1.1 Trace ID 기반)
 
-- 원본 질의와 planner JSON
-- 적용된 hard filter / exclude 조건
-- Qdrant Top-N 후보 ID와 payload 요약
-- LLM 추천 결과와 이유
-- 운영자 최종 확정 결과
-- 잘못 추천된 이유 분류(필터 누락/데이터 누락/의미 오해 등)
+모든 로그는 **Trace ID(Request ID)**를 포함하며, 운영자가 즉시 이해할 수 있는 **한글 기반 메시지**로 기록한다.
+
+- **Planner**: 원본 질의, 분석된 하드 필터 항목, 브랜치별 검색 힌트
+- **Retriever**: 하이브리드 검색 통계(후보 수), 필터 적용 여부 정보
+- **Judge**: 최종 추천 순위와 근거 요약, 리스크 탐지 정보
+- **System**: Trace ID 전파 여부, Fallback 발생 상세 사유
+- **UI Console**: Playground UI를 통한 실시간 한글 로그 모아보기
 
 ---
 

@@ -7,11 +7,16 @@ NTIS 전문가 추천 시스템의 메인 API 엔트리포인트입니다.
 from __future__ import annotations
 
 import logging
+import os
+import time
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from qdrant_client import QdrantClient
+import uvicorn
 
 from apps.api.playground import PLAYGROUND_HTML
 from apps.api.schemas import (
@@ -26,8 +31,11 @@ from apps.api.schemas import (
 )
 from apps.core.config import Settings, get_settings
 from apps.core.feedback_store import FeedbackStore
-from apps.core.logging import configure_logging
-from apps.core.runtime_validation import RuntimeDependencyValidator, validate_runtime_settings
+from apps.core.logging import configure_logging, request_id_ctx, captured_logs_ctx
+from apps.core.runtime_validation import (
+    RuntimeDependencyValidator,
+    validate_runtime_settings,
+)
 from apps.recommendation.cards import CandidateCardBuilder
 from apps.recommendation.judge import HeuristicJudge, OpenAICompatJudge
 from apps.recommendation.planner import HeuristicPlanner, OpenAICompatPlanner
@@ -47,13 +55,8 @@ logger = logging.getLogger(__name__)
 def build_dense_encoder(settings: Settings):
     """
     설정에 따라 적절한 Dense Encoder(임베딩 엔진)를 생성합니다.
-    
-    - openai: 실제 OpenAI API를 사용하여 의미론적 임베딩을 생성합니다.
-    - local: 로컬 SentenceTransformer 모델을 사용하여 임베딩을 생성합니다.
-    - 그 외: 테스트나 로컬 개발용 deterministic hashing encoder를 사용합니다.
     """
     if settings.embedding_backend == "openai":
-        # 운영 환경에서 실제 임베딩 서버를 붙일 때 쓰는 경로다.
         return OpenAIEmbeddingEncoder(
             model_name=settings.embedding_model_name,
             vector_size=settings.embedding_vector_size,
@@ -62,25 +65,27 @@ def build_dense_encoder(settings: Settings):
         )
     elif settings.embedding_backend == "local":
         from apps.search.encoders import LocalSentenceTransformerEncoder
+
         return LocalSentenceTransformerEncoder(
             model_name=settings.embedding_model_name,
             vector_size=settings.embedding_vector_size,
         )
     return HashingDenseEncoder(
-        # 로컬 기본값은 deterministic hashing encoder다.
-        # 실제 의미 임베딩을 대체하는 것은 아니고, seed/tests를 외부 모델 없이 돌리기 위한 장치다.
         model_name=settings.embedding_model_name,
         vector_size=settings.embedding_vector_size,
     )
 
 
-async def build_app_runtime(settings: Settings) -> tuple[RecommendationService, LiveContractValidator]:
+async def build_app_runtime(
+    settings: Settings,
+) -> tuple[RecommendationService, LiveContractValidator]:
     """
     애플리케이션 구동에 필요한 핵심 런타임 객체들을 초기화합니다.
-    Qdrant 클라이언트, 임베딩 엔진, LLM Planner/Judge, 피드백 저장소 등을 준비합니다.
     """
-    # 서비스 초기화 시점에 Qdrant 계약, feedback 저장소, seed를 함께 준비한다.
-    # 이렇게 해두면 요청 처리 경로는 검색/추천 자체에만 집중할 수 있다.
+    if settings.hf_hub_offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        logger.info("HuggingFace Hub 오프라인 모드 강제 설정 (HF_HUB_OFFLINE=1)")
+
     validate_runtime_settings(settings)
 
     registry = SearchSchemaRegistry.default()
@@ -89,21 +94,45 @@ async def build_app_runtime(settings: Settings) -> tuple[RecommendationService, 
         api_key=settings.qdrant_api_key,
         cloud_inference=settings.qdrant_cloud_inference,
     )
+    # 로컬 BM25 인코딩 기능 활성화 (fastembed 필요)
+    cache_dir = Path(settings.bm25_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["FASTEMBED_CACHE_PATH"] = str(cache_dir)
+
+    try:
+        client.set_sparse_model(
+            embedding_model_name=settings.bm25_model_name,
+            cache_dir=str(cache_dir),
+        )
+        logger.info(
+            "Qdrant sparse 모델 설정 완료: name=%s, cache=%s",
+            settings.bm25_model_name,
+            str(cache_dir),
+        )
+    except Exception as exc:
+        logger.warning("Qdrant sparse 모델 설정 실패: %s", exc)
+
     dense_encoder = build_dense_encoder(settings)
 
-    # LLM 백엔드 설정에 따라 Heuristic(규칙 기반) 또는 OpenAI(LLM 기반) Planner/Judge를 선택합니다.
-    planner = HeuristicPlanner() if settings.llm_backend == "heuristic" else OpenAICompatPlanner(settings)
-    judge = HeuristicJudge() if settings.llm_backend == "heuristic" else OpenAICompatJudge(settings)
+    planner = (
+        HeuristicPlanner()
+        if settings.llm_backend == "heuristic"
+        else OpenAICompatPlanner(settings)
+    )
+    judge = (
+        HeuristicJudge()
+        if settings.llm_backend == "heuristic"
+        else OpenAICompatJudge(settings)
+    )
 
-    # 사용자 피드백을 저장할 SQLite 저장소를 초기화합니다.
     feedback_store = FeedbackStore(settings.feedback_db_path, settings.feedback_table)
     feedback_store.initialize()
 
-    # Qdrant 컬렉션이 존재하는지 확인하고 필요시 생성합니다.
-    bootstrapper = QdrantBootstrapper(client=client, settings=settings, registry=registry)
+    bootstrapper = QdrantBootstrapper(
+        client=client, settings=settings, registry=registry
+    )
     bootstrapper.ensure_collection(recreate=settings.seed_allow_recreate_collection)
 
-    # 추천 서비스(핵심 비즈니스 로직)를 조립합니다.
     service = RecommendationService(
         planner=planner,
         retriever=QdrantHybridRetriever(
@@ -119,8 +148,7 @@ async def build_app_runtime(settings: Settings) -> tuple[RecommendationService, 
         feedback_store=feedback_store,
         shortlist_limit=settings.shortlist_limit,
     )
-    
-    # 실시간 시스템 무결성 검증을 위한 Validator를 생성합니다.
+
     validator = LiveContractValidator(
         client=client,
         settings=settings,
@@ -128,7 +156,6 @@ async def build_app_runtime(settings: Settings) -> tuple[RecommendationService, 
         dependency_validator=RuntimeDependencyValidator(settings),
     )
 
-    # 시작 시 데이터 시딩(Seeding)이 설정되어 있으면 실행합니다.
     if settings.seed_on_startup:
         seed_runner = SeedRunner(
             client=client,
@@ -155,20 +182,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """
-        애플리케이션 생명주기 관리(시작/종료 시 작업 정의).
-        비동기로 런타임 서비스를 초기화하여 app.state에 저장합니다.
-        """
         app.state.settings = active_settings
         app.state.recommendation_service = service
         app.state.live_validator = validator
         app.state.startup_error = None
         if app.state.recommendation_service is None:
             try:
-                built_service, built_validator = await build_app_runtime(active_settings)
+                built_service, built_validator = await build_app_runtime(
+                    active_settings
+                )
             except Exception as exc:
                 app.state.startup_error = f"Application startup failed: {exc}"
-                logger.exception("Application startup failed; readiness will report degraded state")
+                logger.exception(
+                    "Application startup failed; readiness will report degraded state"
+                )
             else:
                 app.state.recommendation_service = built_service
                 app.state.live_validator = built_validator
@@ -176,8 +203,35 @@ def create_app(
 
     app = FastAPI(title=active_settings.app_name, lifespan=lifespan)
 
+    @app.middleware("http")
+    async def log_request_middleware(request: Request, call_next):
+        """요청마다 고유 ID를 부여하고 처리 시간과 상태를 로그로 남깁니다."""
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        token = request_id_ctx.set(request_id)
+        # 로그 캡처 버퍼 초기화
+        log_token = captured_logs_ctx.set([])
+
+        t0 = time.monotonic()
+        try:
+            logger.info("--> 요청 시작: [%s] %s", request.method, request.url.path)
+            response = await call_next(request)
+            dt_ms = (time.monotonic() - t0) * 1000
+
+            response.headers["X-Request-ID"] = request_id
+
+            logger.info(
+                "<-- 요청 완료: [%s] %s | 상태 코드: %d | 소요 시간: %.2fms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                dt_ms,
+            )
+            return response
+        finally:
+            request_id_ctx.reset(token)
+            captured_logs_ctx.reset(log_token)
+
     def get_startup_error() -> str | None:
-        """시작 과정에서 발생한 에러를 가져옵니다."""
         return getattr(app.state, "startup_error", None)
 
     def build_readiness_response(
@@ -187,7 +241,6 @@ def create_app(
         issues: list[str],
         sample_point_id: str | None = None,
     ) -> ReadinessResponse:
-        """준비 상태 응답 객체를 생성합니다."""
         return ReadinessResponse(
             ready=ready,
             checks=checks,
@@ -197,7 +250,6 @@ def create_app(
         )
 
     def get_service() -> RecommendationService:
-        """app.state에서 추천 서비스를 가져오거나 준비되지 않은 경우 예외를 발생시킵니다."""
         service = app.state.recommendation_service
         if service is None:
             startup_error = get_startup_error()
@@ -206,29 +258,25 @@ def create_app(
                     status_code=503,
                     detail=f"Recommendation service is not ready: {startup_error}",
                 )
-            raise HTTPException(status_code=503, detail="Recommendation service is not ready")
+            raise HTTPException(
+                status_code=503, detail="Recommendation service is not ready"
+            )
         return service
 
     @app.get("/health")
     def health() -> dict[str, object]:
-        """기본적인 서비스 헬스체크 엔드포인트입니다."""
         return {
             "status": "ok",
             "collection_name": active_settings.qdrant_collection_name,
             "searched_branches": list(BRANCHES),
         }
 
-    @app.get("/playground", include_in_schema=False, response_class=HTMLResponse)
+    @app.get("/", include_in_schema=False, response_class=HTMLResponse)
     def playground() -> HTMLResponse:
-        """로컬 테스트를 위한 웹 UI(Playground)를 제공합니다."""
         return HTMLResponse(PLAYGROUND_HTML)
 
     @app.get("/health/ready", response_model=ReadinessResponse)
     def readiness() -> ReadinessResponse | JSONResponse:
-        """
-        서비스 상세 준비 상태를 확인합니다.
-        Qdrant 연결, 데이터 스키마 일치 여부 등을 실시간으로 검증합니다.
-        """
         startup_error = get_startup_error()
         if startup_error is not None:
             report = build_readiness_response(
@@ -256,18 +304,18 @@ def create_app(
                 checks={"readiness_check_completed": False},
                 issues=[f"Readiness validation crashed: {exc}"],
             )
-            return JSONResponse(status_code=503, content=degraded_report.model_dump(mode="json"))
+            return JSONResponse(
+                status_code=503, content=degraded_report.model_dump(mode="json")
+            )
         if not report.ready:
             payload = ReadinessResponse.model_validate(report.to_dict())
-            return JSONResponse(status_code=503, content=payload.model_dump(mode="json"))
+            return JSONResponse(
+                status_code=503, content=payload.model_dump(mode="json")
+            )
         return ReadinessResponse.model_validate(report.to_dict())
 
     @app.post("/recommend", response_model=RecommendationResponse)
     async def recommend(request: RecommendationRequest) -> RecommendationResponse:
-        """
-        자연어 질의를 기반으로 최종 전문가 추천 목록을 산출합니다.
-        질의 분석(Planner) -> 검색(Retriever) -> 다차원 평가(Judge) 과정을 거칩니다.
-        """
         service = get_service()
         result = await service.recommend(
             query=request.query,
@@ -275,13 +323,17 @@ def create_app(
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
         )
+        # 캡처된 로그 주입
+        logs = captured_logs_ctx.get()
+        if logs is not None and "trace" in result:
+            result["trace"]["server_logs"] = logs
+
         return RecommendationResponse.model_validate(result)
 
     @app.post("/search/candidates", response_model=SearchCandidatesResponse)
-    async def search_candidates(request: SearchCandidatesRequest) -> SearchCandidatesResponse:
-        """
-        최종 추천 단계(Judge)를 거치지 않고, 검색 필터가 적용된 전문가 후보 목록만 조회합니다.
-        """
+    async def search_candidates(
+        request: SearchCandidatesRequest,
+    ) -> SearchCandidatesResponse:
         service = get_service()
         result = await service.search_candidates(
             query=request.query,
@@ -289,6 +341,10 @@ def create_app(
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
         )
+
+        # 캡처된 로그 주입
+        logs = captured_logs_ctx.get()
+
         candidate_items = [
             SearchCandidateItem(
                 expert_id=card.expert_id,
@@ -302,27 +358,28 @@ def create_app(
             )
             for card in result["candidates"]
         ]
+
+        trace = {
+            "planner": result["planner"].model_dump(mode="json"),
+            "branch_queries": result["branch_queries"],
+            "exclude_orgs": result["planner"].exclude_orgs,
+            "candidate_ids": [card.expert_id for card in result["candidates"]],
+            "query_payload": service._serialize_query_payload(result["query_payload"]),
+        }
+        if logs is not None:
+            trace["server_logs"] = logs
+
         return SearchCandidatesResponse(
             intent_summary=result["planner"].intent_summary,
             applied_filters=result["planner"].hard_filters,
             searched_branches=list(BRANCHES),
             retrieved_count=result["retrieved_count"],
             candidates=candidate_items,
-            trace={
-                "planner": result["planner"].model_dump(mode="json"),
-                "branch_queries": result["branch_queries"],
-                "exclude_orgs": result["planner"].exclude_orgs,
-                "candidate_ids": [card.expert_id for card in result["candidates"]],
-                "query_payload": service._serialize_query_payload(result["query_payload"]),
-            },
+            trace=trace,
         )
 
     @app.post("/feedback", response_model=FeedbackResponse)
     def feedback(request: FeedbackRequest) -> FeedbackResponse:
-        """
-        추천 결과에 대한 사용자의 피드백을 저장합니다.
-        선택/거절된 전문가 ID와 관리자 메모 등을 기록합니다.
-        """
         service = get_service()
         feedback_id = service.save_feedback(
             query=request.query,
@@ -337,3 +394,6 @@ def create_app(
 
 
 app = create_app()
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8011, access_log=False)

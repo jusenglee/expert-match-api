@@ -15,6 +15,16 @@
 - LLM 기반 제어 파이프라인
   - Planner: 사용자 질의를 시스템이 처리가능한 검색 엔진 필터(hard_filters) 및 검색 쿼리로 변환합니다.
   - Judge: 1차적으로 도출된 인물 후보군(Candidate Cards)의 관련 요소를 LLM이 대조하여 최종 순위와 선정 사유를 산출합니다.
+- **실시간 추적 및 가시성 기반 디버깅 (Observability)**
+  - 모든 요청에 고유한 **Trace ID(Request ID)**를 부여하여 Planner, Retriever, Judge를 거치는 전 과정을 추적합니다.
+  - 모든 주요 로그는 정교한 한글 메시지로 출력되어 장애 발생 시 신속한 원인 파악이 가능합니다.
+
+## 시각적 도구: Playground & 로그 콘솔
+
+본 시스템은 개발 및 테스트 편의를 위해 강력한 웹 기반 도구를 제공합니다.
+
+- **Interactive Playground**: `/playground` 주소에서 자연어 질의를 직접 입력하고 추천 결과를 즉시 확인할 수 있습니다.
+- **실시간 서버 로그 콘솔**: Playground UI 하단에 통합된 콘솔을 통해 서버 내부에서 발생하는 상세 한글 로그를 실시간으로 모니터링할 수 있습니다.
 
 ## 시작 가이드
 
@@ -36,7 +46,7 @@ OPENAI_API_KEY=sk-your-api-key-here
 ### 3. 서버 실행
 개발용 서버 구동 명령어는 다음과 같습니다.
 ```bash
-uvicorn apps.api.main:app --reload
+uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 ```
 
 ## 문서 안내

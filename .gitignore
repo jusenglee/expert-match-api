@@ -7,3 +7,4 @@ htmlcov/
 feedback.db
 runtime/
 *.egg-info/
+multilingual-e5-large-instruct/

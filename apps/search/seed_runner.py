@@ -71,10 +71,10 @@ class SeedRunner:
         for branch in BRANCHES:
             # Dense Vector: 의미론적 임베딩 생성
             vectors[self.registry.dense_vector_by_branch[branch]] = self.dense_encoder.embed(dense_texts[branch])
-            # Sparse Vector: BM25 키워드 인덱싱용 텍스트 할당
+            # Sparse Vector: BM25 키워드 인덱싱용 텍스트 할당 (로컬 인코딩)
             vectors[self.registry.sparse_vector_by_branch[branch]] = models.Document(
                 text=dense_texts[branch],
-                model="qdrant/bm25",
+                model=self.settings.bm25_model_name,
             )
             
         return models.PointStruct(

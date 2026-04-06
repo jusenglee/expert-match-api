@@ -194,6 +194,7 @@ class PlannerOutput(BaseModel):
     hard_filters: dict[str, Any] = Field(default_factory=dict)
     exclude_orgs: list[str] = Field(default_factory=list)
     soft_preferences: list[str] = Field(default_factory=list)
+    core_keywords: list[str] = Field(default_factory=list)
     branch_query_hints: dict[BranchName, str] = Field(default_factory=dict)
     top_k: int = 5
 
@@ -221,6 +222,7 @@ class CandidateCard(BaseModel):
     major: str | None = None
     branch_coverage: dict[BranchName, bool] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
+    keyword_matched_counts: dict[str, int] = Field(default_factory=dict)
     top_papers: list[PublicationEvidence] = Field(default_factory=list)
     top_patents: list[IntellectualPropertyEvidence] = Field(default_factory=list)
     top_projects: list[ResearchProjectEvidence] = Field(default_factory=list)
@@ -228,6 +230,7 @@ class CandidateCard(BaseModel):
     risks: list[str] = Field(default_factory=list)
     data_gaps: list[str] = Field(default_factory=list)
     shortlist_score: float = 0.0
+    relevance_score: float = 0.0
 
 
 class RecommendationDecision(BaseModel):
@@ -238,10 +241,10 @@ class RecommendationDecision(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+    relevance_score: float = 0.0
 
 
 class JudgeOutput(BaseModel):
     recommended: list[RecommendationDecision] = Field(default_factory=list)
     not_selected_reasons: list[str] = Field(default_factory=list)
     data_gaps: list[str] = Field(default_factory=list)
-

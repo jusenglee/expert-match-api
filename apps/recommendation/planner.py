@@ -133,8 +133,15 @@ class HeuristicPlanner:
             if item not in exclude_list:
                 exclude_list.append(item)
 
+        # 간단한 핵심 키워드 추출 (Heuristic)
+        core_keywords: list[str] = []
+        for kw in ["자율주행", "인체", "에너지", "나노", "양자", "반도체", "인공지능", "배터리"]:
+            if kw in query:
+                core_keywords.append(kw)
+
         return PlannerOutput(
             intent_summary=query.strip(),
+            core_keywords=core_keywords,
             hard_filters=hard_filters,
             exclude_orgs=exclude_list,
             soft_preferences=soft_preferences,
@@ -182,26 +189,29 @@ class OpenAICompatPlanner:
                - "작년부터", "최근 2년" 등 상대적 기간은 현재 연도를 기준으로 정수형(Integer) 값으로 변환하여 `art_recent_years` 또는 `pjt_recent_years`에 할당한다. (예: "최근 3년" -> 3)
                - "최근"이라는 모호한 표현만 있고 수치가 없으면 기본값인 5를 할당한다.
             
-            3. **불필요한 조건 창조 금지 (No Hallucination)**:
+            3. **증거 필터링용 핵심 키워드 추출 (core_keywords)**:
+               - 질의에서 실적(논문/특허/과제) 필터링에 사용할 가장 핵심적인 기술/분야 명사 키워드 2~3개를 추출하여 `core_keywords` 배열에 담는다. (예: ["자율주행", "인공지능"])
+               - 이 키워드들은 나중에 실적 데이터의 제목이나 초록에서 부분 일치(Substring) 매칭용으로 사용되므로, 너무 길지 않은 핵심 명사 위주로 뽑는다.
+
+            4. **추가 조건 및 검색 힌트**:
                - 사용자가 명시하지 않은 조건(성별, 나이, 특정 지역 등)을 추측하여 `hard_filters`에 추가하지 마라.
                - `hard_filters`에는 오직 `art_recent_years`, `pjt_recent_years`, `patent_cnt_min`, `article_cnt_min`, `project_cnt_min`, `degree_slct_nm`, `major_nm` 키만 사용 가능하다.
-            
-            4. **검색 힌트(branch_query_hints) 최적화**:
                - 각 브랜치(basic, art, pat, pjt)의 특성에 맞는 전문 용어와 동의어를 사용하여 검색어 보정 힌트를 생성하라.
-               - `art` 브랜치는 학술적 키워드, `pat` 브랜치는 기술 및 산업적 키워드, `pjt` 브랜치는 사업적/과제 중심 키워드를 강조한다.
-            
+
             ### [출력 스키마 가이드]
             - `intent_summary`: 사용자의 전체 질의 의도를 한 문장으로 요약.
+            - `core_keywords`: 실적 필터링용 핵심 기술 명사 리스트.
             - `hard_filters`: 필수 조건들을 key-value 쌍으로 구성.
-            - `exclude_orgs`: 제외할 기관명들에서 조사(예: ~는, ~에서)를 제거한 순수 명사 리스트.
-            - `soft_preferences`: 강제할 순 없지만 사용자가 선호하는 특징(예: "경력이 풍부한", "학술적 성과가 높은")을 리스트로 정리.
-            - `branch_query_hints`: 각 브랜치별(basic, art, pat, pjt) 검색 품질을 높이기 위한 확장 키워드 문자열.
-            - `top_k`: 추천 인원수. 명시되지 않으면 기본값 5.
+            - `exclude_orgs`: 제외할 기관명들에서 조사를 제거한 순수 명사 리스트.
+            - `soft_preferences`: 사용자가 선호하는 특징 리스트.
+            - `branch_query_hints`: 각 브랜치별 검색 품질을 높이기 위한 확장 키워드 문자열.
+            - `top_k`: 추천 인원수. 기본값 5.
             
             ### [입력 질의 처리 예시]
             질의: "서울대학교 소속은 제외하고, 인공지능 분야에서 최근 3년간 특허가 2건 이상 있는 박사급 전문가 10명 추천해줘."
             결과: {
               "intent_summary": "서울대를 제외한 인공지능 분야의 최근 3년 내 2건 이상 특허를 보유한 박사급 전문가 추천",
+              "core_keywords": ["인공지능", "머신러닝"],
               "hard_filters": {"degree_slct_nm": "박사", "patent_cnt_min": 2, "art_recent_years": 3},
               "exclude_orgs": ["서울대학교"],
               "soft_preferences": ["인공지능 분야 전문성"],
@@ -227,15 +237,23 @@ class OpenAICompatPlanner:
         )
         try:
             # 모델 호출
+            logger.info("LLM 질의 분석(Planning) 시작: 질의=%s", query)
             result = await self.model.ainvoke_non_stream(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
             # 결과 텍스트에서 JSON 추출 및 파싱
-            payload = json.loads(_extract_json_object_text(result.content))
-            return PlannerOutput.model_validate(payload)
+            json_text = _extract_json_object_text(result.content)
+            logger.debug("LLM 응답 텍스트(추출됨): %s", json_text)
+            
+            payload = json.loads(json_text)
+            output = PlannerOutput.model_validate(payload)
+            
+            logger.info("질의 분석 성공: 의도=%r 제외기관=%d개 필터=%r", 
+                        output.intent_summary, len(output.exclude_orgs), output.hard_filters)
+            return output
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             # LLM 장애 또는 파싱 에러 시 HeuristicPlanner로 대체
-            logger.warning("Planner fallback activated: %s", exc)
+            logger.warning("플래너 Fallback 활성화: 사유=%s", exc)
             return await self.fallback.plan(
                 query=query,
                 filters_override=filters_override,
