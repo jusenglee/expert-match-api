@@ -349,6 +349,8 @@ class OpenAICompatJudge:
 
     @staticmethod
     def _build_system_prompt() -> str:
+        """최종 Reduce/Single 라운드용 상세 프롬프트입니다.
+        추천 사유, 근거, 리스크 등 완전한 심사 결과를 생성합니다."""
         return """
             You are the senior recommendation judge for a Korean R&D evaluator recommendation system.
             Return exactly one JSON object that matches this schema:
@@ -389,9 +391,28 @@ class OpenAICompatJudge:
             - Do not return markdown, code fences, or any prose outside the JSON object.
         """
 
+    @staticmethod
+    def _build_map_system_prompt() -> str:
+        """중간 Map 라운드용 경량 프롬프트입니다.
+        상세 사유 없이 생존자 expert_id 목록만 빠르게 반환합니다."""
+        return (
+            "You are a fast screening filter for a Korean R&D evaluator recommendation system.\n"
+            "Your job: from the given shortlist, select the candidates most relevant to the query.\n"
+            "Return ONLY a JSON object. No markdown, no explanation.\n"
+            "First character must be '{', last character must be '}'.\n\n"
+            "Output schema:\n"
+            '{"survivors":[{"expert_id":"...","rank":1},{"expert_id":"...","rank":2}]}\n\n'
+            "Rules:\n"
+            "- Select up to the number specified in plan.top_k (or more if many strong candidates exist).\n"
+            "- Copy expert_id exactly from the shortlist input.\n"
+            "- Rank by relevance to the query (1 = best).\n"
+            "- ONLY output the JSON object. No reasons, no evidence, no explanation.\n"
+        )
+
     def _serialize_shortlist(
         self, shortlist: list[CandidateCard]
     ) -> list[dict[str, Any]]:
+        """Reduce/Single 라운드용 전체 직렬화 (상세 근거 포함)."""
         dumped_shortlist = [card.model_dump(mode="json") for card in shortlist]
         for card_dict in dumped_shortlist:
             for paper in card_dict.get("top_papers", []):
@@ -411,6 +432,41 @@ class OpenAICompatJudge:
                         proj["research_content_summary"][:150] + "..."
                     )
         return dumped_shortlist
+
+    @staticmethod
+    def _serialize_shortlist_for_map(
+        shortlist: list[CandidateCard],
+    ) -> list[dict[str, Any]]:
+        """Map 라운드용 경량 직렬화.
+        LLM이 관련성 판단에 필요한 최소 정보만 포함하여 입력 토큰을 절약합니다."""
+        lightweight: list[dict[str, Any]] = []
+        for card in shortlist:
+            entry: dict[str, Any] = {
+                "expert_id": card.expert_id,
+                "name": card.name,
+                "organization": card.organization,
+                "degree": card.degree,
+                "major": card.major,
+                "rank_score": card.rank_score,
+                "counts": card.counts,
+                "keyword_matched_counts": card.keyword_matched_counts,
+                "branch_coverage": card.branch_coverage,
+            }
+            # 제목만 간결하게 포함 (abstract, 키워드 등 제외)
+            if card.top_papers:
+                entry["paper_titles"] = [
+                    p.publication_title for p in card.top_papers
+                ]
+            if card.top_patents:
+                entry["patent_titles"] = [
+                    p.intellectual_property_title for p in card.top_patents
+                ]
+            if card.top_projects:
+                entry["project_titles"] = [
+                    p.display_title for p in card.top_projects
+                ]
+            lightweight.append(entry)
+        return lightweight
 
     @staticmethod
     def _build_chunks(
@@ -452,19 +508,77 @@ class OpenAICompatJudge:
         round_index: int,
         batch_index: int,
         batch_count: int,
+        max_tokens_hint: int | None = None,
     ) -> tuple[Any, float]:
         async with self._judge_semaphore:
             logger.info(
-                "LLM 호출 슬롯 획득: context=%s round=%d batch=%d/%d max_concurrency=%d",
+                "LLM 호출 슬롯 획득: context=%s round=%d batch=%d/%d max_concurrency=%d max_tokens=%s",
                 context_label,
                 round_index,
                 batch_index,
                 batch_count,
                 self.settings.llm_judge_max_concurrency,
+                max_tokens_hint or "unlimited",
             )
+            invoke_kwargs: dict[str, Any] = {}
+            if max_tokens_hint is not None:
+                invoke_kwargs["max_tokens_hint"] = max_tokens_hint
             with Timer() as t:
-                result = await self.model.ainvoke_non_stream(messages)
+                result = await self.model.ainvoke_non_stream(messages, **invoke_kwargs)
             return result, t.elapsed_ms
+
+    @staticmethod
+    def _parse_map_response(
+        raw_payload: dict[str, Any], shortlist: list[CandidateCard]
+    ) -> JudgeOutput:
+        """Map 라운드의 경량 응답을 JudgeOutput으로 변환합니다.
+        survivors 배열에서 expert_id만 추출하여 최소한의 RecommendationDecision을 생성합니다.
+        LLM이 recommended 형식으로 반환한 경우에도 호환 처리합니다."""
+        survivors = raw_payload.get("survivors", [])
+        if not isinstance(survivors, list):
+            survivors = []
+        # Fallback: LLM이 기존 recommended 형식으로 응답한 경우 호환 처리
+        if not survivors:
+            recommended = raw_payload.get("recommended", [])
+            if isinstance(recommended, list) and recommended:
+                survivors = recommended
+                logger.info("Map 응답 호환 처리: 'recommended' 키를 'survivors'로 대체 사용 (항목 수=%d)", len(survivors))
+
+        card_lookup: dict[str, CandidateCard] = {c.expert_id: c for c in shortlist}
+        recommendations: list[RecommendationDecision] = []
+
+        for fallback_rank, entry in enumerate(survivors, start=1):
+            if not isinstance(entry, dict):
+                continue
+            expert_id = entry.get("expert_id", "")
+            if isinstance(expert_id, str):
+                expert_id = expert_id.strip()
+            if not expert_id:
+                continue
+
+            card = card_lookup.get(expert_id)
+            rank = entry.get("rank", fallback_rank)
+            if isinstance(rank, str):
+                try:
+                    rank = int(rank.strip())
+                except ValueError:
+                    rank = fallback_rank
+
+            recommendations.append(
+                RecommendationDecision(
+                    rank=rank,
+                    expert_id=expert_id,
+                    name=card.name if card else "",
+                    organization=card.organization if card else None,
+                    fit="보통",
+                    reasons=[],
+                    evidence=[],
+                    risks=[],
+                    rank_score=card.rank_score if card else 0.0,
+                )
+            )
+
+        return JudgeOutput(recommended=recommendations)
 
     async def _judge_single_shortlist(
         self,
@@ -477,7 +591,18 @@ class OpenAICompatJudge:
         batch_index: int,
         batch_count: int,
     ) -> JudgeOutput:
-        dumped_shortlist = self._serialize_shortlist(shortlist)
+        is_map_phase = context_label == "map"
+
+        # Map 라운드: 경량 직렬화 + 경량 프롬프트 + max_tokens 제한
+        if is_map_phase:
+            dumped_shortlist = self._serialize_shortlist_for_map(shortlist)
+            system_prompt = self._build_map_system_prompt()
+            max_tokens_hint = 200
+        else:
+            dumped_shortlist = self._serialize_shortlist(shortlist)
+            system_prompt = self._build_system_prompt()
+            max_tokens_hint = None
+
         self._log_shortlist_token_estimate(
             dumped_shortlist,
             context_label=context_label,
@@ -489,19 +614,20 @@ class OpenAICompatJudge:
             "shortlist": dumped_shortlist,
         }
         messages = [
-            SystemMessage(content=self._build_system_prompt()),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
         ]
 
         normalized_recommendation_count = 0
         try:
             logger.info(
-                "LLM 판정 시작: context=%s round=%d batch=%d/%d 후보 수=%d",
+                "LLM 판정 시작: context=%s round=%d batch=%d/%d 후보 수=%d max_tokens=%s",
                 context_label,
                 round_index,
                 batch_index,
                 batch_count,
                 len(shortlist),
+                max_tokens_hint or "unlimited",
             )
             result, elapsed_ms = await self._invoke_non_stream_with_limit(
                 messages,
@@ -509,6 +635,7 @@ class OpenAICompatJudge:
                 round_index=round_index,
                 batch_index=batch_index,
                 batch_count=batch_count,
+                max_tokens_hint=max_tokens_hint,
             )
             json_text = _extract_json_object_text(result.content)
             logger.info(
@@ -529,6 +656,22 @@ class OpenAICompatJudge:
             )
 
             raw_payload = json.loads(json_text)
+
+            # Map 라운드: 경량 파싱 (survivors 배열만 처리)
+            if is_map_phase:
+                output = self._parse_map_response(raw_payload, shortlist)
+                logger.info(
+                    "Map 스크리닝 완료: context=%s round=%d batch=%d/%d 생존자=%d명 소요시간=%.2fms",
+                    context_label,
+                    round_index,
+                    batch_index,
+                    batch_count,
+                    len(output.recommended),
+                    elapsed_ms,
+                )
+                return output
+
+            # Reduce/Single 라운드: 기존 상세 파싱
             normalized_payload, normalized_applied = _normalize_judge_payload(
                 raw_payload, shortlist
             )
