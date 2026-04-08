@@ -10,7 +10,11 @@ import logging
 from qdrant_client import QdrantClient, models
 
 from apps.core.config import Settings
-from apps.search.schema_registry import BRANCHES, PAYLOAD_INDEX_FIELDS, SearchSchemaRegistry
+from apps.search.schema_registry import (
+    BRANCHES,
+    PAYLOAD_INDEX_FIELDS,
+    SearchSchemaRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +32,10 @@ class QdrantBootstrapper:
     Qdrant 저장소의 초기 설정을 담당하는 클래스입니다.
     컬렉션 생성, 벡터 설정, 인덱스 관리를 수행합니다.
     """
-    def __init__(self, client: QdrantClient, settings: Settings, registry: SearchSchemaRegistry) -> None:
+
+    def __init__(
+        self, client: QdrantClient, settings: Settings, registry: SearchSchemaRegistry
+    ) -> None:
         self.client = client
         self.settings = settings
         self.registry = registry
@@ -43,7 +50,9 @@ class QdrantBootstrapper:
             try:
                 self.client.delete_collection(collection_name=collection_name)
             except Exception:
-                logger.info("Collection %s did not exist before recreate", collection_name)
+                logger.info(
+                    "Collection %s did not exist before recreate", collection_name
+                )
 
         if not self._collection_exists(collection_name):
             # 컬렉션 생성 (다중 Dense 벡터 및 Sparse 벡터 설정 포함)
@@ -58,13 +67,15 @@ class QdrantBootstrapper:
                 },
                 # BM25 기반 키워드 검색을 위한 Sparse 벡터 설정
                 sparse_vectors_config={
-                    self.registry.sparse_vector_by_branch[branch]: models.SparseVectorParams(
+                    self.registry.sparse_vector_by_branch[
+                        branch
+                    ]: models.SparseVectorParams(
                         modifier=models.Modifier.IDF,
                     )
                     for branch in BRANCHES
                 },
             )
-        
+
         # 키워드 가중치 수식(Modifier) 확인 및 인덱스 설정
         self.ensure_sparse_vector_modifiers()
         self.ensure_payload_indexes()
@@ -75,7 +86,11 @@ class QdrantBootstrapper:
         if modifier is None:
             return False
 
-        candidates = [modifier, getattr(modifier, "value", None), getattr(modifier, "name", None)]
+        candidates = [
+            modifier,
+            getattr(modifier, "value", None),
+            getattr(modifier, "name", None),
+        ]
         for candidate in candidates:
             if candidate is None:
                 continue
@@ -91,14 +106,23 @@ class QdrantBootstrapper:
         다를 경우 수정을 시도합니다.
         """
         try:
-            collection_info = self.client.get_collection(self.settings.qdrant_collection_name)
+            collection_info = self.client.get_collection(
+                self.settings.qdrant_collection_name
+            )
         except Exception as exc:
-            logger.warning("Skipping sparse vector modifier repair because collection lookup failed: %s", exc)
+            logger.warning(
+                "Skipping sparse vector modifier repair because collection lookup failed: %s",
+                exc,
+            )
             return
 
-        sparse_config = getattr(collection_info.config.params, "sparse_vectors", None) or {}
+        sparse_config = (
+            getattr(collection_info.config.params, "sparse_vectors", None) or {}
+        )
         if not isinstance(sparse_config, dict):
-            logger.warning("Skipping sparse vector modifier repair because sparse vector config is unavailable")
+            logger.warning(
+                "Skipping sparse vector modifier repair because sparse vector config is unavailable"
+            )
             return
 
         updates: dict[str, models.SparseVectorParams] = {}
@@ -108,7 +132,9 @@ class QdrantBootstrapper:
             modifier = getattr(params, "modifier", None)
             # IDF가 아니면 업데이트 목록에 추가
             if not self._modifier_is_idf(modifier):
-                updates[vector_name] = models.SparseVectorParams(modifier=models.Modifier.IDF)
+                updates[vector_name] = models.SparseVectorParams(
+                    modifier=models.Modifier.IDF
+                )
 
         if not updates:
             return
@@ -124,7 +150,11 @@ class QdrantBootstrapper:
                 sorted(updates.keys()),
             )
         except Exception as exc:
-            logger.warning("Failed to update sparse vector modifiers for %s: %s", self.settings.qdrant_collection_name, exc)
+            logger.warning(
+                "Failed to update sparse vector modifiers for %s: %s",
+                self.settings.qdrant_collection_name,
+                exc,
+            )
 
     def ensure_payload_indexes(self) -> None:
         """정의된 필드들에 대해 검색 성능 향상을 위한 인덱스를 생성합니다."""

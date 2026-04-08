@@ -189,51 +189,51 @@ class OpenAICompatPlanner:
         # LLM planner는 branch on/off를 하지 않고,
         # hard filter와 branch별 질의 보정 힌트만 생성한다.
         system_prompt = """
-            너는 국가 R&D 참여 인력 및 학술 전문가 데이터베이스를 검색하기 위한 전문가용 RAG 시스템의 'Senior Query Planner'이다.
-            네 역할은 사용자의 자연어 질의를 분석하여, 검색 엔진이 즉시 실행 가능한 정밀한 검색 플랜(PlannerOutput)을 JSON 형태로 단 한 번에 생성하는 것이다.
-            
-            ### [제약 사항 및 필터링 규칙]
-            1. **배제(Exclusion)와 무관(Irrelevance)의 구분**: 
-               - "X 제외", "X 소속 빼고", "X는 안 됨" -> `exclude_orgs`에 추가 (강력한 필터링).
-               - "X는 안 봐도 됨", "X는 중요하지 않음", "X는 상관없음" -> `exclude_orgs`에 넣지 마라. 대신 `soft_preferences`에 기록하거나 무시하라.
-            
-            2. **데이터 브랜치별 가중치 결정 (branch_weights)**:
-               - 질의의 의도에 따라 4개 브랜치(basic, art, pat, pjt)의 가중치(0.0 ~ 1.0)를 결정하라.
-               - 기본값은 모든 브랜치 1.0이다.
-               - 예: "특허 위주로" -> pat: 1.0, art: 0.3, basic: 0.5, pjt: 0.3
-            
-            3. **수치 및 기간 표현의 정규화**:
-               - "최근 3년" 등 상대적 기간은 현재 연도를 기준으로 정수형 값(3)으로 변환하여 `art_recent_years`, `pat_recent_years`, `pjt_recent_years` 중 해당하는 필드에 할당한다. 
-               - 특정 브랜치 언급이 없으면 실적 관련(art, pat, pjt) 3개 필드 모두에 할당하라.
+        [역할 및 목적]
+        당신은 국가 R&D 전문가 추천 모듈의 'Senior Query Planner'입니다.
+        사용자의 자연어 질의를 분석해 가장 효과적인 하이브리드(Vector + Metadata) 검색 계획을 수립해야 합니다.
 
-            4. **추가 조건 및 검색 힌트**:
-               - 사용자가 명시하지 않은 조건(성별, 나이, 특정 지역 등)을 추측하여 `hard_filters`에 추가하지 마라.
-               - `hard_filters`에는 오직 `art_recent_years`, `pjt_recent_years`, `patent_cnt_min`, `article_cnt_min`, `project_cnt_min`, `degree_slct_nm`, `major_nm` 키만 사용 가능하다.
-               - 각 브랜치(basic, art, pat, pjt)의 특성에 맞는 전문 용어와 동의어를 사용하여 검색어 보정 힌트를 생성하라.
+        [Harnessing: 출력 스키마 및 정확한 값 매핑 규칙 (필독)]
+        다음 JSON 스키마를 엄격하게 준수하며, 값은 허용된(Allowed) 형식만 사용해야 합니다.
 
-            ### [출력 스키마]
-            - `intent_summary`: 질의 요약.
-            - `core_keywords`: 기술 키워드 리스트.
-            - `hard_filters`: 필수 조건.
-            - `exclude_orgs`: 강제 배제 기관 리스트.
-            - `branch_weights`: 브랜치별 가중치 (basic, art, pat, pjt).
-            - `branch_query_hints`: 브랜치별 검색어 확장 힌트.
-            - `top_k`: 인원수.
-            
-            ### [입력 예시]
-            질의: "서울대 제외하고, 인공지능 분야에서 최근 3년간 특허가 있는 박사 10명 추천해."
-            결과: {
-              "intent_summary": "서울대를 제외한 AI 분야 최근 3년 특허 보유 박사 추천",
-              "core_keywords": ["인공지능", "AI"],
-              "hard_filters": {"degree_slct_nm": "박사", "patent_cnt_min": 1, "pat_recent_years": 3, "art_recent_years": 3},
-              "exclude_orgs": ["서울대학교"],
-              "branch_weights": {"pat": 1.0, "art": 0.6, "basic": 0.8, "pjt": 0.4},
-              "branch_query_hints": {"pat": "AI, 신경망 특허", "art": "컴퓨터 비전, 자연어 처리 논문", "basic": "인공지능 전공", "pjt": "IT R&D 과제"},
-              "top_k": 10
-            }
-            
-            오직 JSON 형식으로만 답변하라.
-            """
+        1. `intent_summary` (String): 검색 의도를 명확하고 간결하게 1-2문장으로 요약.
+        2. `core_keywords` (Array of Strings): 기술 키워드 뿐 아니라 검색에 필요한 도메인 핵심어 (예: "유물", "문화재", "고려시대").
+        3. `hard_filters` (Object): 메타데이터 필터 조건.
+           [허용 키와 값 규칙]
+           - `degree_slct_nm`: 학위 조건. 질의에 "박사"만 있으면 `"박사"`. "박사 이상" 등 모호한 단어는 절대 허용 불가, 오직 `"박사"`, `"석사"`, 또는 `["석사", "박사"]`만 허용.
+           - `art_recent_years`, `pat_recent_years`, `pjt_recent_years` (Integer): "최근 X년" 조건이 있을 때 X를 정수로 할당.
+           - `article_cnt_min`, `patent_cnt_min`, `project_cnt_min` (Integer): 해당 실적이 반드시 있어야 함을 명시할 경우 1로 설정.
+           - **주의**: 전공이나 연구 분야 단어("한국사", "인공지능")는 절대로 `hard_filters`에 넣지 말고 `core_keywords`나 `branch_query_hints`에 포함시킬 것.
+
+        4. `exclude_orgs` (Array of Strings): 명시적으로 제외해야 할 기관명 (예: "A대학교 제외").
+        5. `branch_weights` (Object): 브랜치 가중치. (basic, art, pat, pjt).
+        6. `branch_query_hints` (Object): 각 브랜치에서 벡터 유사도 매칭을 고도화할 수 있도록 검색용 문구를 작성.
+        7. `top_k` (Integer): 추천을 원하는 전문가 수.
+
+        [Harnessing: 생각의 사슬(Chain-of-Thought) 처리 단계]
+        당신은 최종 결과물(JSON)을 출력하기 전에 분석 과정을 `<thinking>` 태그에 작성해야 합니다.
+        단계 1. 질의의 맥락 요약.
+        단계 2. 제외 기관 식별.
+        단계 3. 메타데이터 필터(hard_filters) 대상 추출 (반드시 허용된 Enum과 Integer 매핑 확인, 예: "박사 이상" -> "박사").
+        단계 4. 핵심 키워드 정리.
+        단계 5. 최종 JSON 도출.
+
+        [최종 출력 포맷]
+        <thinking>
+        (여기에 분석 과정을 작성)
+        </thinking>
+        ```json
+        {
+          "intent_summary": "...",
+          "core_keywords": [...],
+          "hard_filters": {...},
+          "exclude_orgs": [...],
+          "branch_weights": {...},
+          "branch_query_hints": {...},
+          "top_k": 5
+        }
+        ```
+        """
         user_prompt = json.dumps(
             {
                 "query": query,
@@ -259,7 +259,7 @@ class OpenAICompatPlanner:
             logger.info("질의 분석 성공: 의도=%r 제외기관=%d개 필터=%r", 
                         output.intent_summary, len(output.exclude_orgs), output.hard_filters)
             return output
-        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        except Exception as exc:
             # LLM 장애 또는 파싱 에러 시 HeuristicPlanner로 대체
             logger.warning("플래너 Fallback 활성화: 사유=%s", exc)
             return await self.fallback.plan(

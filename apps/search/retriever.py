@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import pprint
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,7 +74,7 @@ class QdrantHybridRetriever:
         """
         # 1. 브랜치별 최적화된 질의 텍스트 구성
         branch_queries = self.query_builder.build_branch_queries(query, plan)
-        logger.debug("브랜치별 생성 쿼리: %s", branch_queries)
+        logger.debug("브랜치별 생성 쿼리:\n%s", pprint.pformat(branch_queries, indent=2, width=100))
         prefetches: list[models.Prefetch] = []
 
         # 2. 각 데이터 브랜치별로 Prefetch 쿼리 조립
@@ -125,13 +126,29 @@ class QdrantHybridRetriever:
             "with_vectors": False,
         }
 
+        def _sanitize_payload_for_log(data: Any) -> Any:
+            if hasattr(data, "model_dump"):
+                try: data = data.model_dump()
+                except Exception: pass
+            elif hasattr(data, "dict") and callable(data.dict):
+                try: data = data.dict()
+                except Exception: pass
+                
+            if isinstance(data, dict):
+                return {k: _sanitize_payload_for_log(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                if len(data) > 100 and all(isinstance(x, (float, int)) for x in data[:10]):
+                    return f"<Dense Vector: {len(data)} dimensions>"
+                return [_sanitize_payload_for_log(x) for x in data]
+            return data
+
         # Qdrant 호출 (동기 서버 메서드를 비동기 스레드에서 실행)
         logger.info(
             "Qdrant 하이브리드 검색 실행: 컬렉션=%s 필터 적용 여부=%s",
             self.settings.qdrant_collection_name,
             "예" if query_filter else "아니오",
         )
-        logger.info("Qdrant 전달 플랜(Query Payload): %s", query_payload)
+        logger.info("Qdrant 전달 플랜(Query Payload):\n%s", pprint.pformat(_sanitize_payload_for_log(query_payload), indent=2, width=120))
         with Timer() as t:
             points = await asyncio.to_thread(self.client.query_points, **query_payload)
         logger.info("Qdrant 검색 완료: 소요시간=%.2fms", t.elapsed_ms)

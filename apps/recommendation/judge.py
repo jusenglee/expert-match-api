@@ -11,7 +11,13 @@ from pydantic import ValidationError
 from apps.core.config import Settings
 from apps.core.openai_compat_llm import OpenAICompatChatModel
 from apps.core.timer import Timer
-from apps.domain.models import CandidateCard, EvidenceItem, JudgeOutput, PlannerOutput, RecommendationDecision
+from apps.domain.models import (
+    CandidateCard,
+    EvidenceItem,
+    JudgeOutput,
+    PlannerOutput,
+    RecommendationDecision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +83,9 @@ def _normalize_rank(value: Any, fallback_rank: int) -> int | Any:
     return value
 
 
-def _normalize_judge_payload(payload: Any, shortlist: list[CandidateCard]) -> tuple[Any, bool]:
+def _normalize_judge_payload(
+    payload: Any, shortlist: list[CandidateCard]
+) -> tuple[Any, bool]:
     if not isinstance(payload, dict):
         return payload, False
 
@@ -149,12 +157,16 @@ def _normalize_judge_payload(payload: Any, shortlist: list[CandidateCard]) -> tu
                 normalized_applied = True
 
         rank_score = normalized_item.get("rank_score")
-        if rank_score is None and expert_id:
-            # 카드에서 점수 복원
+        if expert_id:
             card = next((c for c in shortlist if c.expert_id == expert_id), None)
             if card:
-                normalized_item["rank_score"] = card.rank_score
-                normalized_applied = True
+                if rank_score is None:
+                    normalized_item["rank_score"] = card.rank_score
+                    normalized_applied = True
+                
+                if normalized_item.get("organization") != card.organization:
+                    normalized_item["organization"] = card.organization
+                    normalized_applied = True
 
         normalized_recommended.append(normalized_item)
 
@@ -163,13 +175,18 @@ def _normalize_judge_payload(payload: Any, shortlist: list[CandidateCard]) -> tu
 
 
 class Judge(Protocol):
-    async def judge(self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]) -> JudgeOutput:
-        ...
+    async def judge(
+        self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]
+    ) -> JudgeOutput: ...
 
 
 class HeuristicJudge:
-    async def judge(self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]) -> JudgeOutput:
-        ranked_cards = sorted(shortlist, key=lambda card: card.shortlist_score, reverse=True)
+    async def judge(
+        self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]
+    ) -> JudgeOutput:
+        ranked_cards = sorted(
+            shortlist, key=lambda card: card.shortlist_score, reverse=True
+        )
         recommendations: list[RecommendationDecision] = []
         global_data_gaps: list[str] = []
 
@@ -196,7 +213,8 @@ class HeuristicJudge:
                         EvidenceItem(
                             type="patent",
                             title=card.top_patents[0].intellectual_property_title,
-                            date=card.top_patents[0].registration_date or card.top_patents[0].application_date,
+                            date=card.top_patents[0].registration_date
+                            or card.top_patents[0].application_date,
                             detail=card.top_patents[0].application_registration_type,
                         )
                     )
@@ -208,7 +226,8 @@ class HeuristicJudge:
                         EvidenceItem(
                             type="project",
                             title=card.top_projects[0].display_title,
-                            date=card.top_projects[0].project_end_date or card.top_projects[0].project_start_date,
+                            date=card.top_projects[0].project_end_date
+                            or card.top_projects[0].project_start_date,
                             detail=card.top_projects[0].managing_agency,
                         )
                     )
@@ -226,12 +245,19 @@ class HeuristicJudge:
             if card.data_gaps:
                 global_data_gaps.extend(card.data_gaps)
 
-            fit = "높음" if card.shortlist_score >= 80 else "중간" if card.shortlist_score >= 50 else "보통"
+            fit = (
+                "높음"
+                if card.shortlist_score >= 80
+                else "중간"
+                if card.shortlist_score >= 50
+                else "보통"
+            )
             recommendations.append(
                 RecommendationDecision(
                     rank=rank,
                     expert_id=card.expert_id,
                     name=card.name,
+                    organization=card.organization,
                     fit=fit,
                     reasons=reasons[:3],
                     evidence=evidence[:4],
@@ -242,7 +268,9 @@ class HeuristicJudge:
         unique_gaps = list(dict.fromkeys(global_data_gaps))
         not_selected_reasons: list[str] = []
         if len(ranked_cards) > len(recommendations):
-            not_selected_reasons.append("상위 추천 대비 근거 다양성이나 최근성이 상대적으로 낮습니다.")
+            not_selected_reasons.append(
+                "상위 추천 대비 근거 다양성이나 최근성이 상대적으로 낮습니다."
+            )
 
         return JudgeOutput(
             recommended=recommendations[:5],
@@ -261,7 +289,9 @@ class OpenAICompatJudge:
             api_key=settings.llm_api_key,
         )
 
-    async def judge(self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]) -> JudgeOutput:
+    async def judge(
+        self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]
+    ) -> JudgeOutput:
         system_prompt = """
             You are the senior recommendation judge for a Korean R&D evaluator recommendation system.
             Return exactly one JSON object that matches this schema:
@@ -271,6 +301,7 @@ class OpenAICompatJudge:
                   "rank": 1,
                   "expert_id": "shortlist expert_id",
                   "name": "shortlist name",
+                  "organization": "optional organization",
                   "fit": "높음|중간|보통",
                   "reasons": ["reason"],
                   "evidence": [
@@ -299,10 +330,42 @@ class OpenAICompatJudge:
             - If no candidate should be recommended, return `recommended=[]` and explain why in `not_selected_reasons` and/or `data_gaps`.
             - Do not return markdown, code fences, or any prose outside the JSON object.
         """
+        dumped_shortlist = [card.model_dump(mode="json") for card in shortlist]
+        for card_dict in dumped_shortlist:
+            for paper in card_dict.get("top_papers", []):
+                if paper.get("abstract"):
+                    paper["abstract"] = paper["abstract"][:150] + "..."
+                if paper.get("korean_keywords"):
+                    paper["korean_keywords"] = paper["korean_keywords"][:5]
+                if paper.get("english_keywords"):
+                    paper["english_keywords"] = paper["english_keywords"][:5]
+            for proj in card_dict.get("top_projects", []):
+                if proj.get("research_objective_summary"):
+                    proj["research_objective_summary"] = proj["research_objective_summary"][:150] + "..."
+                if proj.get("research_content_summary"):
+                    proj["research_content_summary"] = proj["research_content_summary"][:150] + "..."
+
+        # 각 데이터당 예상 토큰 수 계산 및 로깅
+        total_estimated_tokens = 0
+        token_breakdown = []
+        for i, card_dict in enumerate(dumped_shortlist, start=1):
+            char_len = len(json.dumps(card_dict, ensure_ascii=False))
+            # 한글 및 JSON 특성상 보수적으로 2.5글자당 1토큰으로 추정
+            est_tokens = int(char_len / 2.5)
+            total_estimated_tokens += est_tokens
+            token_breakdown.append(f"{card_dict.get('name', 'Unknown')}({est_tokens}t)")
+        
+        chunked_breakdown = [", ".join(token_breakdown[i:i+5]) for i in range(0, len(token_breakdown), 5)]
+        logger.info(
+            "데이터당 예상 토큰 크기 (총 추정=%d 토큰):\n  %s", 
+            total_estimated_tokens, 
+            "\n  ".join(chunked_breakdown)
+        )
+
         user_payload = {
             "query": query,
             "plan": plan.model_dump(mode="json"),
-            "shortlist": [card.model_dump(mode="json") for card in shortlist],
+            "shortlist": dumped_shortlist,
         }
 
         normalized_recommendation_count = 0
@@ -310,33 +373,44 @@ class OpenAICompatJudge:
             logger.info("LLM 최종 판정(Judging) 시작: 후보 수=%d", len(shortlist))
             with Timer() as t:
                 result = await self.model.ainvoke_non_stream(
-                    [SystemMessage(content=system_prompt), HumanMessage(content=json.dumps(user_payload, ensure_ascii=False))]
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(
+                            content=json.dumps(user_payload, ensure_ascii=False)
+                        ),
+                    ]
                 )
             json_text = _extract_json_object_text(result.content)
             logger.info("LLM 응답 수신 완료: 소요시간=%.2fms", t.elapsed_ms)
             logger.info("LLM 응답 텍스트(추출됨): %s", json_text)
-            
+
             raw_payload = json.loads(json_text)
-            normalized_payload, normalized_applied = _normalize_judge_payload(raw_payload, shortlist)
-            
+            normalized_payload, normalized_applied = _normalize_judge_payload(
+                raw_payload, shortlist
+            )
+
             if isinstance(normalized_payload, dict):
                 recommended = normalized_payload.get("recommended", [])
-                normalized_recommendation_count = len(recommended) if isinstance(recommended, list) else 0
-                
+                normalized_recommendation_count = (
+                    len(recommended) if isinstance(recommended, list) else 0
+                )
+
             if normalized_applied:
                 logger.debug(
                     "판정 결과 정규화 적용됨: 후보 수=%d -> 최종 추천 수=%d",
                     len(shortlist),
                     normalized_recommendation_count,
                 )
-            
+
             output = JudgeOutput.model_validate(normalized_payload)
             logger.info("최종 판정 성공: 최종 추천=%d명", len(output.recommended))
             return output
-        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+        except Exception as exc:
             logger.warning(
                 "판정 Fallback 활성화: 사유=%s 후보 수=%d",
                 exc,
                 len(shortlist),
             )
-            return await self.fallback.judge(query=query, plan=plan, shortlist=shortlist)
+            return await self.fallback.judge(
+                query=query, plan=plan, shortlist=shortlist
+            )

@@ -4,124 +4,119 @@
 
 ```mermaid
 graph TD
-    U[사용자 질의] --> API[FastAPI /recommend 또는 /search/candidates]
-    API --> SVC[RecommendationService]
+    U[사용자 질의] --> API[추천/검색 API 호출]
+    API --> SVC[추천 파이프라인 총괄]
 
-    SVC --> P[Planner]
-    P --> P1[HeuristicPlanner 또는 OpenAICompatPlanner]
-    P1 --> P2[PlannerOutput 생성<br/>intent_summary / hard_filters / exclude_orgs / branch_query_hints / top_k]
+    SVC --> P[질의 의도 분석기]
+    P --> P1[LLM - Harness/CoT 적용 또는 휴리스틱 기반 의도 파악]
+    P1 --> P2[의도, 엄격한 제약조건 필터, 최적화 검색어 도출]
+    
+    P2 --> F[검색 조건 변환기]
+    F --> F1[추출된 제한사항을 데이터베이스 필터로 조립]
 
-    P2 --> F[QdrantFilterCompiler]
-    F --> F1[degree/count/recent/exclude_orgs 를 Qdrant Filter로 컴파일]
+    P2 --> QB[특화 검색 쿼리 생성기]
+    QB --> QB1[논문/특허/과제 등 4개 영역별 최적 쿼리 생성]
 
-    P2 --> QB[QueryTextBuilder]
-    QB --> QB1[basic/art/pat/pjt branch query 생성]
-
-    F1 --> R[QdrantHybridRetriever]
+    F1 --> R[하이브리드 벡터 검색 수행기]
     QB1 --> R
 
-    subgraph Q[Qdrant Hybrid Retrieval]
-        R --> D1[basic dense: basic_vector_e5i]
-        R --> S1[basic sparse: basic_vector_bm25]
-        D1 --> RRF1[branch 내부 RRF]
+    subgraph Q[데이터베이스 내부 하이브리드 검색]
+        R --> D1[기본정보 유사도 검색]
+        R --> S1[기본정보 키워드 검색]
+        D1 --> RRF1[브랜치 내 RRF 점수 결합]
         S1 --> RRF1
 
-        R --> D2[art dense: art_vector_e5i]
-        R --> S2[art sparse: art_vector_bm25]
-        D2 --> RRF2[branch 내부 RRF]
+        R --> D2[논문 유사도 검색]
+        R --> S2[논문 키워드 검색]
+        D2 --> RRF2[브랜치 내 RRF 점수 결합]
         S2 --> RRF2
 
-        R --> D3[pat dense: pat_vector_e5i]
-        R --> S3[pat sparse: pat_vector_bm25]
-        D3 --> RRF3[branch 내부 RRF]
+        R --> D3[특허 유사도 검색]
+        R --> S3[특허 키워드 검색]
+        D3 --> RRF3[브랜치 내 RRF 점수 결합]
         S3 --> RRF3
 
-        R --> D4[pjt dense: pjt_vector_e5i]
-        R --> S4[pjt sparse: pjt_vector_bm25]
-        D4 --> RRF4[branch 내부 RRF]
+        R --> D4[과제 유사도 검색]
+        R --> S4[과제 키워드 검색]
+        D4 --> RRF4[브랜치 내 RRF 점수 결합]
         S4 --> RRF4
 
-        RRF1 --> RRF_TOP[최상위 branch 간 RRF]
+        RRF1 --> RRF_TOP[전체 영역 통합 최종 RRF 랭킹 연산]
         RRF2 --> RRF_TOP
         RRF3 --> RRF_TOP
         RRF4 --> RRF_TOP
     end
 
-    RRF_TOP --> H[SearchHit 리스트]
-    H --> H1[ExpertPayload 복원]
-    H1 --> H2[branch_coverage는 실제 매치점수 분해가 아니라 payload 존재 여부로 계산]
+    RRF_TOP --> H[최종 검색 결과 목록]
+    H --> H1[전문가 메타데이터 복원]
+    H1 --> H2[영역별 실적 존재 유무 플래그 판별]
 
-    H2 --> C[CandidateCardBuilder]
+    H2 --> C[전문가 프로필 카드 조립기]
     C --> C1[대표 논문/특허/과제 최근순 추출]
-    C --> C2[shortlist_score 계산<br/>branch coverage + SCIE 수 + 과제 수 + 특허 수]
-    C2 --> C3[카드 정렬 후 shortlist 상위 limit]
+    C --> C2[RRF 순위 점수를 100점 만점으로 정규화]
+    C1 --> C3[프로필 카드 완성 및 최종 후보군 압축]
+    C2 --> C3
 
-    C3 --> J{Judge 선택}
-    J -->|문서 설명상| JL[OpenAICompatJudge]
-    J -->|코드 기본값| JP[PythonSelector]
-    J -->|테스트용| JH[HeuristicJudge]
+    C3 --> J{최종 심사 모드 선택}
+    J -->|설정: LLM 심사| J_MAP[Map: 40명을 N명씩 분할하여 병렬 예비 심사]
+    J_MAP --> J_RED[Reduce: 통과된 예비 후보만 모아 2차 최종 판정]
+    J_RED --> JL[LLM 기반 지능형 판정 최종 5인 확정]
+    J -->|설정: 룰 심사| JH[규칙 기반 고속 판정]
 
-    JP --> JP1[Qdrant raw_rank 기반 find_score]
-    JP --> JP2[evidence bonus: 논문/특허/과제/SCIE/박사]
-    JP --> JP3[동일 기관 중복 penalty -15]
-    JP --> JP4[35점 미만 탈락]
+    JH --> JH1[압축된 후보군 중 최상위 추출]
+    JH1 --> JH2[증빙 자료 결합 및 점수기반 적합도 부여]
 
-    JL --> O1[JudgeOutput JSON]
-    JP4 --> O1
-    JH --> O1
-
-    O1 --> RESP[최종 추천 응답]
+    JL --> O1[최종 심사 결과물 포맷팅]
+    JH2 --> O1
+    
+    O1 --> RESP[사용자 최종 응답]
 ```
 
 ## 2) 실제 점수/선발 흐름
 
 ```mermaid
 graph LR
-    A[Qdrant 최종 hit 순위] --> B[CandidateCard.raw_rank 저장]
-    A --> C[CandidateCardBuilder가 shortlist_score 재계산]
+    A[데이터베이스 검색 결과] --> B[최고 점수 기준 100점 만점 정규화]
+    B --> C[정규화 순위 점수를 최종 숏리스트 추천 점수로 확정]
 
-    subgraph S1[카드 압축 단계]
-        C --> C1[branch coverage 개수 x 10]
-        C --> C2[SCIE count x 3]
-        C --> C3[project count x 2]
-        C --> C4[patent count x 2]
-        C1 --> C5[shortlist_score]
-        C2 --> C5
-        C3 --> C5
-        C4 --> C5
+    subgraph S1[프로필 카드 구성 단계]
+        C --> C1[키워드 기반 주요 실적건 선별]
+        C --> C2[데이터 존재 여부 확인]
+        C1 --> C3[실적 데이터가 포함된 종합 카드 조립]
+        C2 --> C3
     end
 
-    C5 --> D[shortlist 상위 N명]
+    C3 --> D[점수 내림차순 정렬 후 최상위 소수 인원 확정]
 
-    subgraph S2[PythonSelector 단계]
-        D --> E[base_score = raw_rank percentile x 60]
-        D --> F[evidence bonus<br/>논문 +8 / 과제 +8 / 특허 +5 / SCIE +4 / 박사 +3]
-        D --> G[기관 중복 penalty -15]
-        E --> H[final_score]
-        F --> H
+    subgraph S2[규칙 기반 심사 경로]
+        D --> E[최상위 인원 차례로 순회]
+        E --> F[기준 점수 구간별 적합도 텍스트 지정<br>높음 / 중간 / 보통]
+        E --> G[확인된 데이터 토대로 추천 증빙 자동 맵핑]
+        F --> H[심사 완료 항목 반환]
         G --> H
     end
 
-    H --> I{35점 이상?}
-    I -->|Yes| J[최종 추천 후보 채택]
-    I -->|No| K[탈락]
-    J --> L[대표 evidence 1건씩 구성]
-    L --> M[RecommendationDecision 반환]
+    subgraph S3[LLM 심사 경로 - Map-Reduce 병렬 처리]
+        D --> I[전체 후보 40명을 N명(예: 10명) 단위 청크로 분할]
+        I --> J_MAP[각 청크별 LLM 비동기 병렬 호출로 예비 우수자 도출 - Map]
+        J_MAP --> J_RED[도출된 예비 우수자들만 모아 2차 LLM 최종 심사 - Reduce]
+        J_RED --> K[응답 데이터 JSON 교정 및 최종 선발 항목 반환]
+    end
+
+    H --> M{최종 결과 병합}
+    K --> M
+    M --> RESP[최종 결과물 앱 클라이언트 전송]
 ```
 
-## 3) 코드 기준으로 반드시 고쳐야 할 설명 문구
+## 3) 💡 시스템 주요 역할 및 용어 설명
+다이어그램의 이해를 돕기 위해 기존 주요 클래스(영어 명칭)와 한글 블록을 매핑한 설명입니다.
 
-- 현재 구현은 **Qdrant Multi-vector**가 아니라 **Qdrant Named Vector + Sparse Vector** 구조다.
-- 현재 구현은 **Weighted Prefetch / Weighted RRF**를 사용하지 않는다.
-- branch 중요도는 가중치로 주는 것이 아니라 **branch_query_hints 텍스트 보정**으로만 반영한다.
-- branch별 매치 근거를 정교하게 추적하지 않고, `branch_coverage`는 현재 **payload 존재 여부**로만 계산한다.
-- 최종 판정은 문서 표현과 달리 항상 Judge LLM이 아니다. 설정에 따라 **PythonSelector**가 기본 경로가 될 수 있다.
-- 현재 shortlist 단계는 Qdrant score를 그대로 쓰지 않고, **counts 기반 재정렬**을 한 번 더 수행한다.
-
-## 4) 코드 점검 중 발견된 즉시 수정 필요 항목
-
-1. `RecommendationService.search_candidates()`는 `card_builder.build_small_cards(...)`를 호출하지만, 현재 `CandidateCardBuilder`에는 해당 메서드가 없다.
-2. `Settings` 기본값은 `llm_backend=python_selector`인데, `strict_runtime_validation=True` 기본값은 `openai_compat`만 허용한다.
-3. `HeuristicJudge`는 현재 도메인 모델과 맞지 않는 레거시 필드명(`paper_nm`, `jrnl_pub_dt`, `ipr_invention_nm` 등)을 참조한다.
-4. `/recommend` 빈 결과를 200 + 빈 배열로 준다는 문서와 달리, 실제 서비스 코드는 추천 결과가 비면 예외를 발생시킨다.
-5. `/health/ready` 실패 시 응답이 top-level body로 반환된다는 문서와 달리, 현재 코드는 `HTTPException(detail=...)` 경로를 사용한다.
+| 한글 블록 명칭 | 매핑된 실제 소스코드 개념 | 역할에 대한 상세 설명 |
+|---|---|---|
+| **`추천 파이프라인 총괄`** | `RecommendationService` | 시스템의 심장부입니다. 질의 분석, 데이터 검색, 알고리즘 심사를 아울러 최종 결과까지 조립하는 총지휘자 역할을 하며, **Map-Reduce 병렬 호출 트래픽 관장**도 여기서 수행합니다. |
+| **`질의 의도 분석기`** | `Planner` | 사용자가 입력한 자연어에서 필수 조건, 중요 키워드, 피해야 할 기관 정보 등을 기계가 이해할 수 있는 상태로 뽑아냅니다. **Harness 기법 및 CoT(생각의 사슬)**이 적용되어 환각 없이 엄격한 필터 값을 도출합니다. |
+| **`검색 조건 변환기`** | `QdrantFilterCompiler` | 파악된 조건을 벡터 데이터베이스(Qdrant)가 읽을 수 있는 전용 필터 구문으로 번역해 줍니다. |
+| **`특화 검색 쿼리 생성기`** | `QueryTextBuilder` | 논문, 과제, 기본 정보 등 특징이 다른 세부 데이터 더미(브랜치)들에 꼭 맞는 최적화된 검색어를 생성합니다. |
+| **`하이브리드 벡터 검색 수행기`** | `QdrantHybridRetriever` | 의미 기반(Dense) 검색과 정확한 키워드(Sparse BM25) 매칭을 동시에 수행하고 순위 융합(RRF) 알고리즘을 사용해 최상급 성적의 데이터들을 선별합니다. |
+| **`전문가 프로필 카드 조립기`** | `CandidateCardBuilder` | 방대하고 복잡한 데이터 조각들을 사람 눈에 보기 좋은 '하나의 전문가 카드 객체'로 깔끔하게 조립해 제공합니다. |
+| **`지능형 판정 / 고속 판정`** | `Judge` | 모든 증빙과 평가를 취합해 최종 인터뷰(심사)를 진행합니다. LLM을 이용해 **Map-Reduce 병렬 심사**로 심도깊게 리뷰하거나, 빠른 규칙(Rule) 기반으로 통과자를 결정합니다. |

@@ -64,8 +64,7 @@ class Settings(BaseSettings):
     embedding_api_key: str = "EMPTY"
     embedding_model_name: str = Field(
         default_factory=lambda: str(
-            Path(__file__).resolve().parents[2]
-            / "../../Models/multilingual-e5-large-instruct"
+            Path(__file__).resolve().parents[2] / "multilingual-e5-large-instruct"
         )
     )
     embedding_vector_size: int = 1024
@@ -73,11 +72,12 @@ class Settings(BaseSettings):
     # BM25 (희소 벡터 생성) 모델 설정
     bm25_model_name: str = "Qdrant/bm25"
     bm25_cache_dir: str = "../../Models/hub/"
-    bm25_local_files_only: bool = True
-    hf_hub_offline: bool = True
+    bm25_local_files_only: bool = False
+    hf_hub_offline: bool = False
 
     # 검색 및 추천 오케스트레이션 파라미터
-    branch_prefetch_limit: int = 200  # 각 브랜치별 초기 검색 수
+    use_map_reduce_judging: bool = True  # Map-Reduce 병렬 심사 사용 여부
+    branch_prefetch_limit: int = 100  # 각 브랜치별 초기 검색 수
     branch_output_limit: int = 50  # RRF 결합 후 브랜치별 출력 수
     retrieval_limit: int = 80  # 최종 리트리벌 결과 수
     shortlist_limit: int = 40  # 심사에 전달할 후보자 수

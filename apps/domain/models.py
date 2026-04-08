@@ -213,7 +213,7 @@ class SearchHit(BaseModel):
     expert_id: str
     score: float
     payload: ExpertPayload
-    branch: BranchName # 매칭된 실적의 종류
+    branch: BranchName | None = None # 매칭된 실적의 종류
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
 
@@ -255,6 +255,7 @@ class RecommendationDecision(BaseModel):
     rank: int
     expert_id: str
     name: str
+    organization: str | None = None
     fit: Literal["높음", "중간", "보통"]
     reasons: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)

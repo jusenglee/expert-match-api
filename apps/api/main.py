@@ -47,7 +47,6 @@ from apps.search.qdrant_bootstrap import QdrantBootstrapper
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
-from apps.search.seed_runner import SeedRunner
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +146,7 @@ async def build_app_runtime(
         judge=judge,
         feedback_store=feedback_store,
         shortlist_limit=settings.shortlist_limit,
+        use_map_reduce_judging=settings.use_map_reduce_judging,
     )
 
     validator = LiveContractValidator(
@@ -155,16 +155,6 @@ async def build_app_runtime(
         registry=registry,
         dependency_validator=RuntimeDependencyValidator(settings),
     )
-
-    if settings.seed_on_startup:
-        seed_runner = SeedRunner(
-            client=client,
-            settings=settings,
-            registry=registry,
-            dense_encoder=dense_encoder,
-        )
-        logger.info("Seeding development data into Qdrant...")
-        await seed_runner.seed()
 
     return service, validator
 

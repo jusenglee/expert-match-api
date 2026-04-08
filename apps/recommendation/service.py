@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -27,6 +28,7 @@ class RecommendationService:
         judge: Judge,
         feedback_store: FeedbackStore,
         shortlist_limit: int,
+        use_map_reduce_judging: bool = True,
     ) -> None:
         self.planner = planner
         self.retriever = retriever
@@ -35,6 +37,7 @@ class RecommendationService:
         self.judge = judge
         self.feedback_store = feedback_store
         self.shortlist_limit = shortlist_limit
+        self.use_map_reduce_judging = use_map_reduce_judging
 
     async def search_candidates(
         self,
@@ -67,6 +70,10 @@ class RecommendationService:
             "candidates": cards,
             "query_payload": retrieval.query_payload,
             "branch_queries": retrieval.branch_queries,
+            "timers": {
+                "plan_ms": t_plan.elapsed_ms,
+                "search_ms": t_search.elapsed_ms,
+            }
         }
 
     async def recommend(
@@ -110,9 +117,47 @@ class RecommendationService:
                 not_selected_reasons=["조건을 만족하는 추천 후보를 찾지 못했습니다."],
             )
 
-        logger.info("최종 판정(Judging) 단계 시작: 압축 후보 수=%d", len(shortlist))
+        # LLM Context Limit 대응: Map-Reduce 병렬 심사
+        chunk_size = 10
         with Timer() as t_judge:
-            judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
+            if not self.use_map_reduce_judging or len(shortlist) <= chunk_size:
+                logger.info("최종 판정(Judging) 단계 시작: 단일 심사 (후보 수=%d, Map-Reduce=%s)", len(shortlist), self.use_map_reduce_judging)
+                judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
+            else:
+                logger.info("최종 판정(Judging) 단계 시작: Map-Reduce 병렬 심사 (총 후보 수=%d, 청크 크기=%d명)", len(shortlist), chunk_size)
+                chunks = [shortlist[i:i + chunk_size] for i in range(0, len(shortlist), chunk_size)]
+                
+                # 1. Map Phase
+                map_tasks = [self.judge.judge(query=query, plan=plan, shortlist=chunk) for chunk in chunks]
+                map_outputs: list[JudgeOutput] = await asyncio.gather(*map_tasks, return_exceptions=False)
+                
+                # Map 결과 풀링
+                winner_ids = set()
+                all_data_gaps = []
+                all_not_selected_reasons = []
+                for out in map_outputs:
+                    for rec in out.recommended:
+                        winner_ids.add(rec.expert_id)
+                    all_data_gaps.extend(out.data_gaps)
+                    all_not_selected_reasons.extend(out.not_selected_reasons)
+                
+                reduce_shortlist = [card for card in shortlist if card.expert_id in winner_ids]
+                logger.info("Map 단계 완료: %d개 청크에서 총 %d명의 예비 후보 선정됨. Reduce 실행", len(chunks), len(reduce_shortlist))
+                
+                # 2. Reduce Phase
+                if not reduce_shortlist:
+                    judge_output = JudgeOutput(
+                        recommended=[],
+                        not_selected_reasons=self._merge_unique_strings(all_not_selected_reasons),
+                        data_gaps=self._merge_unique_strings(all_data_gaps)
+                    )
+                else:
+                    final_output = await self.judge.judge(query=query, plan=plan, shortlist=reduce_shortlist)
+                    judge_output = JudgeOutput(
+                        recommended=final_output.recommended,
+                        not_selected_reasons=self._merge_unique_strings(all_not_selected_reasons, final_output.not_selected_reasons),
+                        data_gaps=self._merge_unique_strings(all_data_gaps, final_output.data_gaps)
+                    )
         
         evidence_less_count = sum(1 for item in judge_output.recommended if not item.evidence)
         recommendations = [item for item in judge_output.recommended if item.evidence]
@@ -142,7 +187,16 @@ class RecommendationService:
             data_gaps=judge_output.data_gaps,
             not_selected_reasons=not_selected_reasons,
         )
-        logger.info("전체 추천 프로세스 종료: 총 소요시간=%.2fms", t_total.elapsed_ms)
+        
+        t_plan_sec = search_result["timers"]["plan_ms"] / 1000.0
+        t_search_sec = search_result["timers"]["search_ms"] / 1000.0
+        t_judge_sec = t_judge.elapsed_ms / 1000.0
+        t_total_sec = t_total.elapsed_ms / 1000.0
+        
+        logger.info(
+            "전체 추천 프로세스 종료: 총 소요시간=%.2f초 [세부 구간: 의도분석=%.2f초 | 하이브리드 검색=%.2f초 | LLM 심사=%.2f초]", 
+            t_total_sec, t_plan_sec, t_search_sec, t_judge_sec
+        )
         return result
 
     def save_feedback(
@@ -202,8 +256,25 @@ class RecommendationService:
 
     @staticmethod
     def _serialize_query_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        def _mask_vectors(data: Any) -> Any:
+            if hasattr(data, "model_dump"):
+                try: data = data.model_dump()
+                except Exception: pass
+            elif hasattr(data, "dict") and callable(data.dict):
+                try: data = data.dict()
+                except Exception: pass
+
+            if isinstance(data, dict):
+                return {k: _mask_vectors(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                if len(data) > 100 and all(isinstance(x, (float, int)) for x in data[:10]):
+                    return f"<Dense Vector: {len(data)} dimensions>"
+                return [_mask_vectors(x) for x in data]
+            # Qdrant 내부 객체(Enum 등)의 직렬화를 위해 문자열로 변환 (dict, list가 아닌 기본형들)
+            return str(data) if not isinstance(data, (int, float, bool, type(None))) else data
+
         serialized = dict(payload)
-        serialized["prefetch"] = [str(item) for item in payload.get("prefetch", [])]
+        serialized["prefetch"] = [_mask_vectors(item) for item in payload.get("prefetch", [])]
         query_filter = payload.get("query_filter")
         serialized["query_filter"] = str(query_filter) if query_filter else None
         serialized["query"] = str(payload.get("query"))

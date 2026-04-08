@@ -87,7 +87,7 @@ class OpenAICompatChatModel(BaseChatModel):
     # Solar/vLLM reasoning 제어(기본: thinking 끄기 + reasoning 출력 포함 안 함)
     # - reasoning_effort: "low" | "medium" | "high" | None
     # - include_reasoning: True | False | None  (vLLM 프로토콜에 존재)
-    default_reasoning_effort: Optional[str] = "medium"
+    default_reasoning_effort: Optional[str] = "low"
     default_include_reasoning: Optional[bool] = False
 
     # stream에서 reasoning delta가 먼저 와도 최종 답변(content)에 섞이지 않게:

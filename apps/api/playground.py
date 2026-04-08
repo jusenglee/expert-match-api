@@ -598,7 +598,7 @@ PLAYGROUND_HTML = dedent(
                 </div>
                 ${data.recommendations.map(r => `
                   <div class="expert-card">
-                    <h4>#${r.rank} ${escapeHtml(r.name)} <span class="tag">${r.fit}</span></h4>
+                    <h4>#${r.rank} ${escapeHtml(r.name)} <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500; margin-left: 0.5rem;">${escapeHtml(r.organization || '소속 미상')}</span> <span class="tag" style="margin-left: auto;">${r.fit}</span></h4>
                     <div style="font-size: 0.9rem; margin-bottom: 0.5rem"><b>추천 사유:</b> <ul>${r.reasons.map(v => `<li>${escapeHtml(v)}</li>`).join('')}</ul></div>
                     <details>
                       <summary>수행 증거 및 실적</summary>
