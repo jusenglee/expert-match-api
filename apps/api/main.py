@@ -262,6 +262,7 @@ def create_app(
         }
 
     @app.get("/", include_in_schema=False, response_class=HTMLResponse)
+    @app.get("/playground", include_in_schema=False, response_class=HTMLResponse)
     def playground() -> HTMLResponse:
         return HTMLResponse(PLAYGROUND_HTML)
 

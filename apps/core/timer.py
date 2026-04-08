@@ -17,13 +17,20 @@ class Timer:
         self.end_time: float = 0.0
         self.elapsed_ms: float = 0.0
 
-    def __enter__(self):
+    def start(self):
         self.start_time = time.perf_counter()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def stop(self):
         self.end_time = time.perf_counter()
         self.elapsed_ms = (self.end_time - self.start_time) * 1000
+        return self
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
 
     def __str__(self):
         if self.name:

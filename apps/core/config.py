@@ -76,7 +76,9 @@ class Settings(BaseSettings):
     hf_hub_offline: bool = False
 
     # 검색 및 추천 오케스트레이션 파라미터
-    use_map_reduce_judging: bool = True  # Map-Reduce 병렬 심사 사용 여부
+    use_map_reduce_judging: bool = True  # OpenAICompatJudge 내부 배치 병렬 심사 사용 여부
+    llm_judge_batch_size: int = Field(default=10, ge=1)
+    llm_judge_max_concurrency: int = Field(default=10, ge=1)
     branch_prefetch_limit: int = 100  # 각 브랜치별 초기 검색 수
     branch_output_limit: int = 50  # RRF 결합 후 브랜치별 출력 수
     retrieval_limit: int = 80  # 최종 리트리벌 결과 수

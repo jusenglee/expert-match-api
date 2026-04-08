@@ -33,6 +33,9 @@
 | `NTIS_LLM_BASE_URL` | `http://203.250.234.159:8010/v1` | OpenAI 호환 LLM 서버 URL |
 | `NTIS_LLM_API_KEY` | `EMPTY` | OpenAI 호환 API 키 |
 | `NTIS_LLM_MODEL_NAME` | `/model` | 플래너/판정기용 모델 이름 |
+| `NTIS_USE_MAP_REDUCE_JUDGING` | `true` | OpenAICompatJudge가 shortlist를 내부 배치 라운드로 심사할지 여부 |
+| `NTIS_LLM_JUDGE_BATCH_SIZE` | `10` | Judge 내부 병렬 심사 배치 크기 |
+| `NTIS_LLM_JUDGE_MAX_CONCURRENCY` | `10` | Judge 내부 LLM 동시 호출 상한 |
 
 ## 임베딩 백엔드 (Embedding Backend)
 
@@ -52,19 +55,19 @@
 |---|---|---|
 | `NTIS_BM25_MODEL_NAME` | `Qdrant/bm25` | Sparse 벡터 생성용 BM25 모델 이름 |
 | `NTIS_BM25_CACHE_DIR` | `../../Models/hub/` | BM25 모델 캐시 디렉토리 |
-| `NTIS_BM25_LOCAL_FILES_ONLY` | `true` | BM25 모델 로드 시 로컬 파일만 사용 여부 |
-| `NTIS_HF_HUB_OFFLINE` | `true` | HuggingFace Hub 오프라인 모드 강제 여부 |
+| `NTIS_BM25_LOCAL_FILES_ONLY` | `false` | BM25 모델 로드 시 로컬 파일만 사용 여부 |
+| `NTIS_HF_HUB_OFFLINE` | `false` | HuggingFace Hub 오프라인 모드 강제 여부 |
 
 ## 검색 제어 (Retrieval Controls)
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_BRANCH_PREFETCH_LIMIT` | `80` | 각 데이터 브랜치별 프리페치(Prefetch) 제한 |
+| `NTIS_BRANCH_PREFETCH_LIMIT` | `100` | 각 데이터 브랜치별 프리페치(Prefetch) 제한 |
 | `NTIS_BRANCH_OUTPUT_LIMIT` | `50` | 브랜치 통합(Fusion) 출력 제한 |
-| `NTIS_RETRIEVAL_LIMIT` | `40` | 최종 검색 결과 통합 제한 |
-| `NTIS_SHORTLIST_LIMIT` | `10` | 판정(Judge) 단계로 넘길 숏리스트 크기 |
-| `NTIS_FINAL_RECOMMENDATION_MIN` | `3` | 최소 요구 최종 추천 수 |
-| `NTIS_FINAL_RECOMMENDATION_MAX` | `5` | 최대 허용 최종 추천 수 |
+| `NTIS_RETRIEVAL_LIMIT` | `80` | 최종 검색 결과 통합 제한 |
+| `NTIS_SHORTLIST_LIMIT` | `40` | 판정(Judge) 단계로 넘길 숏리스트 크기 |
+| `NTIS_FINAL_RECOMMENDATION_MIN` | `1` | 최소 요구 최종 추천 수 |
+| `NTIS_FINAL_RECOMMENDATION_MAX` | `20` | 최대 허용 최종 추천 수 |
 
 ## 시드 설정 (Seed Controls)
 
@@ -78,6 +81,9 @@
 - 권장되는 라이브 설정:
   - `NTIS_STRICT_RUNTIME_VALIDATION=true`
   - `NTIS_LLM_BACKEND=openai_compat`
+  - `NTIS_USE_MAP_REDUCE_JUDGING=true`
+  - `NTIS_LLM_JUDGE_BATCH_SIZE=10`
+  - `NTIS_LLM_JUDGE_MAX_CONCURRENCY=10`
   - `NTIS_EMBEDDING_BACKEND=openai` 또는 `local`
   - `NTIS_SEED_ON_STARTUP=false`
 - 엄격한 런타임 검증이 활성화된 경우 라이브 설정은 위와 같이 구성되어야 하며, `NTIS_SEED_ON_STARTUP=false`여야 합니다. 그럼에도 불구하고 플래너와 판정기는 실제 실행 중에 AI 모델 호출이 실패하면 내부적으로 휴리스틱 폴백을 수행합니다.

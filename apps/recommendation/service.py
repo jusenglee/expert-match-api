@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -38,6 +37,11 @@ class RecommendationService:
         self.feedback_store = feedback_store
         self.shortlist_limit = shortlist_limit
         self.use_map_reduce_judging = use_map_reduce_judging
+        judge_settings = getattr(self.judge, "settings", None)
+        if judge_settings is not None and hasattr(
+            judge_settings, "use_map_reduce_judging"
+        ):
+            judge_settings.use_map_reduce_judging = use_map_reduce_judging
 
     async def search_candidates(
         self,
@@ -85,13 +89,14 @@ class RecommendationService:
         top_k: int | None = None,
     ) -> dict[str, Any]:
         logger.info("전체 추천 프로세스 시작: 질의=%r", query)
-        with Timer() as t_total:
-            search_result = await self.search_candidates(
-                query=query,
-                filters_override=filters_override,
-                exclude_orgs=exclude_orgs,
-                top_k=top_k,
-            )
+        t_total = Timer()
+        t_total.start()
+        search_result = await self.search_candidates(
+            query=query,
+            filters_override=filters_override,
+            exclude_orgs=exclude_orgs,
+            top_k=top_k,
+        )
 
         plan: PlannerOutput = search_result["planner"]
         candidate_cards: list[CandidateCard] = search_result["candidates"]
@@ -117,47 +122,17 @@ class RecommendationService:
                 not_selected_reasons=["조건을 만족하는 추천 후보를 찾지 못했습니다."],
             )
 
-        # LLM Context Limit 대응: Map-Reduce 병렬 심사
-        chunk_size = 10
         with Timer() as t_judge:
-            if not self.use_map_reduce_judging or len(shortlist) <= chunk_size:
-                logger.info("최종 판정(Judging) 단계 시작: 단일 심사 (후보 수=%d, Map-Reduce=%s)", len(shortlist), self.use_map_reduce_judging)
-                judge_output: JudgeOutput = await self.judge.judge(query=query, plan=plan, shortlist=shortlist)
-            else:
-                logger.info("최종 판정(Judging) 단계 시작: Map-Reduce 병렬 심사 (총 후보 수=%d, 청크 크기=%d명)", len(shortlist), chunk_size)
-                chunks = [shortlist[i:i + chunk_size] for i in range(0, len(shortlist), chunk_size)]
-                
-                # 1. Map Phase
-                map_tasks = [self.judge.judge(query=query, plan=plan, shortlist=chunk) for chunk in chunks]
-                map_outputs: list[JudgeOutput] = await asyncio.gather(*map_tasks, return_exceptions=False)
-                
-                # Map 결과 풀링
-                winner_ids = set()
-                all_data_gaps = []
-                all_not_selected_reasons = []
-                for out in map_outputs:
-                    for rec in out.recommended:
-                        winner_ids.add(rec.expert_id)
-                    all_data_gaps.extend(out.data_gaps)
-                    all_not_selected_reasons.extend(out.not_selected_reasons)
-                
-                reduce_shortlist = [card for card in shortlist if card.expert_id in winner_ids]
-                logger.info("Map 단계 완료: %d개 청크에서 총 %d명의 예비 후보 선정됨. Reduce 실행", len(chunks), len(reduce_shortlist))
-                
-                # 2. Reduce Phase
-                if not reduce_shortlist:
-                    judge_output = JudgeOutput(
-                        recommended=[],
-                        not_selected_reasons=self._merge_unique_strings(all_not_selected_reasons),
-                        data_gaps=self._merge_unique_strings(all_data_gaps)
-                    )
-                else:
-                    final_output = await self.judge.judge(query=query, plan=plan, shortlist=reduce_shortlist)
-                    judge_output = JudgeOutput(
-                        recommended=final_output.recommended,
-                        not_selected_reasons=self._merge_unique_strings(all_not_selected_reasons, final_output.not_selected_reasons),
-                        data_gaps=self._merge_unique_strings(all_data_gaps, final_output.data_gaps)
-                    )
+            logger.info(
+                "최종 판정(Judging) 단계 시작: 후보 수=%d, judge_managed_map_reduce=%s",
+                len(shortlist),
+                self.use_map_reduce_judging,
+            )
+            judge_output = await self.judge.judge(
+                query=query,
+                plan=plan,
+                shortlist=shortlist,
+            )
         
         evidence_less_count = sum(1 for item in judge_output.recommended if not item.evidence)
         recommendations = [item for item in judge_output.recommended if item.evidence]
@@ -188,9 +163,12 @@ class RecommendationService:
             not_selected_reasons=not_selected_reasons,
         )
         
-        t_plan_sec = search_result["timers"]["plan_ms"] / 1000.0
-        t_search_sec = search_result["timers"]["search_ms"] / 1000.0
+        timers = search_result.get("timers", {})
+        t_plan_sec = float(timers.get("plan_ms", 0.0)) / 1000.0
+        t_search_sec = float(timers.get("search_ms", 0.0)) / 1000.0
         t_judge_sec = t_judge.elapsed_ms / 1000.0
+        
+        t_total.stop()
         t_total_sec = t_total.elapsed_ms / 1000.0
         
         logger.info(

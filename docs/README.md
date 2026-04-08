@@ -41,6 +41,8 @@ NTIS 심사위원 발굴 및 추천을 위한 FastAPI 기반 서비스입니다.
 - Planner 응답이 유효하지 않은 경우 요청을 즉시 실패시키는 대신 휴리스틱 플래너로 폴백합니다.
 - `POST /recommend` 호출 시 검색된 후보가 없거나 숏리스트가 비어있으면 판정(Judge) 단계를 건너뛰고 구조화된 빈 결과를 즉시 반환합니다.
 - Judge는 LLM 응답에서 첫 번째 JSON 객체를 추출하며, 검증 전 복구 가능한 리스트/문자열 불일치를 정규화합니다. 유효하지 않은 응답의 경우 마찬가지로 휴리스틱 판정기로 폴백합니다.
+- `use_map_reduce_judging`가 활성화된 경우 서비스 계층이 아니라 OpenAICompatJudge가 shortlist 배치 분할, 라운드 축소, 세마포어 기반 동시성 제어를 담당합니다.
+- Judge 내부 병렬 심사 기본값은 `NTIS_LLM_JUDGE_BATCH_SIZE=10`, `NTIS_LLM_JUDGE_MAX_CONCURRENCY=10`이며 운영 환경에서는 두 값을 함께 조정해 vLLM 처리량을 맞춥니다.
 
 ## 빠른 시작 (Quick Start)
 
@@ -51,7 +53,7 @@ NTIS 심사위원 발굴 및 추천을 위한 FastAPI 기반 서비스입니다.
 5. `ntis-validate-live` 명령어로 준비 상태를 확인합니다.
 6. `uvicorn apps.api.main:app --reload` 명령어로 서버를 실행합니다.
 7. `GET /health/ready`를 확인합니다.
-8. `http://127.0.0.1:8000/playground`에 접속합니다.
+8. `http://127.0.0.1:8011/playground`에 접속합니다.
 9. 필요한 경우 `POST /search/candidates` 또는 `POST /recommend` 테스트를 수행합니다.
 
 `uvicorn`은 시작되었으나 `/health/ready`가 `503`을 반환하는 경우, 추천 API를 호출하기 전에 구조화된 응답 내용을 확인하십시오. 브라우저 플레이그라운드의 상세 정보 패널에서도 동일한 정보를 확인할 수 있습니다.

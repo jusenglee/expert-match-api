@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import ValidationError
 
 from apps.core.config import Settings
 from apps.core.openai_compat_llm import OpenAICompatChatModel
@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_json_object_text(content: Any) -> str:
-    """Extract the first JSON object from an LLM response payload."""
+    """Extract the first JSON object from an LLM response payload.
+
+    Safely strips <thinking> blocks, markdown code fences, and extraneous text,
+    then uses balanced-brace matching to isolate the top-level JSON object.
+    """
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -40,11 +44,49 @@ def _extract_json_object_text(content: Any) -> str:
         text = str(content)
 
     text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
 
+    # 1단계: <thinking>...</thinking> 블록 완전 제거
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = text.strip()
+
+    # 2단계: 마크다운 코드 블록 제거
+    code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if code_block_match:
+        text = code_block_match.group(1).strip()
+    else:
+        text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```", "", text).strip()
+
+    # 3단계: 균형 잡힌 중괄호 매칭으로 최상위 JSON 객체 추출
     start = text.find("{")
+    if start == -1:
+        return text
+
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\":
+            if in_string:
+                escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+
+    # 균형 매칭 실패 시 폴백
     end = text.rfind("}")
     if start != -1 and end != -1 and start < end:
         return text[start : end + 1]
@@ -163,7 +205,7 @@ def _normalize_judge_payload(
                 if rank_score is None:
                     normalized_item["rank_score"] = card.rank_score
                     normalized_applied = True
-                
+
                 if normalized_item.get("organization") != card.organization:
                     normalized_item["organization"] = card.organization
                     normalized_applied = True
@@ -172,6 +214,19 @@ def _normalize_judge_payload(
 
     normalized_payload["recommended"] = normalized_recommended
     return normalized_payload, normalized_applied
+
+
+def _merge_unique_strings(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged
 
 
 class Judge(Protocol):
@@ -269,7 +324,7 @@ class HeuristicJudge:
         not_selected_reasons: list[str] = []
         if len(ranked_cards) > len(recommendations):
             not_selected_reasons.append(
-                "상위 추천 대비 근거 다양성이나 최근성이 상대적으로 낮습니다."
+                "상위 추천 대비 근거 다양성이나 최신성이 상대적으로 낮습니다."
             )
 
         return JudgeOutput(
@@ -288,11 +343,13 @@ class OpenAICompatJudge:
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
         )
+        self._judge_semaphore = asyncio.Semaphore(
+            max(1, settings.llm_judge_max_concurrency)
+        )
 
-    async def judge(
-        self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]
-    ) -> JudgeOutput:
-        system_prompt = """
+    @staticmethod
+    def _build_system_prompt() -> str:
+        return """
             You are the senior recommendation judge for a Korean R&D evaluator recommendation system.
             Return exactly one JSON object that matches this schema:
             {
@@ -321,15 +378,20 @@ class OpenAICompatJudge:
             }
 
             Rules:
+            - IMPORTANT: You MUST recommend up to the number of candidates specified in the plan's `top_k` field. Do NOT just return 1 candidate if there are multiple suitable fits.
             - IMPORTANT: `rank_score` is a RELATIVE score within this search result (RRF-based), not an absolute suitability percentage. Do not misuse it as a probability.
             - IMPORTANT: `branch_presence_flags` only indicate that data exists in that branch. It does not guarantee a perfect match. Verify exact suitability from `top_papers`, `top_patents`, etc.
             - Copy `expert_id` exactly from the shortlist input.
-            - Every recommendation must include `rank`, `expert_id`, `name`, `fit`, `reasons`, `evidence`, and `risks`.
+            - Every recommendation must include `rank`, `expert_id`, `name`, `organization`, `fit`, `reasons`, `evidence`, and `risks`.
             - `reasons`, `risks`, `not_selected_reasons`, and `data_gaps` must always be arrays of strings, never a single string.
             - Only use evidence that already exists in `top_papers`, `top_patents`, `top_projects`, or the profile fields of the shortlist input.
             - If no candidate should be recommended, return `recommended=[]` and explain why in `not_selected_reasons` and/or `data_gaps`.
             - Do not return markdown, code fences, or any prose outside the JSON object.
         """
+
+    def _serialize_shortlist(
+        self, shortlist: list[CandidateCard]
+    ) -> list[dict[str, Any]]:
         dumped_shortlist = [card.model_dump(mode="json") for card in shortlist]
         for card_dict in dumped_shortlist:
             for paper in card_dict.get("top_papers", []):
@@ -341,25 +403,84 @@ class OpenAICompatJudge:
                     paper["english_keywords"] = paper["english_keywords"][:5]
             for proj in card_dict.get("top_projects", []):
                 if proj.get("research_objective_summary"):
-                    proj["research_objective_summary"] = proj["research_objective_summary"][:150] + "..."
+                    proj["research_objective_summary"] = (
+                        proj["research_objective_summary"][:150] + "..."
+                    )
                 if proj.get("research_content_summary"):
-                    proj["research_content_summary"] = proj["research_content_summary"][:150] + "..."
+                    proj["research_content_summary"] = (
+                        proj["research_content_summary"][:150] + "..."
+                    )
+        return dumped_shortlist
 
-        # 각 데이터당 예상 토큰 수 계산 및 로깅
+    @staticmethod
+    def _build_chunks(
+        shortlist: list[CandidateCard], batch_size: int
+    ) -> list[list[CandidateCard]]:
+        return [
+            shortlist[i : i + batch_size]
+            for i in range(0, len(shortlist), batch_size)
+        ]
+
+    def _log_shortlist_token_estimate(
+        self, dumped_shortlist: list[dict[str, Any]], *, context_label: str
+    ) -> None:
         total_estimated_tokens = 0
         token_breakdown = []
-        for i, card_dict in enumerate(dumped_shortlist, start=1):
+        for card_dict in dumped_shortlist:
             char_len = len(json.dumps(card_dict, ensure_ascii=False))
-            # 한글 및 JSON 특성상 보수적으로 2.5글자당 1토큰으로 추정
             est_tokens = int(char_len / 2.5)
             total_estimated_tokens += est_tokens
             token_breakdown.append(f"{card_dict.get('name', 'Unknown')}({est_tokens}t)")
-        
-        chunked_breakdown = [", ".join(token_breakdown[i:i+5]) for i in range(0, len(token_breakdown), 5)]
+
+        chunked_breakdown = [
+            ", ".join(token_breakdown[i : i + 5])
+            for i in range(0, len(token_breakdown), 5)
+        ]
         logger.info(
-            "데이터당 예상 토큰 크기 (총 추정=%d 토큰):\n  %s", 
-            total_estimated_tokens, 
-            "\n  ".join(chunked_breakdown)
+            "데이터당 예상 토큰 크기: context=%s 총 추정=%d 토큰 후보 수=%d\n  %s",
+            context_label,
+            total_estimated_tokens,
+            len(dumped_shortlist),
+            "\n  ".join(chunked_breakdown) if chunked_breakdown else "(empty)",
+        )
+
+    async def _invoke_non_stream_with_limit(
+        self,
+        messages: list[SystemMessage | HumanMessage],
+        *,
+        context_label: str,
+        round_index: int,
+        batch_index: int,
+        batch_count: int,
+    ) -> tuple[Any, float]:
+        async with self._judge_semaphore:
+            logger.info(
+                "LLM 호출 슬롯 획득: context=%s round=%d batch=%d/%d max_concurrency=%d",
+                context_label,
+                round_index,
+                batch_index,
+                batch_count,
+                self.settings.llm_judge_max_concurrency,
+            )
+            with Timer() as t:
+                result = await self.model.ainvoke_non_stream(messages)
+            return result, t.elapsed_ms
+
+    async def _judge_single_shortlist(
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        shortlist: list[CandidateCard],
+        context_label: str,
+        round_index: int,
+        batch_index: int,
+        batch_count: int,
+    ) -> JudgeOutput:
+        dumped_shortlist = self._serialize_shortlist(shortlist)
+        self._log_shortlist_token_estimate(
+            dumped_shortlist,
+            context_label=context_label,
         )
 
         user_payload = {
@@ -367,22 +488,45 @@ class OpenAICompatJudge:
             "plan": plan.model_dump(mode="json"),
             "shortlist": dumped_shortlist,
         }
+        messages = [
+            SystemMessage(content=self._build_system_prompt()),
+            HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
+        ]
 
         normalized_recommendation_count = 0
         try:
-            logger.info("LLM 최종 판정(Judging) 시작: 후보 수=%d", len(shortlist))
-            with Timer() as t:
-                result = await self.model.ainvoke_non_stream(
-                    [
-                        SystemMessage(content=system_prompt),
-                        HumanMessage(
-                            content=json.dumps(user_payload, ensure_ascii=False)
-                        ),
-                    ]
-                )
+            logger.info(
+                "LLM 판정 시작: context=%s round=%d batch=%d/%d 후보 수=%d",
+                context_label,
+                round_index,
+                batch_index,
+                batch_count,
+                len(shortlist),
+            )
+            result, elapsed_ms = await self._invoke_non_stream_with_limit(
+                messages,
+                context_label=context_label,
+                round_index=round_index,
+                batch_index=batch_index,
+                batch_count=batch_count,
+            )
             json_text = _extract_json_object_text(result.content)
-            logger.info("LLM 응답 수신 완료: 소요시간=%.2fms", t.elapsed_ms)
-            logger.info("LLM 응답 텍스트(추출됨): %s", json_text)
+            logger.info(
+                "LLM 응답 수신 완료: context=%s round=%d batch=%d/%d 소요시간=%.2fms",
+                context_label,
+                round_index,
+                batch_index,
+                batch_count,
+                elapsed_ms,
+            )
+            logger.info(
+                "LLM 응답 텍스트(추출됨): context=%s round=%d batch=%d/%d %s",
+                context_label,
+                round_index,
+                batch_index,
+                batch_count,
+                json_text,
+            )
 
             raw_payload = json.loads(json_text)
             normalized_payload, normalized_applied = _normalize_judge_payload(
@@ -397,20 +541,193 @@ class OpenAICompatJudge:
 
             if normalized_applied:
                 logger.debug(
-                    "판정 결과 정규화 적용됨: 후보 수=%d -> 최종 추천 수=%d",
+                    "판정 결과 정규화 적용: context=%s round=%d batch=%d/%d 후보 수=%d -> 최종 추천 수=%d",
+                    context_label,
+                    round_index,
+                    batch_index,
+                    batch_count,
                     len(shortlist),
                     normalized_recommendation_count,
                 )
 
             output = JudgeOutput.model_validate(normalized_payload)
-            logger.info("최종 판정 성공: 최종 추천=%d명", len(output.recommended))
+            logger.info(
+                "최종 판정 성공: context=%s round=%d batch=%d/%d 최종 추천=%d명",
+                context_label,
+                round_index,
+                batch_index,
+                batch_count,
+                len(output.recommended),
+            )
             return output
         except Exception as exc:
             logger.warning(
-                "판정 Fallback 활성화: 사유=%s 후보 수=%d",
+                "판정 Fallback 활성화: context=%s round=%d batch=%d/%d 사유=%s 후보 수=%d",
+                context_label,
+                round_index,
+                batch_index,
+                batch_count,
                 exc,
                 len(shortlist),
             )
             return await self.fallback.judge(
                 query=query, plan=plan, shortlist=shortlist
             )
+
+    async def _judge_batched(
+        self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]
+    ) -> JudgeOutput:
+        batch_size = max(1, self.settings.llm_judge_batch_size)
+        logger.info(
+            "LLM 최종 판정(Judging) 시작: 내부 배치 병렬 심사 (후보 수=%d, batch_size=%d, max_concurrency=%d)",
+            len(shortlist),
+            batch_size,
+            self.settings.llm_judge_max_concurrency,
+        )
+        if batch_size <= plan.top_k:
+            logger.warning(
+                "Judge batch_size가 top_k 이하입니다. 축소 단계가 정체될 수 있습니다: batch_size=%d top_k=%d",
+                batch_size,
+                plan.top_k,
+            )
+
+        round_index = 1
+        current_shortlist = shortlist
+        merged_not_selected_reasons: list[str] = []
+        merged_data_gaps: list[str] = []
+
+        while len(current_shortlist) > batch_size:
+            chunks = self._build_chunks(current_shortlist, batch_size)
+            logger.info(
+                "Judge map round 시작: round=%d candidates=%d batches=%d batch_size=%d max_concurrency=%d",
+                round_index,
+                len(current_shortlist),
+                len(chunks),
+                batch_size,
+                self.settings.llm_judge_max_concurrency,
+            )
+            map_outputs = await asyncio.gather(
+                *[
+                    self._judge_single_shortlist(
+                        query=query,
+                        plan=plan,
+                        shortlist=chunk,
+                        context_label="map",
+                        round_index=round_index,
+                        batch_index=index + 1,
+                        batch_count=len(chunks),
+                    )
+                    for index, chunk in enumerate(chunks)
+                ],
+                return_exceptions=False,
+            )
+
+            winner_ids: set[str] = set()
+            for output in map_outputs:
+                winner_ids.update(rec.expert_id for rec in output.recommended)
+                merged_not_selected_reasons.extend(output.not_selected_reasons)
+                merged_data_gaps.extend(output.data_gaps)
+
+            if not winner_ids:
+                logger.info(
+                    "Judge map round 종료: round=%d survivors=0",
+                    round_index,
+                )
+                return JudgeOutput(
+                    recommended=[],
+                    not_selected_reasons=_merge_unique_strings(
+                        merged_not_selected_reasons
+                    ),
+                    data_gaps=_merge_unique_strings(merged_data_gaps),
+                )
+
+            next_shortlist = [
+                card for card in current_shortlist if card.expert_id in winner_ids
+            ]
+            logger.info(
+                "Judge map round 종료: round=%d survivors=%d",
+                round_index,
+                len(next_shortlist),
+            )
+            if len(next_shortlist) >= len(current_shortlist):
+                logger.warning(
+                    "Judge map round가 shortlist를 축소하지 못했습니다. 최종 단일 라운드로 전환합니다: round=%d candidates=%d",
+                    round_index,
+                    len(current_shortlist),
+                )
+                break
+
+            current_shortlist = next_shortlist
+            round_index += 1
+
+        logger.info(
+            "Judge final round 시작: round=%d candidates=%d batch_size=%d max_concurrency=%d",
+            round_index,
+            len(current_shortlist),
+            batch_size,
+            self.settings.llm_judge_max_concurrency,
+        )
+        final_output = await self._judge_single_shortlist(
+            query=query,
+            plan=plan,
+            shortlist=current_shortlist,
+            context_label="reduce",
+            round_index=round_index,
+            batch_index=1,
+            batch_count=1,
+        )
+        return JudgeOutput(
+            recommended=final_output.recommended,
+            not_selected_reasons=_merge_unique_strings(
+                merged_not_selected_reasons,
+                final_output.not_selected_reasons,
+            ),
+            data_gaps=_merge_unique_strings(
+                merged_data_gaps,
+                final_output.data_gaps,
+            ),
+        )
+
+    async def judge(
+        self, *, query: str, plan: PlannerOutput, shortlist: list[CandidateCard]
+    ) -> JudgeOutput:
+        if not shortlist:
+            return JudgeOutput()
+
+        batch_size = max(1, self.settings.llm_judge_batch_size)
+        if not self.settings.use_map_reduce_judging:
+            logger.info(
+                "LLM 최종 판정(Judging) 시작: 단일 심사 (후보 수=%d, internal batching disabled)",
+                len(shortlist),
+            )
+            return await self._judge_single_shortlist(
+                query=query,
+                plan=plan,
+                shortlist=shortlist,
+                context_label="single",
+                round_index=1,
+                batch_index=1,
+                batch_count=1,
+            )
+
+        if len(shortlist) <= batch_size:
+            logger.info(
+                "LLM 최종 판정(Judging) 시작: 단일 심사 (후보 수=%d, batch_size=%d)",
+                len(shortlist),
+                batch_size,
+            )
+            return await self._judge_single_shortlist(
+                query=query,
+                plan=plan,
+                shortlist=shortlist,
+                context_label="single",
+                round_index=1,
+                batch_index=1,
+                batch_count=1,
+            )
+
+        return await self._judge_batched(
+            query=query,
+            plan=plan,
+            shortlist=shortlist,
+        )

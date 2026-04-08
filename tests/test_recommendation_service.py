@@ -1,7 +1,13 @@
 import asyncio
 from types import MethodType
 
-from apps.domain.models import CandidateCard, EvidenceItem, JudgeOutput, PlannerOutput, RecommendationDecision
+from apps.domain.models import (
+    CandidateCard,
+    EvidenceItem,
+    JudgeOutput,
+    PlannerOutput,
+    RecommendationDecision,
+)
 from apps.recommendation.service import RecommendationService
 
 
@@ -34,31 +40,41 @@ class RecordingJudge:
     def __init__(self, output: JudgeOutput) -> None:
         self.output = output
         self.called = False
+        self.shortlist_sizes: list[int] = []
 
     async def judge(self, *, query, plan, shortlist):
         self.called = True
+        self.shortlist_sizes.append(len(shortlist))
         return self.output
 
 
-def _candidate_card() -> CandidateCard:
+def _candidate_card(expert_id: str = "1") -> CandidateCard:
     return CandidateCard(
-        expert_id="1",
-        name="Kim Tester",
+        expert_id=expert_id,
+        name=f"Kim Tester {expert_id}",
         organization="Test Institute",
         branch_coverage={"basic": True, "art": True, "pat": False, "pjt": False},
         counts={"article_cnt": 1, "scie_cnt": 1, "patent_cnt": 0, "project_cnt": 0},
         shortlist_score=12.0,
+        rank_score=12.0,
     )
 
 
 def _plan() -> PlannerOutput:
     return PlannerOutput(
         intent_summary="Recommend semiconductor reviewers",
-        branch_query_hints={"basic": "basic", "art": "papers", "pat": "patents", "pjt": "projects"},
+        branch_query_hints={
+            "basic": "basic",
+            "art": "papers",
+            "pat": "patents",
+            "pjt": "projects",
+        },
     )
 
 
-def _build_service(judge_output: JudgeOutput) -> tuple[RecommendationService, RecordingJudge]:
+def _build_service(
+    judge_output: JudgeOutput, *, use_map_reduce_judging: bool = True
+) -> tuple[RecommendationService, RecordingJudge]:
     judge = RecordingJudge(judge_output)
     service = RecommendationService(
         planner=DummyPlanner(),
@@ -67,20 +83,33 @@ def _build_service(judge_output: JudgeOutput) -> tuple[RecommendationService, Re
         card_builder=DummyCardBuilder(),
         judge=judge,
         feedback_store=DummyFeedbackStore(),
-        shortlist_limit=10,
+        shortlist_limit=40,
+        use_map_reduce_judging=use_map_reduce_judging,
     )
     return service, judge
 
 
-def _bind_search_result(service: RecommendationService, *, cards: list[CandidateCard], retrieved_count: int = 0) -> None:
-    async def fake_search_candidates(self, *, query, filters_override=None, exclude_orgs=None, top_k=None):
+def _bind_search_result(
+    service: RecommendationService,
+    *,
+    cards: list[CandidateCard],
+    retrieved_count: int = 0,
+) -> None:
+    async def fake_search_candidates(
+        self, *, query, filters_override=None, exclude_orgs=None, top_k=None
+    ):
         return {
             "planner": _plan(),
             "query_filter": None,
             "retrieved_count": retrieved_count,
             "candidates": cards,
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
-            "branch_queries": {"basic": "basic", "art": "papers", "pat": "patents", "pjt": "projects"},
+            "branch_queries": {
+                "basic": "basic",
+                "art": "papers",
+                "pat": "patents",
+                "pjt": "projects",
+            },
         }
 
     service.search_candidates = MethodType(fake_search_candidates, service)
@@ -111,7 +140,13 @@ def test_recommend_skips_judge_when_shortlist_is_empty():
 
 
 def test_recommend_returns_empty_success_when_judge_returns_no_recommendations():
-    service, judge = _build_service(JudgeOutput(recommended=[], not_selected_reasons=[], data_gaps=["paper evidence missing"]))
+    service, judge = _build_service(
+        JudgeOutput(
+            recommended=[],
+            not_selected_reasons=[],
+            data_gaps=["paper evidence missing"],
+        )
+    )
     _bind_search_result(service, cards=[_candidate_card()], retrieved_count=1)
 
     result = asyncio.run(service.recommend(query="Recommend reviewers"))
@@ -185,7 +220,35 @@ def test_recommend_filters_evidence_less_items_but_keeps_valid_recommendations()
     assert judge.called is True
     assert len(result["recommendations"]) == 1
     assert result["recommendations"][0].expert_id == "2"
-    assert result["not_selected_reasons"] == ["Existing judge reason", "근거가 충분한 추천 결과를 생성하지 못했습니다."]
+    assert result["not_selected_reasons"] == [
+        "Existing judge reason",
+        "근거가 충분한 추천 결과를 생성하지 못했습니다.",
+    ]
     assert result["trace"]["recommendation_evidence_summary"] == [
         {"expert_id": "2", "evidence_titles": ["Semiconductor Paper"]}
     ]
+
+
+def test_recommend_delegates_large_shortlist_to_judge_once():
+    judge_output = JudgeOutput(
+        recommended=[
+            RecommendationDecision(
+                rank=1,
+                expert_id="1",
+                name="Kim Tester 1",
+                fit="높음",
+                reasons=["Strong publication evidence"],
+                evidence=[EvidenceItem(type="paper", title="Semiconductor Paper")],
+                risks=[],
+            )
+        ]
+    )
+    service, judge = _build_service(judge_output, use_map_reduce_judging=True)
+    cards = [_candidate_card(str(index)) for index in range(25)]
+    _bind_search_result(service, cards=cards, retrieved_count=25)
+
+    result = asyncio.run(service.recommend(query="Recommend reviewers"))
+
+    assert judge.called is True
+    assert judge.shortlist_sizes == [25]
+    assert result["recommendations"][0].expert_id == "1"

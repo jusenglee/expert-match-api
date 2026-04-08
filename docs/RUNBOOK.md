@@ -40,6 +40,7 @@ uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 ```
 
 - **참고**: `NTIS_EMBEDDING_BACKEND=local` 모드 사용 시, 루트의 `multilingual-e5-large-instruct` 폴더 내에 모델 파일들이 온전히 존재해야 합니다.
+- **Judge 병렬화**: `NTIS_USE_MAP_REDUCE_JUDGING=true`이면 OpenAICompatJudge가 shortlist를 `NTIS_LLM_JUDGE_BATCH_SIZE` 단위로 나눠 내부 라운드 심사를 수행하며, 실제 LLM 호출은 `NTIS_LLM_JUDGE_MAX_CONCURRENCY` 상한으로 제한됩니다.
 
 ## 5. 브라우저 플레이그라운드 (Playground) 활용
 
@@ -78,6 +79,7 @@ curl -X POST http://127.0.0.1:8011/recommend `
 - **Planner**: 사용자 질의 분석 결과 및 하드 필터 추출 정보
 - **Retriever**: 하이브리드 검색 실행 결과 및 검색된 후보 수
 - **Judge**: 후보 간 비교 판단 근거 및 추천 순위 결정 사유
+- **Judge Batch Round**: 라운드 번호, 배치 수, 배치 크기, 생존 후보 수, 세마포어 상한
 - **Fallback**: LLM 오류 시 휴리스틱 모드로의 전환 안내
 - **Data Gap**: 특정 전문가의 데이터 누락(논문 없음 등)에 대한 경고
 

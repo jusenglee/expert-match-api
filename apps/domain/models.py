@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 
 BranchName = Literal["basic", "art", "pat", "pjt"]
@@ -55,6 +55,18 @@ def _normalize_optional_int(value: Any) -> Any:
         except ValueError:
             return value
     return value
+
+
+def _backfill_branch_flags(
+    data: Any, *, source_key: str = "branch_coverage", target_key: str
+) -> Any:
+    if not isinstance(data, dict):
+        return data
+    if target_key in data or source_key not in data:
+        return data
+    normalized = dict(data)
+    normalized[target_key] = normalized[source_key]
+    return normalized
 
 
 class BasicInfo(BaseModel):
@@ -216,12 +228,32 @@ class SearchHit(BaseModel):
     branch: BranchName | None = None # 매칭된 실적의 종류
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_legacy_branch_coverage(cls, data: Any) -> Any:
+        return _backfill_branch_flags(data, target_key="data_presence_flags")
+
+    @computed_field
+    @property
+    def branch_coverage(self) -> dict[BranchName, bool]:
+        return self.data_presence_flags
+
 
 class GroupedSearchHit(BaseModel):
     expert_id: str
     group_score: float # 그룹 내 최고 점수 또는 집계 점수
     hits: list[SearchHit] # 해당 전문가의 매칭된 실적 리스트
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_legacy_branch_coverage(cls, data: Any) -> Any:
+        return _backfill_branch_flags(data, target_key="data_presence_flags")
+
+    @computed_field
+    @property
+    def branch_coverage(self) -> dict[BranchName, bool]:
+        return self.data_presence_flags
 
 
 class EvidenceItem(BaseModel):
@@ -249,6 +281,16 @@ class CandidateCard(BaseModel):
     data_gaps: list[str] = Field(default_factory=list)
     shortlist_score: float = 0.0
     rank_score: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_legacy_branch_coverage(cls, data: Any) -> Any:
+        return _backfill_branch_flags(data, target_key="branch_presence_flags")
+
+    @computed_field
+    @property
+    def branch_coverage(self) -> dict[BranchName, bool]:
+        return self.branch_presence_flags
 
 
 class RecommendationDecision(BaseModel):

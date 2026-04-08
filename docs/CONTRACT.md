@@ -42,6 +42,7 @@ Planner 동작 방식:
       "rank": 1,
       "expert_id": "11008395",
       "name": "홍길동",
+      "organization": "테스트연구원",
       "fit": "높음",
       "reasons": ["논문 실적이 우수합니다."],
       "evidence": [
@@ -49,7 +50,7 @@ Planner 동작 방식:
         {"type": "project", "title": "예시 과제 제목", "date": "2020-04-06", "detail": "주관연구책임자"}
       ],
       "risks": ["특허 실적이 누락되었습니다."],
-      "relevance_score": 95.5
+      "rank_score": 95.5
     }
   ],
   "not_selected_reasons": ["다른 후보자들의 실적 범위가 더 넓었습니다."],
@@ -59,7 +60,7 @@ Planner 동작 방식:
 
 Judge 동작 방식:
 
-- 각 `recommended[]` 항목은 `rank`, `expert_id`, `name`, `fit`, `reasons`, `evidence`, `risks`, `relevance_score` 필드를 포함해야 합니다.
+- 각 `recommended[]` 항목은 `rank`, `expert_id`, `name`, `organization`, `fit`, `reasons`, `evidence`, `risks`, `rank_score` 필드를 포함해야 합니다.
 - `reasons`, `risks`, `not_selected_reasons`, `data_gaps`는 문자열 배열이어야 합니다.
 - 판정 도중 LLM 응답에서 첫 번째 JSON 객체를 추출하며, 검증 전 가능한 범위 내에서 문자열/리스트 불일치를 정규화합니다.
 - `expert_id`가 누락되었으나 `name`이 숏리스트 후보 중 한 명과 정확히 일치하면 해당 전문가의 `expert_id`를 자동으로 보완합니다.
