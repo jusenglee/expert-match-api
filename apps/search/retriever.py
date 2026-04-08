@@ -131,6 +131,7 @@ class QdrantHybridRetriever:
             self.settings.qdrant_collection_name,
             "예" if query_filter else "아니오",
         )
+        logger.info("Qdrant 전달 플랜(Query Payload): %s", query_payload)
         with Timer() as t:
             points = await asyncio.to_thread(self.client.query_points, **query_payload)
         logger.info("Qdrant 검색 완료: 소요시간=%.2fms", t.elapsed_ms)

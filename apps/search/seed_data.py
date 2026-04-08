@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from apps.domain.models import BasicInfo, ResearcherProfile, PublicationEvidence, IntellectualPropertyEvidence, ResearchProjectEvidence, ExpertPayload, SeedExpertRecord
+from apps.domain.models import (
+    BasicInfo, ResearcherProfile, PublicationEvidence, 
+    IntellectualPropertyEvidence, ResearchProjectEvidence, 
+    ExpertPayload, SeedExpertRecord, SeedEvidencePoint
+)
 from apps.search.text_utils import normalize_org_name
 
 
@@ -127,25 +131,102 @@ def build_source_texts(payload: ExpertPayload) -> tuple[str, str, str, str]:
     )
 
 
+def points_from_payload(payload: ExpertPayload) -> list[SeedEvidencePoint]:
+    """
+    단일 전문가 페이로드를 Qdrant에 삽입 가능한 여러 개의 실적 단위(Evidence-level) 포인트들로 분리합니다.
+    구성: 1개의 기본 프로필 포인트 + N개의 개별 실적 포인트
+    """
+    points: list[SeedEvidencePoint] = []
+    r_id = payload.basic_info.researcher_id
+    
+    # 1. 기본 프로필 포인트 (이름, 소속, 전공, 평가위원 데이터 포함)
+    eval_activities = [
+        f"위원회: {act.committee_nm or ''} (기관: {act.appoint_org_nm or ''})"
+        for act in payload.evaluation_activities
+    ]
+    basic_text = "\n".join([
+        f"이름: {payload.basic_info.researcher_name}",
+        f"소속기관: {payload.basic_info.affiliated_organization or ''}",
+        f"직위: {payload.basic_info.position_title or ''}",
+        f"학위: {payload.researcher_profile.highest_degree or ''}",
+        f"전공: {payload.researcher_profile.major_field or ''}",
+        f"심사평가위원 활동: {', '.join(eval_activities)}",
+        f"심사참여건수: {payload.evaluation_activity_cnt}",
+    ])
+    points.append(
+        SeedEvidencePoint(
+            point_id=f"{r_id}_basic",
+            researcher_id=r_id,
+            branch="basic",
+            content_text=basic_text,
+            payload=payload
+        )
+    )
+
+    # 2. 개별 논문 포인트 (각 논문을 독립된 벡터로 인덱싱)
+    for i, paper in enumerate(payload.publications):
+        art_text = f"{paper.publication_title} {paper.journal_name or ''} {paper.abstract or ''} {', '.join(paper.korean_keywords)} {', '.join(paper.english_keywords)}"
+        points.append(
+            SeedEvidencePoint(
+                point_id=f"{r_id}_art_{i}",
+                researcher_id=r_id,
+                branch="art",
+                content_text=art_text,
+                payload=payload
+            )
+        )
+
+    # 3. 개별 특허 포인트
+    for i, patent in enumerate(payload.intellectual_properties):
+        pat_text = f"{patent.intellectual_property_title} {patent.application_registration_type or ''} {patent.application_country or ''}"
+        points.append(
+            SeedEvidencePoint(
+                point_id=f"{r_id}_pat_{i}",
+                researcher_id=r_id,
+                branch="pat",
+                content_text=pat_text,
+                payload=payload
+            )
+        )
+
+    # 4. 개별 연구 과제 포인트
+    for i, project in enumerate(payload.research_projects):
+        pjt_text = (
+            f"{project.project_title_korean or ''} {project.project_title_english or ''} "
+            f"{project.research_content_summary or ''} {project.performing_organization or ''} "
+            f"{project.managing_agency or ''}"
+        )
+        points.append(
+            SeedEvidencePoint(
+                point_id=f"{r_id}_pjt_{i}",
+                researcher_id=r_id,
+                branch="pjt",
+                content_text=pjt_text,
+                payload=payload
+            )
+        )
+
+    return points
+
+
 def record_from_payload(payload: ExpertPayload) -> SeedExpertRecord:
-    """단일 전문가 페이로드를 Qdrant에 삽입 가능한 Seed 레코드 형태로 변환합니다."""
-    basic_text, art_text, pat_text, pjt_text = build_source_texts(payload)
+    """Legacy: 가용성을 위해 유지하지만 내부적으로는 points_from_payload 사용을 권장합니다."""
+    # 하위 호환성을 위해 유지 (필요시 삭제)
     return SeedExpertRecord(
         point_id=payload.basic_info.researcher_id,
         payload=payload,
-        basic_text=basic_text,
-        art_text=art_text,
-        pat_text=pat_text,
-        pjt_text=pjt_text,
+        basic_text="DEPRECATED",
+        art_text="DEPRECATED",
+        pat_text="DEPRECATED",
+        pjt_text="DEPRECATED",
     )
 
 
-def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
+def build_synthetic_records_as_points(canonical: ExpertPayload) -> list[SeedEvidencePoint]:
     """
-    표준 템플릿을 변형하여 다양한 특징을 가진 여러 전문가 레코드를 생성합니다.
-    검색 랭킹 점수 차이, 필터링 로직, 브랜치별 가중치 테스트 등을 수행하기 위함입니다.
+    다양한 실적 특성을 가진 전문가들의 포인트 리스트를 생성합니다.
     """
-    records: list[SeedExpertRecord] = [record_from_payload(canonical)]
+    all_points: list[SeedEvidencePoint] = points_from_payload(canonical)
 
     # 1. 밸런스형 전문가 (논문, 특허, 과제 고루 분포)
     balanced = deepcopy(canonical)
@@ -165,7 +246,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
             registration_date="2023-05-01",
         )
     )
-    records.append(record_from_payload(balanced))
+    all_points.extend(points_from_payload(balanced))
 
     # 2. 논문 실적 중심 전문가
     paper_heavy = deepcopy(canonical)
@@ -197,7 +278,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     )
     paper_heavy.researcher_profile.publication_count = len(paper_heavy.publications)
     paper_heavy.researcher_profile.scie_publication_count = 3
-    records.append(record_from_payload(paper_heavy))
+    all_points.extend(points_from_payload(paper_heavy))
 
     # 3. 특허 실적 중심 전문가
     patent_heavy = deepcopy(canonical)
@@ -223,7 +304,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
         ),
     ]
     patent_heavy.researcher_profile.intellectual_property_count = len(patent_heavy.intellectual_properties)
-    records.append(record_from_payload(patent_heavy))
+    all_points.extend(points_from_payload(patent_heavy))
 
     # 4. 연구 과제 중심 전문가
     project_heavy = deepcopy(canonical)
@@ -254,7 +335,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
         ]
     )
     project_heavy.researcher_profile.research_project_count = len(project_heavy.research_projects)
-    records.append(record_from_payload(project_heavy))
+    all_points.extend(points_from_payload(project_heavy))
 
     # 5. 특정 기관(제외 대상) 소속 전문가 테스트용
     excluded_org = deepcopy(canonical)
@@ -262,7 +343,7 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     excluded_org.basic_info.researcher_name = "오제외"
     excluded_org.basic_info.affiliated_organization = "A기관"
     excluded_org.basic_info.affiliated_organization_exact = normalize_org_name("A기관")
-    records.append(record_from_payload(excluded_org))
+    all_points.extend(points_from_payload(excluded_org))
 
     # 6. 실적 정보가 매우 부족한 전문가 (낮은 순위 노출 테스트)
     weak_evidence = deepcopy(canonical)
@@ -277,6 +358,6 @@ def build_synthetic_records(canonical: ExpertPayload) -> list[SeedExpertRecord]:
     weak_evidence.researcher_profile.intellectual_property_count = 0
     weak_evidence.research_projects = weak_evidence.research_projects[:1]
     weak_evidence.researcher_profile.research_project_count = 1
-    records.append(record_from_payload(weak_evidence))
+    all_points.extend(points_from_payload(weak_evidence))
 
-    return records
+    return all_points

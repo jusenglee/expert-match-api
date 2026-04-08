@@ -180,7 +180,16 @@ class ExpertPayload(BaseModel):
         return self.model_dump(mode="json")
 
 
+class SeedEvidencePoint(BaseModel):
+    point_id: str
+    researcher_id: str
+    branch: BranchName
+    content_text: str
+    payload: ExpertPayload
+
+
 class SeedExpertRecord(BaseModel):
+    # Deprecated: SeedEvidencePoint로 대체 예정
     point_id: str
     payload: ExpertPayload
     basic_text: str
@@ -204,6 +213,14 @@ class SearchHit(BaseModel):
     expert_id: str
     score: float
     payload: ExpertPayload
+    branch: BranchName # 매칭된 실적의 종류
+    data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
+
+
+class GroupedSearchHit(BaseModel):
+    expert_id: str
+    group_score: float # 그룹 내 최고 점수 또는 집계 점수
+    hits: list[SearchHit] # 해당 전문가의 매칭된 실적 리스트
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
 

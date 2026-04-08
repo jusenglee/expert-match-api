@@ -52,6 +52,7 @@ class RecommendationService:
                 top_k=top_k,
             )
         logger.info("질의 분석 완료: 소요시간=%.2fms 의도=%r 필터=%r", t_plan.elapsed_ms, plan.intent_summary, plan.hard_filters)
+        logger.info("플래너 상세 답변(PlannerOutput): %s", plan.model_dump_json(indent=2))
         
         query_filter = self.filter_compiler.compile(plan.hard_filters, plan.exclude_orgs)
         with Timer() as t_search:
