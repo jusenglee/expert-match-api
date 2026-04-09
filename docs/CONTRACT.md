@@ -7,6 +7,7 @@
 ```json
 {
   "intent_summary": "AI 반도체 분야 심사위원 추천",
+  "core_keywords": ["AI 반도체", "인공지능", "반도체 설계"],
   "hard_filters": {
     "degree_slct_nm": "박사",
     "art_sci_slct_nm": "SCIE",
@@ -15,11 +16,12 @@
   },
   "exclude_orgs": ["A 기관"],
   "soft_preferences": ["최근 성과 중심"],
+  "branch_weights": {"basic": 0.5, "art": 1.0, "pat": 0.7, "pjt": 0.8},
   "branch_query_hints": {
-    "basic": "프로필 중심 질의",
-    "art": "논문 중심 질의",
-    "pat": "특허 중심 질의",
-    "pjt": "과제 중심 질의"
+    "basic": "AI 반도체 전공 박사 연구자 프로필",
+    "art": "AI 반도체 설계 논문 키워드 초록",
+    "pat": "AI 반도체 설계 공정 특허 발명 등록",
+    "pjt": "AI 반도체 설계 연구과제 수행 목표"
   },
   "top_k": 5
 }
@@ -28,8 +30,12 @@
 Planner 동작 방식:
 
 - LLM 플래너는 `PlannerOutput` 규격에 맞는 단일 JSON 객체를 반환해야 합니다.
+- 프롬프트는 JSON-only 출력을 강제합니다. 설명, 마크다운, 코드 펜스, `<thinking>` 태그를 출력하지 않도록 지시하며, "첫 글자 `{`, 마지막 글자 `}`" 규칙을 명시합니다.
+- `core_keywords`는 기술 도메인 핵심 키워드 배열입니다. 전공이나 연구 분야 단어는 `hard_filters`가 아닌 이 필드 또는 `branch_query_hints`에 포함해야 합니다.
+- `branch_weights`는 각 브랜치의 상대 중요도(0.0~1.0)를 나타냅니다. 현재 검색 파이프라인에서 가중 RRF로는 사용하지 않으나, query hint 생성 참고용으로 활용됩니다.
 - `branch_query_hints`는 리스트가 아닌 `basic`, `art`, `pat`, `pjt` 키를 가진 객체여야 합니다.
-- LLM 출력이 유효한 `PlannerOutput` 형식이 아니면 시스템은 히우리스틱 플래너로 폴백합니다.
+- LLM 응답에서 JSON 추출 시 3단계 방어 로직(`<thinking>` 제거 → 코드 블록 제거 → 균형 중괄호 매칭)을 적용합니다.
+- 추출·파싱된 결과가 유효한 `PlannerOutput` 형식이 아니면 시스템은 휴리스틱 플래너로 폴백합니다.
 
 ## Judge 출력 (Judge Output)
 
@@ -60,11 +66,21 @@ Planner 동작 방식:
 
 Judge 동작 방식:
 
+- `NTIS_USE_MAP_REDUCE_JUDGING=true`(기본값)이면 Judge는 **Map-Reduce 2단계**로 동작합니다.
+- **Map 라운드**: 숏리스트를 `NTIS_LLM_JUDGE_BATCH_SIZE`(기본 10) 단위로 분할하여 병렬 호출합니다. 경량 직렬화(프로필 핵심 정보 + 제목만)와 경량 프롬프트를 사용하며, `max_tokens=400`으로 응답을 제한합니다.
+
+Map 라운드 출력 스키마:
+```json
+{"survivors":[{"expert_id":"...","rank":1},{"expert_id":"...","rank":2}]}
+```
+- LLM이 `survivors` 대신 `recommended` 키로 응답한 경우에도 호환 처리합니다.
+
+- **Reduce 라운드**: Map에서 살아남은 후보만 모아 전체 직렬화(초록, 키워드, 연구 요약 포함)와 상세 프롬프트로 최종 1회 호출합니다. `max_tokens` 제한 없이 상세 응답을 허용합니다.
 - 각 `recommended[]` 항목은 `rank`, `expert_id`, `name`, `organization`, `fit`, `reasons`, `evidence`, `risks`, `rank_score` 필드를 포함해야 합니다.
 - `reasons`, `risks`, `not_selected_reasons`, `data_gaps`는 문자열 배열이어야 합니다.
-- 판정 도중 LLM 응답에서 첫 번째 JSON 객체를 추출하며, 검증 전 가능한 범위 내에서 문자열/리스트 불일치를 정규화합니다.
+- 판정 도중 LLM 응답에서 3단계 방어 JSON 추출(`<thinking>` 제거 → 코드 블록 제거 → 균형 중괄호 매칭)을 수행하며, 검증 전 가능한 범위 내에서 문자열/리스트 불일치를 정규화합니다.
 - `expert_id`가 누락되었으나 `name`이 숏리스트 후보 중 한 명과 정확히 일치하면 해당 전문가의 `expert_id`를 자동으로 보완합니다.
-- 정규화된 결과가 여전히 `JudgeOutput` 규격에 맞지 않으면 히우리스틱 판정기로 폴백합니다.
+- 정규화된 결과가 여전히 `JudgeOutput` 규격에 맞지 않으면 휴리스틱 판정기로 폴백합니다.
 
 ## API 명세
 

@@ -597,7 +597,7 @@ class OpenAICompatJudge:
         if is_map_phase:
             dumped_shortlist = self._serialize_shortlist_for_map(shortlist)
             system_prompt = self._build_map_system_prompt()
-            max_tokens_hint = 200
+            max_tokens_hint = 400
         else:
             dumped_shortlist = self._serialize_shortlist(shortlist)
             system_prompt = self._build_system_prompt()

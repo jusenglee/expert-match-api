@@ -76,12 +76,25 @@ curl -X POST http://127.0.0.1:8011/recommend `
 본 시스템은 모든 요청에 대해 **Trace ID**를 부여하여 추적성을 보장합니다.
 
 ### 주요 추적 로그 포인트 (한글 로그)
-- **Planner**: 사용자 질의 분석 결과 및 하드 필터 추출 정보
-- **Retriever**: 하이브리드 검색 실행 결과 및 검색된 후보 수
-- **Judge**: 후보 간 비교 판단 근거 및 추천 순위 결정 사유
-- **Judge Batch Round**: 라운드 번호, 배치 수, 배치 크기, 생존 후보 수, 세마포어 상한
-- **Fallback**: LLM 오류 시 휴리스틱 모드로의 전환 안내
+- **Planner**: 사용자 질의 분석 결과, 하드 필터 추출 정보, LLM 응답 소요시간 및 토큰 수
+- **Retriever**: 하이브리드 검색 실행 결과, 검색된 후보 수, 필터 적용 현황
+- **Judge Map 라운드**: 배치 분할 정보(라운드 번호, 배치 수, 배치 크기), 후보별 예상 토큰 크기, `max_tokens=400` 제한 적용, LLM 호출 슬롯 획득(세마포어), 경량 응답 수신 시간, 생존자(survivors) 수
+- **Judge Reduce 라운드**: 생존 후보의 전체 직렬화 토큰 추정, `max_tokens=unlimited` 적용, 상세 응답 수신 시간
+- **Judge JSON 추출**: 3단계 방어 JSON 추출 결과 (추출된 텍스트 로깅)
+- **Judge 정규화**: 문자열/리스트 불일치 자동 교정 횟수
+- **Fallback**: LLM 오류 또는 JSON 파싱 실패 시 휴리스틱 모드로의 전환 안내 (Planner/Judge 각각)
 - **Data Gap**: 특정 전문가의 데이터 누락(논문 없음 등)에 대한 경고
 
 로그 형식은 다음과 같으며, Playground UI의 콘솔에서 레벨별 색상과 함께 확인할 수 있습니다.
 `[시간] [레벨] [ID:TraceID] [모듈명] 메시지`
+
+### 로그 예시 (Map-Reduce 심사)
+```
+[09:45:54] [INFO] [ID:abc123] [Judge] Map-Reduce 분할 시작: 총 후보=37 배치크기=10 배치수=4
+[09:45:54] [INFO] [ID:abc123] [Judge] 데이터당 예상 토큰 크기: context=map 총 추정=1200 토큰 후보 수=10
+[09:45:54] [INFO] [ID:abc123] [Judge] LLM 호출 슬롯 획득: context=map round=1 batch=1/4 max_concurrency=10 max_tokens=400
+[09:45:56] [INFO] [ID:abc123] [Judge] LLM 응답 수신 완료: context=map round=1 batch=1/4 소요시간=1823.45ms
+[09:45:58] [INFO] [ID:abc123] [Judge] Map 라운드 완료: 생존 후보=15
+[09:45:58] [INFO] [ID:abc123] [Judge] LLM 판정 시작: context=reduce round=2 batch=1/1 후보 수=15 max_tokens=unlimited
+[09:46:09] [INFO] [ID:abc123] [Judge] LLM 응답 수신 완료: context=reduce round=2 batch=1/1 소요시간=10894.23ms
+```

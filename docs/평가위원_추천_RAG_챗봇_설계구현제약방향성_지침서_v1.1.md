@@ -2,8 +2,8 @@
 ## 설계 · 구현 · 제한 · 방향성 지침서
 
 **기준선:** Qdrant v1.16.0 / Named Vector + Hybrid Retrieval / LLM Recommendation  
-**문서 버전:** v1.1  
-**기준일:** 2026-04-06
+**문서 버전:** v1.2  
+**기준일:** 2026-04-09
 
 ---
 
@@ -15,7 +15,7 @@
 | 고정 기준 | Qdrant v1.16.0 고정 / named vector 기반 / prefetch 동시검색 / 가중치 미사용 / 최종 추천은 LLM 판단 |
 | 검색 철학 | Qdrant는 후보 생성과 정렬 보조, LLM은 비교·추천과 설명 생성 |
 | 설계 단위 | 전문가 1명 = 1 point, 기본정보(root) + 논문/특허/과제 nested payload |
-| 문서 버전 | v1.0 (초기 기준선, 2026-03-31) |
+| 문서 버전 | v1.2 (Map-Reduce 심사, JSON 추출 방어, Planner 프롬프트 개선 반영, 2026-04-09) |
 
 > **이번 문서에서 확정한 핵심 원칙**
 >
@@ -106,8 +106,9 @@
 [Candidate Card Builder]
    - top-N 후보를 LLM 입력용 카드로 압축
    ↓
-[LLM Judge / Recommender]
-   - 후보 비교
+[LLM Judge / Recommender — Map-Reduce 2단계]
+   - Map: 경량 직렬화 + 경량 프롬프트로 배치 병렬 예비 심사 (max_tokens=400)
+   - Reduce: 생존자만 전체 직렬화 + 상세 프롬프트로 최종 비교
    - 추천/제외 사유 생성
    - 데이터 공백 명시
    ↓
@@ -125,7 +126,7 @@
 | Retrieval Orchestrator | dense/sparse 질의 생성, Qdrant prefetch 조립 | 검색 파이프라인의 핵심 제어층 |
 | Qdrant | 후보 생성, fusion, 필터 적용 | 최종 추천 판단은 담당하지 않음 |
 | Candidate Card Builder | LLM 입력용 증거 요약 | 토큰 비용과 잡음을 줄이는 단계 |
-| LLM Judge / Recommender | 후보 비교, 최종 추천 생성 | 최종 의사결정의 핵심 |
+| LLM Judge / Recommender | Map-Reduce 2단계 심사: Map(경량 병렬 예비 심사) → Reduce(상세 최종 추천) | 최종 의사결정의 핵심 |
 | Visibility Layer | Trace ID 부여 및 실시간 한글 로깅 | **(v1.1 추가)** 전 과정 추적성 보장 |
 | Audit Logger | 질의, 필터, 후보, 추천 결과 저장 | 운영 개선과 평가셋 구축에 필수 |
 
@@ -274,15 +275,42 @@ result = client.query_points(
 - 추천 사유는 반드시 payload evidence와 연결한다.
 - 충분한 근거가 없으면 `추천 보류` 또는 `추가 조건 필요`를 출력한다.
 
-### 7.2 Candidate Card 설계
+### 7.2 Map-Reduce 2단계 심사 (v1.2 신규)
+
+`NTIS_USE_MAP_REDUCE_JUDGING=true`(기본값)이면 Judge는 아래 2단계로 동작한다.
+
+#### Map 라운드 (예비 심사)
+
+| 항목 | 설정 |
+|---|---|
+| 입력 직렬화 | 경량: 프로필 핵심(이름, 소속, 전공, 학위, 실적 건수) + 논문/특허/과제 제목만. 초록, 키워드, 연구 요약 제외 |
+| 프롬프트 | 경량: "관련성 높은 후보를 골라 `survivors` 배열로 반환하라". 이유, 근거, 리스크 요구 없음 |
+| 출력 스키마 | `{"survivors":[{"expert_id":"...","rank":1}]}` |
+| max_tokens | 400 |
+| 병렬화 | `NTIS_LLM_JUDGE_BATCH_SIZE`(기본 10) 단위로 분할, `asyncio.gather`로 동시 호출, `NTIS_LLM_JUDGE_MAX_CONCURRENCY`(기본 10) 세마포어 |
+
+#### Reduce 라운드 (최종 심사)
+
+| 항목 | 설정 |
+|---|---|
+| 입력 직렬화 | 전체: 초록(150자 절단), 키워드(5개), 연구 요약(150자 절단) 포함 |
+| 프롬프트 | 상세: 추천 순위, 적합도, 이유, 근거, 리스크, 비선택 사유, 데이터 공백 모두 요구 |
+| 출력 스키마 | `JudgeOutput` 전체 (아래 7.4 참조) |
+| max_tokens | 제한 없음 |
+| 호출 횟수 | 1회 |
+
+이 구조로 Map에서 입력 토큰을 절약하고 심사 대상을 축소한 뒤, Reduce에서 집중 비교하므로 전체 토큰 비용과 지연시간이 줄어든다.
+
+### 7.3 Candidate Card 설계
 
 | 카드 종류 | 포함 내용 | 용도 |
 |---|---|---|
-| Small Card | 기본 프로필, 집계값, 대표 논문/특허/과제 1~2건 | top 40 → top 10 축약 |
-| Large Card | small card + 근거 3~6건 + 리스크 + 누락 정보 | 최종 top 3~5 추천 |
+| Map용 경량 카드 | expert_id, 이름, 소속, 전공, 학위, 실적 건수, 키워드 매칭 건수, branch 커버리지, 논문/특허/과제 제목 | Map 라운드 예비 심사 입력 |
+| Reduce용 전체 카드 | 기본 프로필 + 논문 초록(150자)/키워드(5개) + 과제 연구 목표/내용(150자) + 특허 전체 + 리스크 + 누락 정보 | Reduce 라운드 최종 심사 입력 |
 
-### 7.3 LLM Judge 출력 규격(권장)
+### 7.4 LLM Judge 출력 규격
 
+**Reduce/Single 라운드 출력 (JudgeOutput):**
 ```json
 {
   "recommended": [
@@ -290,6 +318,7 @@ result = client.query_points(
       "rank": 1,
       "expert_id": "11008395",
       "name": "홍길동",
+      "organization": "테스트연구원",
       "fit": "높음",
       "reasons": [
         "주제 적합성이 높음",
@@ -297,10 +326,11 @@ result = client.query_points(
         "논문/과제 근거가 모두 확인됨"
       ],
       "evidence": [
-        {"type": "paper", "title": "...", "date": "2024-09"},
-        {"type": "project", "title": "...", "period": "2020-01 ~ 2022-12"}
+        {"type": "paper", "title": "...", "date": "2024-09", "detail": "SCIE"},
+        {"type": "project", "title": "...", "date": "2020-01-01", "detail": "주관연구책임자"}
       ],
-      "risks": ["특허 근거는 상대적으로 약함"]
+      "risks": ["특허 근거는 상대적으로 약함"],
+      "rank_score": 95.5
     }
   ],
   "not_selected_reasons": [],
@@ -308,13 +338,29 @@ result = client.query_points(
 }
 ```
 
-### 7.4 프롬프트 가드레일
+**Map 라운드 출력 (경량):**
+```json
+{"survivors":[{"expert_id":"ntis:...","rank":1},{"expert_id":"ntis:...","rank":2}]}
+```
+
+### 7.5 3단계 방어적 JSON 추출 (v1.2 신규)
+
+Planner와 Judge 양쪽에서 동일한 `_extract_json_object_text` 함수를 사용한다.
+
+1. `<thinking>...</thinking>` 블록 정규식 제거
+2. 마크다운 코드 블록(` ```json ... ``` `) 내부 텍스트 추출
+3. 첫 번째 `{`부터 깊이 추적, 문자열 리터럴 안의 `{}`는 무시, 깊이 0에서 끊는 균형 중괄호 매칭
+
+이 3단계 방어로 LLM이 JSON 외 텍스트를 출력하더라도 파싱 실패율이 대폭 감소한다.
+
+### 7.6 프롬프트 가드레일
 
 - 질문에 없는 조건을 임의로 추가하지 말 것
 - Hard filter를 충족하지 않는 후보는 추천하지 말 것
 - 동일한 근거를 여러 번 반복하지 말 것
 - 근거가 약한 경우 `추측`이 아니라 `근거 부족`으로 표현할 것
 - 추천 결과뿐 아니라 왜 1순위/2순위인지 비교 문장을 포함할 것
+- `rank_score`는 상대적 RRF 점수이며 절대적 적합도 백분율이 아님을 명시
 
 ---
 
