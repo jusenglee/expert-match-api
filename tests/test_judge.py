@@ -359,6 +359,62 @@ def test_openai_compat_judge_falls_back_per_batch_without_failing_entire_round()
     assert any(item.expert_id.startswith("fail") for item in result.recommended)
 
 
+async def _fake_judge_with_pjt_type(messages, **kwargs):
+    """LLM이 evidence.type에 'pjt' 축약어를 반환하는 경우를 재현합니다.
+    Pydantic validator가 자동 정규화(pjt → project)하므로 ValidationError 없이
+    통과되어야 합니다 (postmortem-judge-errors 회귀 방지 케이스).
+    """
+    return SimpleNamespace(
+        content="""{
+  "recommended": [
+    {
+      "rank": 1,
+      "expert_id": "1",
+      "name": "Alice Kim",
+      "organization": "Test Lab",
+      "fit": "높음",
+      "reasons": ["연구과제 실적 우수"],
+      "evidence": [
+        {
+          "type": "pjt",
+          "title": "AI Semiconductor Program",
+          "date": "2025-12-31",
+          "detail": "NIPA"
+        }
+      ],
+      "risks": [],
+      "rank_score": 25.0
+    }
+  ],
+  "not_selected_reasons": [],
+  "data_gaps": []
+}"""
+    )
+
+
+def test_openai_compat_judge_normalizes_pjt_type_in_evidence():
+    """
+    회귀 방지: LLM이 evidence.type에 브랜치 축약어 'pjt'를 반환해도
+    Pydantic validator가 'project'로 자동 정규화하여 ValidationError 없이 통과해야 한다.
+    이전에는 이 오류로 Reduce 라운드 전체가 Fallback으로 강등되었음.
+    """
+    judge = OpenAICompatJudge(Settings(app_env="test", strict_runtime_validation=False))
+    judge.model = SimpleNamespace(ainvoke_non_stream=_fake_judge_with_pjt_type)
+
+    result = asyncio.run(
+        judge.judge(query="AI 반도체 전문가", plan=_plan(), shortlist=[_full_card()])
+    )
+
+    assert len(result.recommended) == 1
+    evidence = result.recommended[0].evidence
+    assert len(evidence) == 1
+    assert evidence[0].type == "project", (
+        "'pjt' 타입이 'project'로 정규화되지 않았습니다. "
+        "EvidenceItem._normalize_evidence_type validator를 확인하세요."
+    )
+    assert evidence[0].title == "AI Semiconductor Program"
+
+
 async def _fake_recoverable_judge_response(messages, **kwargs):
     return SimpleNamespace(
         content="""```json

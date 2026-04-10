@@ -9,8 +9,10 @@ from typing import Any, Protocol
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from apps.core.config import Settings
+from apps.core.json_utils import extract_json_object_text as _extract_json_object_text
 from apps.core.openai_compat_llm import OpenAICompatChatModel
 from apps.core.timer import Timer
+from apps.core.utils import merge_unique_strings as _merge_unique_strings
 from apps.domain.models import (
     CandidateCard,
     EvidenceItem,
@@ -22,75 +24,7 @@ from apps.domain.models import (
 logger = logging.getLogger(__name__)
 
 
-def _extract_json_object_text(content: Any) -> str:
-    """Extract the first JSON object from an LLM response payload.
-
-    Safely strips <thinking> blocks, markdown code fences, and extraneous text,
-    then uses balanced-brace matching to isolate the top-level JSON object.
-    """
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        text = "".join(parts)
-    else:
-        text = str(content)
-
-    text = text.strip()
-
-    # 1단계: <thinking>...</thinking> 블록 완전 제거
-    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = text.strip()
-
-    # 2단계: 마크다운 코드 블록 제거
-    code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    if code_block_match:
-        text = code_block_match.group(1).strip()
-    else:
-        text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"```", "", text).strip()
-
-    # 3단계: 균형 잡힌 중괄호 매칭으로 최상위 JSON 객체 추출
-    start = text.find("{")
-    if start == -1:
-        return text
-
-    depth = 0
-    in_string = False
-    escape_next = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == "\\":
-            if in_string:
-                escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-
-    # 균형 매칭 실패 시 폴백
-    end = text.rfind("}")
-    if start != -1 and end != -1 and start < end:
-        return text[start : end + 1]
-    return text
+# _extract_json_object_text 는 apps.core.json_utils 로 이전됨 (import 위 참조)
 
 
 def _normalize_string_list(value: Any) -> list[str] | Any:
@@ -216,17 +150,7 @@ def _normalize_judge_payload(
     return normalized_payload, normalized_applied
 
 
-def _merge_unique_strings(*groups: list[str]) -> list[str]:
-    merged: list[str] = []
-    seen: set[str] = set()
-    for group in groups:
-        for item in group:
-            normalized = item.strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            merged.append(normalized)
-    return merged
+# _merge_unique_strings 는 apps.core.utils 로 이전됨 (import 위 참조)
 
 
 class Judge(Protocol):
@@ -328,7 +252,7 @@ class HeuristicJudge:
             )
 
         return JudgeOutput(
-            recommended=recommendations[:5],
+            recommended=recommendations[: plan.top_k],
             not_selected_reasons=not_selected_reasons,
             data_gaps=unique_gaps,
         )
@@ -383,6 +307,7 @@ class OpenAICompatJudge:
             - IMPORTANT: You MUST recommend up to the number of candidates specified in the plan's `top_k` field. Do NOT just return 1 candidate if there are multiple suitable fits.
             - IMPORTANT: `rank_score` is a RELATIVE score within this search result (RRF-based), not an absolute suitability percentage. Do not misuse it as a probability.
             - IMPORTANT: `branch_presence_flags` only indicate that data exists in that branch. It does not guarantee a perfect match. Verify exact suitability from `top_papers`, `top_patents`, etc.
+            - IMPORTANT: In evidence items, `type` must be exactly one of "paper", "patent", "project", or "profile". Do NOT use branch abbreviations like "pjt", "art", or "pat". Research projects (과제) must use "project".
             - Copy `expert_id` exactly from the shortlist input.
             - Every recommendation must include `rank`, `expert_id`, `name`, `organization`, `fit`, `reasons`, `evidence`, and `risks`.
             - `reasons`, `risks`, `not_selected_reasons`, and `data_gaps` must always be arrays of strings, never a single string.
@@ -594,10 +519,13 @@ class OpenAICompatJudge:
         is_map_phase = context_label == "map"
 
         # Map 라운드: 경량 직렬화 + 경량 프롬프트 + max_tokens 제한
+        # 주의: 400 이하로 설정 시 LLM 출력이 중간에 잘려 JSON 파싱 오류 발생.
+        # Map 응답은 {"survivors":[...]} 최소 형식이지만, LLM이 불필요한 텍스트를
+        # 추가 생성하는 경우도 있으므로 1500 이상 여유를 확보한다.
         if is_map_phase:
             dumped_shortlist = self._serialize_shortlist_for_map(shortlist)
             system_prompt = self._build_map_system_prompt()
-            max_tokens_hint = 400
+            max_tokens_hint = 6000
         else:
             dumped_shortlist = self._serialize_shortlist(shortlist)
             system_prompt = self._build_system_prompt()

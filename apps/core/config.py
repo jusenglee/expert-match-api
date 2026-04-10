@@ -40,10 +40,9 @@ class Settings(BaseSettings):
 
     # 기본 앱 정보
     app_name: str = "NTIS Evaluator Recommendation API"
-    app_env: Literal["dev", "test", "prod"] = "prod"
+    app_env: Literal["dev", "test", "prod"] = "prod"  # 스타트업 로그에 기록됨
     app_host: str = "0.0.0.0"
     app_port: int = 8011
-    api_prefix: str = ""
     strict_runtime_validation: bool = True
 
     # Qdrant 벡터 데이터베이스 설정

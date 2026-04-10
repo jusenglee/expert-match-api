@@ -15,82 +15,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from apps.core.config import Settings
+from apps.core.json_utils import extract_json_object_text as _extract_json_object_text
 from apps.core.openai_compat_llm import OpenAICompatChatModel
 from apps.domain.models import PlannerOutput
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_json_object_text(content: Any) -> str:
-    """
-    LLM 응답 텍스트에서 JSON 객체 부분만 추출합니다.
-    <thinking> 태그, 마크다운 코드 블록, 부가 텍스트 등을 안전하게 제거하고
-    균형 잡힌 중괄호 매칭으로 최상위 JSON 객체만 반환합니다.
-    """
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-            else:
-                parts.append(str(item))
-        text = "".join(parts)
-    else:
-        text = str(content)
-
-    text = text.strip()
-
-    # 1단계: <thinking>...</thinking> 블록 완전 제거 (내부에 {}가 포함될 수 있으므로)
-    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = text.strip()
-
-    # 2단계: 마크다운 코드 블록 제거 (```json ... ``` 또는 ``` ... ```)
-    code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    if code_block_match:
-        text = code_block_match.group(1).strip()
-    else:
-        # 코드 펜스 마커만 단독으로 존재하는 경우 제거
-        text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"```", "", text).strip()
-
-    # 3단계: 균형 잡힌 중괄호 매칭으로 최상위 JSON 객체 추출
-    start = text.find("{")
-    if start == -1:
-        return text
-
-    depth = 0
-    in_string = False
-    escape_next = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == "\\":
-            if in_string:
-                escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-
-    # 균형 매칭 실패 시 기존 방식 폴백 (첫 { ~ 마지막 })
-    end = text.rfind("}")
-    if start != -1 and end != -1 and start < end:
-        return text[start : end + 1]
-    return text
+# _extract_json_object_text 는 apps.core.json_utils 로 이전됨 (import 위 참조)
 
 
 class Planner(Protocol):
@@ -197,7 +129,7 @@ class HeuristicPlanner:
             soft_preferences=soft_preferences,
             branch_weights=branch_weights,
             branch_query_hints=branch_hints,
-            top_k=top_k or 5,
+            top_k=top_k or 15,
         )
 
 
@@ -238,12 +170,20 @@ class OpenAICompatPlanner:
             '  "intent_summary": "검색 의도를 1-2문장으로 요약",\n'
             '  "core_keywords": ["기술 도메인 핵심어"],\n'
             '  "hard_filters": { 허용 키만 사용 },\n'
+            '  "include_orgs": ["검색 대상 기관명 (소속 제한)"],\n'
             '  "exclude_orgs": ["제외할 기관명"],\n'
             '  "soft_preferences": ["선호 조건 설명"],\n'
             '  "branch_weights": {"basic":1.0,"art":1.0,"pat":1.0,"pjt":1.0},\n'
             '  "branch_query_hints": {"basic":"...","art":"...","pat":"...","pjt":"..."},\n'
-            '  "top_k": 5\n'
+            '  "top_k": 15\n'
             '}\n\n'
+            "## 기관 필터 규칙 (매우 중요 — 혼동 금지)\n"
+            "- include_orgs: 추천 대상을 특정 기관 소속 연구자로 **제한**할 때 사용.\n"
+            "  → 패턴 예시: 'X 소속 연구자 중', 'X 소속에서 추천', 'X 연구원 소속 전문가'\n"
+            "  → 이 경우 X를 include_orgs에 넣고 exclude_orgs는 비워야 함.\n"
+            "- exclude_orgs: 특정 기관을 결과에서 **제외**할 때 사용.\n"
+            "  → 패턴 예시: 'X 제외', 'X 빼고', 'X 소속 제외'\n"
+            "- 절대 혼동 금지: '소속 연구자 중'은 포함(include)이지 제외(exclude)가 아님.\n\n"
             "## hard_filters 허용 키 및 값 규칙 (이 외의 키는 사용 금지)\n"
             '- "degree_slct_nm": 학위 조건. 허용 값: "박사", "석사", 또는 ["석사","박사"]. '
             '"박사 이상" 같은 표현은 "박사"로 변환.\n'
@@ -265,6 +205,7 @@ class OpenAICompatPlanner:
             '{"intent_summary":"자율주행 센서 융합 분야에서 최근 5년간 논문실적이 있는 박사급 전문가를 추천합니다.",'
             '"core_keywords":["자율주행","센서 융합","LiDAR","카메라 융합","ADAS"],'
             '"hard_filters":{"degree_slct_nm":"박사","art_recent_years":5,"article_cnt_min":1},'
+            '"include_orgs":[],'
             '"exclude_orgs":["A대학교"],'
             '"soft_preferences":["최근 5년 논문실적 보유","센서 융합 관련 연구경험"],'
             '"branch_weights":{"basic":0.5,"art":1.0,"pat":0.7,"pjt":0.8},'
@@ -272,12 +213,13 @@ class OpenAICompatPlanner:
             '"art":"자율주행 센서 융합 LiDAR 카메라 융합 인지 알고리즘 논문 키워드 초록",'
             '"pat":"자율주행 센서 융합 인지 시스템 특허 발명 등록",'
             '"pjt":"자율주행 센서 융합 ADAS 연구과제 수행 목표 내용"},'
-            '"top_k":5}\n\n'
+            '"top_k":15}\n\n'
             "## 예시 2\n"
             "질의: \"반도체 공정 장비 관련 특허 보유 전문가\"\n"
             '{"intent_summary":"반도체 공정 장비 관련 특허를 보유한 전문가를 추천합니다.",'
             '"core_keywords":["반도체","공정 장비","웨이퍼","식각","증착"],'
             '"hard_filters":{"patent_cnt_min":1},'
+            '"include_orgs":[],'
             '"exclude_orgs":[],'
             '"soft_preferences":["반도체 공정 장비 관련 등록 특허 보유"],'
             '"branch_weights":{"basic":0.5,"art":0.5,"pat":1.0,"pjt":0.7},'
@@ -285,7 +227,21 @@ class OpenAICompatPlanner:
             '"art":"반도체 공정 장비 식각 증착 관련 논문",'
             '"pat":"반도체 공정 장비 웨이퍼 식각 증착 특허 발명명 등록",'
             '"pjt":"반도체 공정 장비 관련 연구과제 수행 경험"},'
-            '"top_k":5}\n'
+            '"top_k":15}\n\n'
+            "## 예시 3\n"
+            "질의: \"한국과학기술정보연구원 소속 연구자 중 국가 R&D 성과물 과제 관련 평가위원 추천\"\n"
+            '{"intent_summary":"한국과학기술정보연구원 소속 연구자 중 국가 R&D 성과물 과제 관련 평가위원을 추천합니다.",'
+            '"core_keywords":["국가 R&D 성과물","평가위원","연구성과"],'
+            '"hard_filters":{"project_cnt_min":1},'
+            '"include_orgs":["한국과학기술정보연구원"],'
+            '"exclude_orgs":[],'
+            '"soft_preferences":["국가 R&D 성과물 평가 경험","성과물 기반 연구과제 수행"],'
+            '"branch_weights":{"basic":1.0,"art":0.7,"pat":0.5,"pjt":1.0},'
+            '"branch_query_hints":{"basic":"한국과학기술정보연구원 소속 연구자 프로필",'
+            '"art":"국가 R&D 성과물 관련 논문 키워드 초록",'
+            '"pat":"국가 R&D 성과물 관련 특허 발명명",'
+            '"pjt":"국가 R&D 성과물 기반 연구과제 수행 목표 내용"},'
+            '"top_k":15}\n'
         )
         user_prompt = json.dumps(
             {

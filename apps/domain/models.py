@@ -213,12 +213,18 @@ class SeedExpertRecord(BaseModel):
 class PlannerOutput(BaseModel):
     intent_summary: str
     hard_filters: dict[str, Any] = Field(default_factory=dict)
+    include_orgs: list[str] = Field(
+        default_factory=list,
+        description="추천 대상을 특정 기관 소속으로 제한할 때 사용. "
+                    "'X 소속 연구자 중', 'X에서 추천' 패턴 → must 조건. "
+                    "exclude_orgs(제외)와 반대 개념.",
+    )
     exclude_orgs: list[str] = Field(default_factory=list)
     soft_preferences: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
     branch_weights: dict[BranchName, float] = Field(default_factory=dict)
     branch_query_hints: dict[BranchName, str] = Field(default_factory=dict)
-    top_k: int = 5
+    top_k: int = 15
 
 
 class SearchHit(BaseModel):
@@ -261,6 +267,22 @@ class EvidenceItem(BaseModel):
     title: str
     date: str | None = None
     detail: str | None = None
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _normalize_evidence_type(cls, v: Any) -> Any:
+        """LLM이 플래너 브랜치 축약어(pjt, art, pat)를 그대로 출력하는 경우를 방어합니다.
+        내부 브랜치명과 Pydantic 허용값 사이의 스키마 파편화로 발생하는 Validation 오류를
+        자동으로 복구합니다 (브랜치명 → 정규 type 값 매핑).
+        """
+        _BRANCH_ALIAS: dict[str, str] = {
+            "pjt": "project",
+            "art": "paper",
+            "pat": "patent",
+        }
+        if isinstance(v, str):
+            return _BRANCH_ALIAS.get(v.strip().lower(), v)
+        return v
 
 
 class CandidateCard(BaseModel):

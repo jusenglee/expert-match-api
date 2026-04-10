@@ -81,6 +81,11 @@ async def build_app_runtime(
     """
     애플리케이션 구동에 필요한 핵심 런타임 객체들을 초기화합니다.
     """
+    logger.info(
+        "앱 런타임 초기화 시작: app_env=%s app_name=%r",
+        settings.app_env,
+        settings.app_name,
+    )
     if settings.hf_hub_offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
         logger.info("HuggingFace Hub 오프라인 모드 강제 설정 (HF_HUB_OFFLINE=1)")
@@ -147,6 +152,8 @@ async def build_app_runtime(
         feedback_store=feedback_store,
         shortlist_limit=settings.shortlist_limit,
         use_map_reduce_judging=settings.use_map_reduce_judging,
+        final_recommendation_max=settings.final_recommendation_max,
+        final_recommendation_min=settings.final_recommendation_min,
     )
 
     validator = LiveContractValidator(

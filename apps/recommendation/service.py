@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from apps.core.feedback_store import FeedbackStore
+from apps.core.utils import merge_unique_strings as _merge_unique_strings
 from apps.domain.models import CandidateCard, JudgeOutput, PlannerOutput, RecommendationDecision
 from apps.recommendation.cards import CandidateCardBuilder
 from apps.recommendation.judge import Judge
@@ -28,6 +29,8 @@ class RecommendationService:
         feedback_store: FeedbackStore,
         shortlist_limit: int,
         use_map_reduce_judging: bool = True,
+        final_recommendation_max: int = 20,
+        final_recommendation_min: int = 1,
     ) -> None:
         self.planner = planner
         self.retriever = retriever
@@ -37,6 +40,8 @@ class RecommendationService:
         self.feedback_store = feedback_store
         self.shortlist_limit = shortlist_limit
         self.use_map_reduce_judging = use_map_reduce_judging
+        self.final_recommendation_max = final_recommendation_max
+        self.final_recommendation_min = final_recommendation_min
         judge_settings = getattr(self.judge, "settings", None)
         if judge_settings is not None and hasattr(
             judge_settings, "use_map_reduce_judging"
@@ -61,7 +66,11 @@ class RecommendationService:
         logger.info("질의 분석 완료: 소요시간=%.2fms 의도=%r 필터=%r", t_plan.elapsed_ms, plan.intent_summary, plan.hard_filters)
         logger.info("플래너 상세 답변(PlannerOutput): %s", plan.model_dump_json(indent=2))
         
-        query_filter = self.filter_compiler.compile(plan.hard_filters, plan.exclude_orgs)
+        query_filter = self.filter_compiler.compile(
+            plan.hard_filters,
+            plan.exclude_orgs,
+            include_orgs=plan.include_orgs,
+        )
         with Timer() as t_search:
             retrieval = await self.retriever.search(query=query, plan=plan, query_filter=query_filter)
         logger.info("검색 완료: 소요시간=%.2fms 검색된 히트 수=%d", t_search.elapsed_ms, len(retrieval.hits))
@@ -136,15 +145,33 @@ class RecommendationService:
         
         evidence_less_count = sum(1 for item in judge_output.recommended if not item.evidence)
         recommendations = [item for item in judge_output.recommended if item.evidence]
-        not_selected_reasons = self._merge_unique_strings(judge_output.not_selected_reasons)
+
+        # final_recommendation_max 상한 적용
+        if len(recommendations) > self.final_recommendation_max:
+            logger.warning(
+                "추천 결과가 최대 허용치를 초과하여 절단: %d → %d",
+                len(recommendations),
+                self.final_recommendation_max,
+            )
+            recommendations = recommendations[: self.final_recommendation_max]
+
+        # final_recommendation_min 하한 경고 (결과 자체는 유지)
+        if 0 < len(recommendations) < self.final_recommendation_min:
+            logger.warning(
+                "추천 결과가 최소 기준 미달: 현재=%d 기준=%d (결과 그대로 반환)",
+                len(recommendations),
+                self.final_recommendation_min,
+            )
+
+        not_selected_reasons = _merge_unique_strings(judge_output.not_selected_reasons)
 
         if not judge_output.recommended:
-            not_selected_reasons = self._merge_unique_strings(
+            not_selected_reasons = _merge_unique_strings(
                 not_selected_reasons,
                 ["조건을 만족하는 추천 후보를 찾지 못했습니다."],
             )
         elif evidence_less_count:
-            not_selected_reasons = self._merge_unique_strings(
+            not_selected_reasons = _merge_unique_strings(
                 not_selected_reasons,
                 ["근거가 충분한 추천 결과를 생성하지 못했습니다."],
             )
@@ -258,15 +285,4 @@ class RecommendationService:
         serialized["query"] = str(payload.get("query"))
         return serialized
 
-    @staticmethod
-    def _merge_unique_strings(*groups: list[str]) -> list[str]:
-        merged: list[str] = []
-        seen: set[str] = set()
-        for group in groups:
-            for item in group:
-                normalized = item.strip()
-                if not normalized or normalized in seen:
-                    continue
-                seen.add(normalized)
-                merged.append(normalized)
-        return merged
+    # _merge_unique_strings 는 apps.core.utils 로 이전됨 (import 위 참조)
