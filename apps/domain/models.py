@@ -221,6 +221,10 @@ class PlannerOutput(BaseModel):
     )
     exclude_orgs: list[str] = Field(default_factory=list)
     soft_preferences: list[str] = Field(default_factory=list)
+    task_terms: list[str] = Field(
+        default_factory=list,
+        description="Non-retrieval task or role terms extracted from the request. Retrieval does not consume these.",
+    )
     core_keywords: list[str] = Field(default_factory=list)
     branch_weights: dict[BranchName, float] = Field(default_factory=dict)
     branch_query_hints: dict[BranchName, str] = Field(

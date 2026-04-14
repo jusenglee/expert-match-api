@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from apps.core.feedback_store import FeedbackStore
 from apps.core.timer import Timer
 from apps.core.utils import merge_unique_strings as _merge_unique_strings
-from apps.domain.models import CandidateCard, PlannerOutput, RecommendationDecision
+from apps.domain.models import CandidateCard, ExpertPayload, PlannerOutput, RecommendationDecision
 from apps.recommendation.cards import CandidateCardBuilder
+from apps.recommendation.evidence import EvidenceResolver, PassThroughEvidenceResolver
 from apps.recommendation.judge import Judge
 from apps.recommendation.planner import Planner
 from apps.search.filters import QdrantFilterCompiler
@@ -37,6 +39,7 @@ class RecommendationService:
         judge: Judge,
         feedback_store: FeedbackStore,
         shortlist_limit: int,
+        evidence_resolver: EvidenceResolver | None = None,
         use_map_reduce_judging: bool = True,
         final_recommendation_max: int = 20,
         final_recommendation_min: int = 1,
@@ -46,6 +49,7 @@ class RecommendationService:
         self.filter_compiler = filter_compiler
         self.card_builder = card_builder
         self.judge = judge
+        self.evidence_resolver = evidence_resolver or PassThroughEvidenceResolver()
         self.feedback_store = feedback_store
         self.shortlist_limit = shortlist_limit
         self.use_map_reduce_judging = use_map_reduce_judging
@@ -104,6 +108,7 @@ class RecommendationService:
                 "query_filter": query_filter,
                 "retrieved_count": 0,
                 "candidates": [],
+                "payload_by_expert_id": {},
                 "query_payload": {
                     "skipped": True,
                     "reason": EMPTY_RETRIEVAL_KEYWORDS_REASON,
@@ -132,12 +137,16 @@ class RecommendationService:
         )
 
         cards = self.card_builder.build_small_cards(retrieval.hits, plan)
+        payload_by_expert_id: dict[str, ExpertPayload] = {}
+        for hit in retrieval.hits:
+            payload_by_expert_id.setdefault(hit.expert_id, hit.payload)
         return {
             "planner": plan,
             "planner_trace": planner_trace,
             "query_filter": query_filter,
             "retrieved_count": len(retrieval.hits),
             "candidates": cards,
+            "payload_by_expert_id": payload_by_expert_id,
             "query_payload": retrieval.query_payload,
             "branch_queries": retrieval.branch_queries,
             "retrieval_keywords": retrieval.retrieval_keywords,
@@ -172,6 +181,9 @@ class RecommendationService:
 
         plan: PlannerOutput = search_result["planner"]
         candidate_cards: list[CandidateCard] = search_result["candidates"]
+        payload_by_expert_id: dict[str, ExpertPayload] = (
+            search_result.get("payload_by_expert_id") or {}
+        )
         shortlist = self.card_builder.shortlist(candidate_cards, self.shortlist_limit)
 
         logger.info(
@@ -206,6 +218,7 @@ class RecommendationService:
                 not_selected_reasons=[NO_MATCHING_CANDIDATE_REASON],
                 planner_trace=search_result.get("planner_trace"),
                 judge_trace=None,
+                evidence_resolution_trace=[],
                 timers=search_result.get("timers"),
             )
 
@@ -217,11 +230,19 @@ class RecommendationService:
             )
 
         judge_trace = self._extract_component_trace(self.judge)
+        resolved_recommendations, evidence_resolution_trace = (
+            await self._resolve_recommendations(
+                query=query,
+                plan=plan,
+                recommendations=judge_output.recommended,
+                payload_by_expert_id=payload_by_expert_id,
+            )
+        )
         evidence_less_count = sum(
-            1 for item in judge_output.recommended if not item.evidence
+            1 for item in resolved_recommendations if not item.evidence
         )
         recommendations = [
-            item for item in judge_output.recommended if item.evidence
+            item for item in resolved_recommendations if item.evidence
         ]
 
         if len(recommendations) > self.final_recommendation_max:
@@ -279,8 +300,51 @@ class RecommendationService:
             not_selected_reasons=not_selected_reasons,
             planner_trace=search_result.get("planner_trace"),
             judge_trace=judge_trace,
+            evidence_resolution_trace=evidence_resolution_trace,
             timers=timers,
         )
+
+    async def _resolve_recommendations(
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        recommendations: list[RecommendationDecision],
+        payload_by_expert_id: dict[str, ExpertPayload],
+    ) -> tuple[list[RecommendationDecision], list[dict[str, Any]]]:
+        if not recommendations:
+            return [], []
+
+        resolution_results = await asyncio.gather(
+            *[
+                self.evidence_resolver.resolve(
+                    query=query,
+                    plan=plan,
+                    recommendation=recommendation,
+                    payload=payload_by_expert_id.get(recommendation.expert_id),
+                )
+                for recommendation in recommendations
+            ]
+        )
+
+        resolved_recommendations: list[RecommendationDecision] = []
+        evidence_resolution_trace: list[dict[str, Any]] = []
+        for recommendation, resolution in zip(recommendations, resolution_results):
+            resolved_recommendations.append(
+                recommendation.model_copy(update={"evidence": resolution.evidence})
+            )
+            evidence_resolution_trace.append(
+                {
+                    "expert_id": recommendation.expert_id,
+                    "resolver_mode": resolution.resolver_mode,
+                    "status": resolution.status,
+                    "alignment_passed": resolution.alignment_passed,
+                    "source_option_ids": resolution.source_option_ids,
+                    "evidence_titles": [item.title for item in resolution.evidence],
+                    "notes": resolution.notes,
+                }
+            )
+        return resolved_recommendations, evidence_resolution_trace
 
     def save_feedback(
         self,
@@ -328,6 +392,7 @@ class RecommendationService:
         not_selected_reasons: list[str],
         planner_trace: dict[str, Any] | None,
         judge_trace: dict[str, Any] | None,
+        evidence_resolution_trace: list[dict[str, Any]],
         timers: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
@@ -352,15 +417,25 @@ class RecommendationService:
                     (judge_trace or {}).get("final_reduce_gate_reason")
                 ),
                 "raw_query": raw_query,
+                "planner_raw_keywords": (
+                    (planner_trace or {}).get("planner_raw_keywords") or []
+                ),
+                "verifier_keywords": (
+                    (planner_trace or {}).get("verifier_keywords") or []
+                ),
                 "retrieval_keywords": retrieval_keywords,
                 "planner_retry_count": (
                     (planner_trace or {}).get("planner_retry_count", 0)
+                ),
+                "verifier_applied": (
+                    (planner_trace or {}).get("verifier_applied", False)
                 ),
                 "retrieval_skipped_reason": retrieval_skipped_reason,
                 "branch_queries": branch_queries,
                 "include_orgs": plan.include_orgs,
                 "exclude_orgs": plan.exclude_orgs,
                 "candidate_ids": [card.expert_id for card in candidate_cards],
+                "evidence_resolution_trace": evidence_resolution_trace,
                 "recommendation_evidence_summary": [
                     {
                         "expert_id": item.expert_id,

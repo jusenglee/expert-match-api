@@ -37,6 +37,10 @@ from apps.core.runtime_validation import (
     validate_runtime_settings,
 )
 from apps.recommendation.cards import CandidateCardBuilder
+from apps.recommendation.evidence import (
+    OpenAICompatEvidenceResolver,
+    PassThroughEvidenceResolver,
+)
 from apps.recommendation.judge import HeuristicJudge, OpenAICompatJudge
 from apps.recommendation.planner import HeuristicPlanner, OpenAICompatPlanner
 from apps.recommendation.service import RecommendationService
@@ -133,6 +137,11 @@ async def build_app_runtime(
         if settings.llm_backend == "heuristic"
         else OpenAICompatJudge(settings)
     )
+    evidence_resolver = (
+        PassThroughEvidenceResolver()
+        if settings.llm_backend == "heuristic"
+        else OpenAICompatEvidenceResolver(settings)
+    )
 
     feedback_store = FeedbackStore(settings.feedback_db_path, settings.feedback_table)
     feedback_store.initialize()
@@ -154,6 +163,7 @@ async def build_app_runtime(
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
         judge=judge,
+        evidence_resolver=evidence_resolver,
         feedback_store=feedback_store,
         shortlist_limit=settings.shortlist_limit,
         use_map_reduce_judging=settings.use_map_reduce_judging,
@@ -370,9 +380,18 @@ def create_app(
             "planner": result["planner"].model_dump(mode="json"),
             "planner_trace": result.get("planner_trace") or {},
             "raw_query": result.get("raw_query", normalized_query),
+            "planner_raw_keywords": (
+                (result.get("planner_trace") or {}).get("planner_raw_keywords") or []
+            ),
+            "verifier_keywords": (
+                (result.get("planner_trace") or {}).get("verifier_keywords") or []
+            ),
             "retrieval_keywords": result.get("retrieval_keywords") or [],
             "planner_retry_count": (
                 (result.get("planner_trace") or {}).get("planner_retry_count", 0)
+            ),
+            "verifier_applied": (
+                (result.get("planner_trace") or {}).get("verifier_applied", False)
             ),
             "retrieval_skipped_reason": result.get("retrieval_skipped_reason"),
             "branch_queries": result["branch_queries"],

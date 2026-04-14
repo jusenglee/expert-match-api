@@ -300,8 +300,9 @@ class OpenAICompatJudge:
             2. 엄격한 필터링: [후보 전문가 데이터]에 명시된 경력, 프로젝트, 연구 분야가 추출된 키워드와 직접적으로 연관된 전문가만 선별하세요. 
                관련성이 모호하거나 데이터에 없는 내용을 유추하여 추천해서는 절대 안 됩니다.
             3. 관련성 점수 부여 및 정렬 (Ranking): 선별된 전문가들이 사용자 질문과 얼마나 일치하는지 100점 만점 기준으로 점수를 계산하고, 높은 순으로 정렬하세요.
-            4. 증거 제시: 추천 이유(reasons)와 근거(evidence)는 반드시 제공된 데이터에 기반하여 구체적으로 작성하세요.
-
+            4. 증거 제시 - 1 : 추천 이유(reasons)와 근거(evidence)는 반드시 제공된 데이터에 기반하여 구체적으로 작성하세요.
+            5. 증거 제시 - 2 : 추천 이유(reasons)와 근거(evidence)는 반드시 사용자의 질문 (User Query) 과 연관이 있어야합니다.
+            
             # Constraints
             - 출력은 반드시 유효한 단일 JSON 객체여야 합니다.
             - `expert_id`는 숏리스트 입력에서 정확히 복사하십시오.
@@ -360,14 +361,20 @@ class OpenAICompatJudge:
     @staticmethod
     def _build_map_system_prompt() -> str:
         return (
-            "You are a shortlist reducer.\n"
-            "Return exactly one JSON object and nothing else.\n"
-            'Schema: {"survivors":[{"expert_id":"...","rank":1}]}\n'
-            "Rules:\n"
-            "- Only return shortlist expert_ids.\n"
-            "- Keep only the most relevant survivors.\n"
-            "- Respect selection_limit when it is provided.\n"
-            "- Prefer higher rank_score when multiple candidates are similarly relevant.\n"
+            "당신은 한국 R&D 평가위원 추천 시스템의 고속 선별 필터(fast screening filter)입니다.\n"
+            "당신의 역할: 주어진 숏리스트(shortlist)에서 쿼리와 가장 관련성이 높은 후보자를 선택하는 것입니다.\n"
+            "오직 JSON 객체만 반환하십시오. 마크다운이나 설명은 포함하지 마십시오.\n"
+            "첫 번째 문자는 '{'이어야 하고, 마지막 문자는 '}'이어야 합니다.\n\n"
+            "출력 스키마:\n"
+            '{"survivors":[{"expert_id":"...","rank":1},{"expert_id":"...","rank":2}]}\n\n'
+            "규칙:\n"
+            "- plan.top_k에 지정된 수만큼 선택하십시오 (단, 강력한 후보가 많을 경우 더 선택할 수 있습니다).\n"
+            "- expert_id는 숏리스트 입력에서 정확히 복사하십시오.\n"
+            "- 중요: 입력에 제공된 rank_score는 고도로 최적화된 검색 엔진의 순위를 반영하므로 이를 전적으로 신뢰해야 합니다.\n"
+            "- 쿼리와의 관련성을 검증하되, 생존자(survivors)의 순위는 주로 rank_score를 기반으로 할당하십시오 (높은 점수 = 순위 1 등).\n"
+            "- 보수적으로 평가하십시오. 숏리스트의 증거가 쿼리를 명확하게 뒷받침하는 경우에만 후보자를 유지하십시오.\n"
+            "- 부분적이거나 관련 없는 제목에서 명시되지 않은 전문성을 임의로 추론하지 마십시오.\n"
+            "- 오직 JSON 객체만 출력하십시오. 이유, 증거, 설명은 절대 포함하지 마십시오.\n"
         )
 
     @staticmethod
