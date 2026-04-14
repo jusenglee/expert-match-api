@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -50,6 +49,10 @@ from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_query_text(query: str) -> str:
+    return " ".join(query.split())
 
 
 def build_dense_encoder(settings: Settings):
@@ -317,7 +320,7 @@ def create_app(
     @app.post("/recommend", response_model=RecommendationResponse)
     async def recommend(request: RecommendationRequest) -> RecommendationResponse:
         service = get_service()
-        normalized_query = re.sub(r'\s+', ' ', request.query).strip()
+        normalized_query = _normalize_query_text(request.query)
         result = await service.recommend(
             query=normalized_query,
             filters_override=request.filters_override,
@@ -337,7 +340,7 @@ def create_app(
         request: SearchCandidatesRequest,
     ) -> SearchCandidatesResponse:
         service = get_service()
-        normalized_query = re.sub(r'\s+', ' ', request.query).strip()
+        normalized_query = _normalize_query_text(request.query)
         result = await service.search_candidates(
             query=normalized_query,
             filters_override=request.filters_override,
@@ -365,10 +368,19 @@ def create_app(
 
         trace = {
             "planner": result["planner"].model_dump(mode="json"),
+            "planner_trace": result.get("planner_trace") or {},
+            "raw_query": result.get("raw_query", normalized_query),
+            "retrieval_keywords": result.get("retrieval_keywords") or [],
+            "planner_retry_count": (
+                (result.get("planner_trace") or {}).get("planner_retry_count", 0)
+            ),
+            "retrieval_skipped_reason": result.get("retrieval_skipped_reason"),
             "branch_queries": result["branch_queries"],
+            "include_orgs": result["planner"].include_orgs,
             "exclude_orgs": result["planner"].exclude_orgs,
             "candidate_ids": [card.expert_id for card in result["candidates"]],
             "query_payload": service._serialize_query_payload(result["query_payload"]),
+            "timers": result.get("timers") or {},
         }
         if logs is not None:
             trace["server_logs"] = logs

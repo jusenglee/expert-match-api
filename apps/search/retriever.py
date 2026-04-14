@@ -1,7 +1,5 @@
 """
-Qdrant를 사용하여 하이브리드 검색을 수행하는 리트리버 모델입니다.
-Dense(의미론적) 검색과 Sparse(키워드) 검색을 결합하고,
-여러 데이터 브랜치(Basic, Art, Pat, Pjt)의 결과를 RRF(Reciprocal Rank Fusion)로 통합합니다.
+Hybrid Qdrant retriever for NTIS expert search.
 """
 
 from __future__ import annotations
@@ -28,18 +26,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class RetrievalResult:
-    """검색 결과를 담는 데이터 클래스입니다."""
-
-    hits: list[SearchHit]  # 검색된 전문가 히트 리스트
-    query_payload: dict[str, Any]  # Qdrant에 전달된 최종 쿼리 페이로드 (디버깅용)
-    branch_queries: dict[str, str]  # 브랜치별로 최적화된 질의문 (디버깅용)
+    hits: list[SearchHit]
+    query_payload: dict[str, Any]
+    branch_queries: dict[str, str]
+    retrieval_keywords: list[str]
 
 
 class QdrantHybridRetriever:
-    """
-    Qdrant의 다중 벡터 지원 기능을 활용하여 복합적인 전문가 검색을 수행합니다.
-    """
-
     def __init__(
         self,
         *,
@@ -49,9 +42,6 @@ class QdrantHybridRetriever:
         dense_encoder: DenseEncoder,
         query_builder: QueryTextBuilder,
     ) -> None:
-        """
-        리트리버 초기화 및 필요한 의존성 주입.
-        """
         self.client = client
         self.settings = settings
         self.registry = registry
@@ -65,46 +55,30 @@ class QdrantHybridRetriever:
         plan: PlannerOutput,
         query_filter: models.Filter | None,
     ) -> RetrievalResult:
-        """
-        하이브리드 RRF 검색을 실행합니다.
-
-        파이프라인:
-        1. 브랜치별(논문/특허/과제/기본) 질의문 생성
-        2. 각 브랜치 내부에서 Dense + Sparse 하이브리드 검색용 Prefetch 조립
-        3. 모든 브랜치 결과를 최상위에서 RRF로 다시 결합하여 최종 순위 산정
-        """
-        # 1. 브랜치별 최적화된 질의 텍스트 구성
+        _ = query
+        retrieval_keywords = self.query_builder.normalize_keywords(plan.core_keywords)
         branch_queries = self.query_builder.build_branch_queries(query, plan)
         logger.debug(
-            "브랜치별 생성 쿼리:\n%s",
+            "Generated branch queries:\n%s",
             pprint.pformat(branch_queries, indent=2, width=100),
         )
         prefetches: list[models.Prefetch] = []
 
-        # 2. 각 데이터 브랜치별로 Prefetch 쿼리 조립
         for branch in BRANCHES:
-            # 브랜치 가중치가 0이면 아예 검색에서 제외 (데이터 노이즈 제거)
-            weight = plan.branch_weights.get(branch, 1.0)
-            if weight <= 0.0:
-                logger.info("브랜치 검색 스킵 (가중치 0): %s", branch)
-                continue
-
-            # 의미론적 검색을 위한 Dense 임베딩 생성 (e5-instruct 등 instruct 모델 최적화)
             dense_query_text = branch_queries[branch]
             if "instruct" in getattr(self.dense_encoder, "model_name", "").lower():
-                instruct_prefix = "Instruct: 주어진 질의에 가장 적합한 연구자 프로필이나 논문/특허/과제 실적을 찾으세요.\nQuery: "
+                instruct_prefix = (
+                    "Instruct: Find experts whose profile, papers, patents, or projects "
+                    "match the given query.\nQuery: "
+                )
                 dense_query_text = f"{instruct_prefix}{dense_query_text}"
             dense_query = self.dense_encoder.embed(dense_query_text)
-            
-            # 키워드 검색을 위한 Sparse 쿼리 구성 (BM25 로컬 인코딩 - Prefix 절대 넣지 않음)
+
             sparse_query = models.Document(
-                text=branch_queries[branch], model=self.settings.bm25_model_name
+                text=branch_queries[branch],
+                model=self.settings.bm25_model_name,
             )
 
-            # 가중치에 따라 브랜치별 노출 제한 조정 (RRF 특성상 가중치 부여가 어려우므로 limit으로 조절)
-            branch_limit = max(1, int(self.settings.branch_output_limit * weight))
-
-            # 브랜치 레벨 RRF: Dense와 Sparse 결과를 합침
             prefetches.append(
                 models.Prefetch(
                     prefetch=[
@@ -122,12 +96,11 @@ class QdrantHybridRetriever:
                         ),
                     ],
                     query=models.FusionQuery(fusion=models.Fusion.RRF),
-                    limit=branch_limit,
+                    limit=self.settings.branch_output_limit,
                     filter=query_filter,
                 )
             )
 
-        # 3. 최종 통합 쿼리 구성 (모든 브랜치 통합 RRF)
         query_payload = {
             "collection_name": self.settings.qdrant_collection_name,
             "prefetch": prefetches,
@@ -151,35 +124,30 @@ class QdrantHybridRetriever:
                     pass
 
             if isinstance(data, dict):
-                return {k: _sanitize_payload_for_log(v) for k, v in data.items()}
-            elif isinstance(data, list):
+                return {key: _sanitize_payload_for_log(value) for key, value in data.items()}
+            if isinstance(data, list):
                 if len(data) > 100 and all(
-                    isinstance(x, (float, int)) for x in data[:10]
+                    isinstance(value, (float, int)) for value in data[:10]
                 ):
                     return f"<Dense Vector: {len(data)} dimensions>"
-                return [_sanitize_payload_for_log(x) for x in data]
+                return [_sanitize_payload_for_log(value) for value in data]
             return data
 
-        # Qdrant 호출 (동기 서버 메서드를 비동기 스레드에서 실행)
         logger.info(
-            "Qdrant 하이브리드 검색 실행: 컬렉션=%s 필터 적용 여부=%s",
+            "Qdrant hybrid search: collection=%s filter_applied=%s",
             self.settings.qdrant_collection_name,
-            "예" if query_filter else "아니오",
+            query_filter is not None,
         )
         logger.info(
-            "Qdrant 전달 플랜(Query Payload):\n%s",
-            pprint.pformat(
-                _sanitize_payload_for_log(query_payload), indent=2, width=120
-            ),
+            "Qdrant query payload:\n%s",
+            pprint.pformat(_sanitize_payload_for_log(query_payload), indent=2, width=120),
         )
-        with Timer() as t:
+        with Timer() as timer:
             points = await asyncio.to_thread(self.client.query_points, **query_payload)
-        logger.info("Qdrant 검색 완료: 소요시간=%.2fms", t.elapsed_ms)
+        logger.info("Qdrant search finished: elapsed_ms=%.2f", timer.elapsed_ms)
 
         hits: list[SearchHit] = []
         skipped_invalid_payloads = 0
-
-        # 4. 검색 결과 파싱 및 도메인 모델 변환
         point_list = getattr(points, "points", points)
         for point in point_list:
             point_id = getattr(point, "id", None)
@@ -191,18 +159,16 @@ class QdrantHybridRetriever:
             )
 
             try:
-                # Pydantic 모델을 사용한 데이터 무결성 검증
                 payload = ExpertPayload.model_validate(payload_data)
             except ValidationError as exc:
                 skipped_invalid_payloads += 1
                 logger.warning(
-                    "유효하지 않은 Qdrant 페이로드 스킵: point_id=%s 오류=%s",
+                    "Skipping invalid payload: point_id=%s errors=%s",
                     point_id,
                     exc.errors(include_url=False),
                 )
                 continue
 
-            # 브랜치별 데이터 존재 여부 확인 (실제 검색 기여도와는 다를 수 있음에 유의)
             data_presence_flags = {
                 "basic": True,
                 "art": bool(payload.publications),
@@ -210,17 +176,17 @@ class QdrantHybridRetriever:
                 "pjt": bool(payload.research_projects),
             }
 
-            # Qdrant의 exact match 필터에서 누락될 수 있는 부분(띄어쓰기, KISTI 등 영문 병기)을
-            # 보완하기 위한 Python 레벨의 강력한 Post-Filtering
             if plan.exclude_orgs:
-                org = payload.basic_info.affiliated_organization or ""
-                org_norm = normalize_org_name(org) or ""
+                organization = payload.basic_info.affiliated_organization or ""
+                normalized_org = normalize_org_name(organization) or ""
                 should_exclude = False
-                for ex_org in plan.exclude_orgs:
-                    ex_org_norm = normalize_org_name(ex_org) or ""
-                    if ex_org_norm and org_norm:
-                        # 한쪽이 다른 한쪽을 완전히 포함하면 제외 (부분 일치 방어)
-                        if (ex_org_norm in org_norm) or (org_norm in ex_org_norm):
+                for excluded_org in plan.exclude_orgs:
+                    normalized_excluded_org = normalize_org_name(excluded_org) or ""
+                    if normalized_excluded_org and normalized_org:
+                        if (
+                            normalized_excluded_org in normalized_org
+                            or normalized_org in normalized_excluded_org
+                        ):
                             should_exclude = True
                             break
                 if should_exclude:
@@ -237,13 +203,16 @@ class QdrantHybridRetriever:
 
         if skipped_invalid_payloads:
             logger.info(
-                "검색 완료: 총 %d명의 히트 중 %d명의 데이터가 유효하지 않아 스킵되었습니다.",
+                "Search completed with payload skips: total=%d skipped=%d",
                 len(point_list),
                 skipped_invalid_payloads,
             )
         else:
-            logger.info("검색 완료: 총 %d명의 전문가 히트 반환", len(hits))
+            logger.info("Search completed: hits=%d", len(hits))
 
         return RetrievalResult(
-            hits=hits, query_payload=query_payload, branch_queries=branch_queries
+            hits=hits,
+            query_payload=query_payload,
+            branch_queries=branch_queries,
+            retrieval_keywords=retrieval_keywords,
         )

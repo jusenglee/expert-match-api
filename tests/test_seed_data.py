@@ -9,4 +9,4 @@ def test_canonical_payload_fixture_maps_project_dates_correctly():
     assert payload.research_projects[0].project_start_date == "2019-10-07"
     assert payload.research_projects[0].project_end_date == "2020-04-06"
     assert payload.research_projects[0].reference_year == 2019
-    assert payload.basic_info.affiliated_organization_exact == "주식회사미소테크".upper()
+    assert payload.basic_info.affiliated_organization_exact == "미소테크".upper()

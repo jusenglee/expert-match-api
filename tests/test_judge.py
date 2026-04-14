@@ -62,7 +62,12 @@ def _full_card() -> CandidateCard:
     )
 
 
-def _simple_card(expert_id: str, *, organization: str = "Test Lab") -> CandidateCard:
+def _simple_card(
+    expert_id: str,
+    *,
+    organization: str = "Test Lab",
+    paper_title: str | None = None,
+) -> CandidateCard:
     return CandidateCard(
         expert_id=expert_id,
         name=f"Researcher {expert_id}",
@@ -73,7 +78,7 @@ def _simple_card(expert_id: str, *, organization: str = "Test Lab") -> Candidate
         counts={"article_cnt": 1, "scie_cnt": 1, "patent_cnt": 0, "project_cnt": 0},
         top_papers=[
             PublicationEvidence(
-                publication_title=f"Paper {expert_id}",
+                publication_title=paper_title or f"Paper {expert_id}",
                 publication_year_month="2024-09-01",
                 journal_name="IEEE Access",
             )
@@ -85,6 +90,14 @@ def _simple_card(expert_id: str, *, organization: str = "Test Lab") -> Candidate
 
 def _build_shortlist(count: int, *, prefix: str = "expert") -> list[CandidateCard]:
     return [_simple_card(f"{prefix}-{index:02d}") for index in range(count)]
+
+
+def _build_large_title_shortlist(count: int, title_size: int) -> list[CandidateCard]:
+    long_title = "X" * title_size
+    return [
+        _simple_card(f"large-{index:02d}", paper_title=f"{long_title}-{index}")
+        for index in range(count)
+    ]
 
 
 class RecordingBatchModel:
@@ -107,8 +120,9 @@ class RecordingBatchModel:
 
     async def ainvoke_non_stream(self, messages, **kwargs):
         payload = json.loads(messages[1].content)
-        shortlist = payload["shortlist"]
+        shortlist = payload.get("shortlist", [])
         expert_ids = [card["expert_id"] for card in shortlist]
+
         self.calls.append(expert_ids)
         self.call_kwargs.append(dict(kwargs))
         self.in_flight += 1
@@ -121,42 +135,60 @@ class RecordingBatchModel:
             ):
                 raise RuntimeError("synthetic batch failure")
 
-            top_k = int(payload["plan"].get("top_k", 5))
-            recommended = []
-            for rank, card in enumerate(shortlist[: min(top_k, len(shortlist))], start=1):
-                top_papers = card.get("top_papers") or [{}]
-                first_paper = top_papers[0] if top_papers else {}
-                recommended.append(
-                    {
-                        "rank": rank,
-                        "expert_id": card["expert_id"],
-                        "name": card["name"],
-                        "organization": card.get("organization"),
-                        "fit": "높음",
-                        "reasons": ["Strong evidence"],
-                        "evidence": [
-                            {
-                                "type": "paper",
-                                "title": first_paper.get(
-                                    "publication_title",
-                                    f"Paper {card['expert_id']}",
-                                ),
-                            }
-                        ],
-                        "risks": [],
-                        "rank_score": card.get("rank_score", 0.0),
-                    }
-                )
+            plan_payload = payload.get("plan", {})
+            selection_limit = payload.get("selection_limit")
+            if selection_limit is None:
+                selection_limit = int(plan_payload.get("top_k", 5))
+            selection_limit = int(selection_limit)
 
-            response = {
-                "recommended": recommended,
-                "not_selected_reasons": (
-                    [self.shared_not_selected_reason]
-                    if self.shared_not_selected_reason
-                    else []
-                ),
-                "data_gaps": [self.shared_data_gap] if self.shared_data_gap else [],
-            }
+            if "selection_limit" in payload:
+                survivors = [
+                    {"expert_id": card["expert_id"], "rank": rank}
+                    for rank, card in enumerate(
+                        shortlist[: min(selection_limit, len(shortlist))], start=1
+                    )
+                ]
+                response = {"survivors": survivors}
+            else:
+                recommended = []
+                for rank, card in enumerate(
+                    shortlist[: min(selection_limit, len(shortlist))], start=1
+                ):
+                    top_papers = card.get("top_papers") or []
+                    first_paper = top_papers[0] if top_papers else {}
+                    recommended.append(
+                        {
+                            "rank": rank,
+                            "expert_id": card["expert_id"],
+                            "name": card["name"],
+                            "organization": card.get("organization"),
+                            "fit": "높음",
+                            "reasons": ["Strong evidence"],
+                            "evidence": [
+                                {
+                                    "type": "paper",
+                                    "title": first_paper.get(
+                                        "publication_title",
+                                        f"Paper {card['expert_id']}",
+                                    ),
+                                }
+                            ],
+                            "risks": [],
+                            "rank_score": card.get("rank_score", 0.0),
+                        }
+                    )
+                response = {
+                    "recommended": recommended,
+                    "not_selected_reasons": (
+                        [self.shared_not_selected_reason]
+                        if self.shared_not_selected_reason
+                        else []
+                    ),
+                    "data_gaps": (
+                        [self.shared_data_gap] if self.shared_data_gap else []
+                    ),
+                }
+
             return SimpleNamespace(content=json.dumps(response, ensure_ascii=False))
         finally:
             self.in_flight -= 1
@@ -218,7 +250,9 @@ def test_openai_compat_judge_normalizes_recoverable_output_before_validation():
     assert recommendation.fit == "높음"
     assert recommendation.reasons == ["Publication evidence is strong."]
     assert recommendation.risks == ["Patent evidence is thinner."]
-    assert result.not_selected_reasons == ["Other shortlisted candidates had weaker alignment."]
+    assert result.not_selected_reasons == [
+        "Other shortlisted candidates had weaker alignment."
+    ]
     assert result.data_gaps == ["Patent coverage is limited."]
 
 
@@ -290,7 +324,7 @@ def test_openai_compat_judge_disables_batching_when_flag_is_false():
     assert len(result.recommended) == 5
 
 
-def test_openai_compat_judge_batches_large_shortlist_into_tournament_rounds():
+def test_openai_compat_judge_batches_large_shortlist_with_forced_contraction():
     settings = Settings(
         app_env="test",
         strict_runtime_validation=False,
@@ -312,8 +346,7 @@ def test_openai_compat_judge_batches_large_shortlist_into_tournament_rounds():
         )
     )
 
-    assert len(model.calls) == 7
-    assert all(len(call) == 10 for call in model.calls)
+    assert len(model.calls) == 8
     assert all(kwargs["temperature"] == 0.0 for kwargs in model.call_kwargs)
     assert all(kwargs["top_p"] == 0.2 for kwargs in model.call_kwargs)
     assert all(kwargs["reasoning_effort"] == "low" for kwargs in model.call_kwargs)
@@ -326,6 +359,14 @@ def test_openai_compat_judge_batches_large_shortlist_into_tournament_rounds():
     assert len(result.recommended) == 5
     assert result.not_selected_reasons == ["shared-reason"]
     assert result.data_gaps == ["shared-gap"]
+    assert judge.last_trace["final_reduce_candidate_count"] == 6
+    assert judge.last_trace["final_reduce_gate_reason"] == "ready"
+    summary_rounds = [
+        entry
+        for entry in judge.last_trace["rounds"]
+        if entry["context"] == "map_round_summary"
+    ]
+    assert [entry["post_compression_count"] for entry in summary_rounds] == [20, 10, 6]
 
 
 def test_openai_compat_judge_respects_semaphore_limit_during_batched_calls():
@@ -371,16 +412,59 @@ def test_openai_compat_judge_falls_back_per_batch_without_failing_entire_round()
         )
     )
 
-    assert len(model.calls) == 3
+    assert len(model.calls) == 4
     assert len(result.recommended) == 5
-    assert any(item.expert_id.startswith("fail") for item in result.recommended)
+    assert all(item.expert_id.startswith("fail") for item in result.recommended)
+
+
+def test_openai_compat_judge_normalizes_pjt_type_in_evidence():
+    judge = OpenAICompatJudge(Settings(app_env="test", strict_runtime_validation=False))
+    judge.model = SimpleNamespace(ainvoke_non_stream=_fake_judge_with_pjt_type)
+
+    result = asyncio.run(
+        judge.judge(query="AI semiconductor", plan=_plan(), shortlist=[_full_card()])
+    )
+
+    assert len(result.recommended) == 1
+    evidence = result.recommended[0].evidence
+    assert len(evidence) == 1
+    assert evidence[0].type == "project"
+    assert evidence[0].title == "AI Semiconductor Program"
+
+
+def test_openai_compat_judge_forces_extra_map_round_when_reduce_token_gate_blocks():
+    settings = Settings(
+        app_env="test",
+        strict_runtime_validation=False,
+        llm_judge_batch_size=10,
+        llm_judge_max_concurrency=10,
+    )
+    judge = OpenAICompatJudge(settings)
+    model = RecordingBatchModel()
+    judge.model = model
+
+    result = asyncio.run(
+        judge.judge(
+            query="AI semiconductor",
+            plan=_plan(top_k=5),
+            shortlist=_build_large_title_shortlist(6, 4000),
+        )
+    )
+
+    assert len(model.calls) == 4
+    assert [len(call) for call in model.calls] == [6, 5, 4, 3]
+    assert len(result.recommended) == 3
+    summary_rounds = [
+        entry
+        for entry in judge.last_trace["rounds"]
+        if entry["context"] == "map_round_summary"
+    ]
+    assert summary_rounds[0]["reduce_gate_reason"] == "token_limit"
+    assert summary_rounds[0]["post_compression_count"] == 5
+    assert judge.last_trace["final_reduce_candidate_count"] == 3
 
 
 async def _fake_judge_with_pjt_type(messages, **kwargs):
-    """LLM이 evidence.type에 'pjt' 축약어를 반환하는 경우를 재현합니다.
-    Pydantic validator가 자동 정규화(pjt → project)하므로 ValidationError 없이
-    통과되어야 합니다 (postmortem-judge-errors 회귀 방지 케이스).
-    """
     return SimpleNamespace(
         content="""{
   "recommended": [
@@ -390,7 +474,7 @@ async def _fake_judge_with_pjt_type(messages, **kwargs):
       "name": "Alice Kim",
       "organization": "Test Lab",
       "fit": "높음",
-      "reasons": ["연구과제 실적 우수"],
+      "reasons": ["Project evidence is strong."],
       "evidence": [
         {
           "type": "pjt",
@@ -407,29 +491,6 @@ async def _fake_judge_with_pjt_type(messages, **kwargs):
   "data_gaps": []
 }"""
     )
-
-
-def test_openai_compat_judge_normalizes_pjt_type_in_evidence():
-    """
-    회귀 방지: LLM이 evidence.type에 브랜치 축약어 'pjt'를 반환해도
-    Pydantic validator가 'project'로 자동 정규화하여 ValidationError 없이 통과해야 한다.
-    이전에는 이 오류로 Reduce 라운드 전체가 Fallback으로 강등되었음.
-    """
-    judge = OpenAICompatJudge(Settings(app_env="test", strict_runtime_validation=False))
-    judge.model = SimpleNamespace(ainvoke_non_stream=_fake_judge_with_pjt_type)
-
-    result = asyncio.run(
-        judge.judge(query="AI 반도체 전문가", plan=_plan(), shortlist=[_full_card()])
-    )
-
-    assert len(result.recommended) == 1
-    evidence = result.recommended[0].evidence
-    assert len(evidence) == 1
-    assert evidence[0].type == "project", (
-        "'pjt' 타입이 'project'로 정규화되지 않았습니다. "
-        "EvidenceItem._normalize_evidence_type validator를 확인하세요."
-    )
-    assert evidence[0].title == "AI Semiconductor Program"
 
 
 async def _fake_recoverable_judge_response(messages, **kwargs):

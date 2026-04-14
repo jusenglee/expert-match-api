@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # Qdrant 벡터 데이터베이스 설정
     qdrant_url: str = "http://203.250.234.159:8005"
     qdrant_api_key: str | None = None
-    qdrant_collection_name: str = "researcher_recommend_proto"
+    qdrant_collection_name: str = "researcher_recommend_proto1"
     qdrant_cloud_inference: bool = False
 
     # LLM (의도의 분석 및 심사) 백엔드 설정

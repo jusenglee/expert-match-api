@@ -200,6 +200,9 @@ class OpenAICompatChatModel(BaseChatModel):
             "temperature": kwargs.get("temperature", self.default_temperature),
             "top_p": kwargs.get("top_p", self.default_top_p),
         }
+        seed = kwargs.get("seed")
+        if seed is not None:
+            request_kwargs["seed"] = int(seed)
         if max_tokens_hint is not None:
             request_kwargs["max_tokens"] = max_tokens_hint
             request_kwargs["max_completion_tokens"] = max_tokens_hint

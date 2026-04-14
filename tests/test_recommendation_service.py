@@ -8,7 +8,12 @@ from apps.domain.models import (
     PlannerOutput,
     RecommendationDecision,
 )
-from apps.recommendation.service import RecommendationService
+from apps.recommendation.service import (
+    EMPTY_RETRIEVAL_KEYWORDS_REASON,
+    INSUFFICIENT_EVIDENCE_REASON,
+    NO_MATCHING_CANDIDATE_REASON,
+    RecommendationService,
+)
 
 
 class DummyPlanner:
@@ -63,12 +68,7 @@ def _candidate_card(expert_id: str = "1") -> CandidateCard:
 def _plan() -> PlannerOutput:
     return PlannerOutput(
         intent_summary="Recommend semiconductor reviewers",
-        branch_query_hints={
-            "basic": "basic",
-            "art": "papers",
-            "pat": "patents",
-            "pjt": "projects",
-        },
+        core_keywords=["semiconductor", "review"],
     )
 
 
@@ -96,19 +96,37 @@ def _bind_search_result(
     retrieved_count: int = 0,
 ) -> None:
     async def fake_search_candidates(
-        self, *, query, filters_override=None, exclude_orgs=None, top_k=None
+        self,
+        *,
+        query,
+        filters_override=None,
+        include_orgs=None,
+        exclude_orgs=None,
+        top_k=None,
     ):
         return {
             "planner": _plan(),
+            "planner_trace": {
+                "mode": "test",
+                "planner_retry_count": 0,
+                "retrieval_keywords": ["semiconductor", "review"],
+            },
             "query_filter": None,
             "retrieved_count": retrieved_count,
             "candidates": cards,
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
             "branch_queries": {
-                "basic": "basic",
-                "art": "papers",
-                "pat": "patents",
-                "pjt": "projects",
+                "basic": "semiconductor\nreview",
+                "art": "semiconductor\nreview",
+                "pat": "semiconductor\nreview",
+                "pjt": "semiconductor\nreview",
+            },
+            "retrieval_keywords": ["semiconductor", "review"],
+            "raw_query": query,
+            "retrieval_skipped_reason": None,
+            "timers": {
+                "plan_ms": 1.0,
+                "search_ms": 2.0,
             },
         }
 
@@ -124,8 +142,11 @@ def test_recommend_skips_judge_when_no_candidates_are_retrieved():
     assert judge.called is False
     assert result["recommendations"] == []
     assert result["data_gaps"] == []
-    assert result["not_selected_reasons"] == ["조건을 만족하는 추천 후보를 찾지 못했습니다."]
+    assert result["not_selected_reasons"] == [NO_MATCHING_CANDIDATE_REASON]
+    assert result["trace"]["planner_trace"]["mode"] == "test"
+    assert result["trace"]["judge_trace"] == {}
     assert result["trace"]["recommendation_evidence_summary"] == []
+    assert result["trace"]["retrieval_keywords"] == ["semiconductor", "review"]
 
 
 def test_recommend_skips_judge_when_shortlist_is_empty():
@@ -136,7 +157,55 @@ def test_recommend_skips_judge_when_shortlist_is_empty():
 
     assert judge.called is False
     assert result["recommendations"] == []
-    assert result["not_selected_reasons"] == ["조건을 만족하는 추천 후보를 찾지 못했습니다."]
+    assert result["not_selected_reasons"] == [NO_MATCHING_CANDIDATE_REASON]
+
+
+def test_recommend_returns_data_gap_when_retrieval_is_skipped():
+    service, judge = _build_service(JudgeOutput(recommended=[]))
+    _bind_search_result(service, cards=[], retrieved_count=0)
+
+    async def fake_search_candidates(
+        self,
+        *,
+        query,
+        filters_override=None,
+        include_orgs=None,
+        exclude_orgs=None,
+        top_k=None,
+    ):
+        return {
+            "planner": _plan(),
+            "planner_trace": {
+                "mode": "deterministic_fallback",
+                "planner_retry_count": 1,
+                "retrieval_keywords": [],
+            },
+            "query_filter": None,
+            "retrieved_count": 0,
+            "candidates": [],
+            "query_payload": {
+                "skipped": True,
+                "reason": EMPTY_RETRIEVAL_KEYWORDS_REASON,
+            },
+            "branch_queries": {},
+            "retrieval_keywords": [],
+            "raw_query": query,
+            "retrieval_skipped_reason": EMPTY_RETRIEVAL_KEYWORDS_REASON,
+            "timers": {
+                "plan_ms": 1.0,
+                "search_ms": 0.0,
+            },
+        }
+
+    service.search_candidates = MethodType(fake_search_candidates, service)
+
+    result = asyncio.run(service.recommend(query="Recommend reviewers"))
+
+    assert judge.called is False
+    assert result["recommendations"] == []
+    assert result["data_gaps"] == [EMPTY_RETRIEVAL_KEYWORDS_REASON]
+    assert result["trace"]["planner_retry_count"] == 1
+    assert result["trace"]["retrieval_skipped_reason"] == EMPTY_RETRIEVAL_KEYWORDS_REASON
 
 
 def test_recommend_returns_empty_success_when_judge_returns_no_recommendations():
@@ -154,7 +223,7 @@ def test_recommend_returns_empty_success_when_judge_returns_no_recommendations()
     assert judge.called is True
     assert result["recommendations"] == []
     assert result["data_gaps"] == ["paper evidence missing"]
-    assert result["not_selected_reasons"] == ["조건을 만족하는 추천 후보를 찾지 못했습니다."]
+    assert result["not_selected_reasons"] == [NO_MATCHING_CANDIDATE_REASON]
     assert result["trace"]["recommendation_evidence_summary"] == []
 
 
@@ -182,7 +251,7 @@ def test_recommend_returns_empty_success_when_all_judge_recommendations_lack_evi
 
     assert judge.called is True
     assert result["recommendations"] == []
-    assert result["not_selected_reasons"] == ["근거가 충분한 추천 결과를 생성하지 못했습니다."]
+    assert result["not_selected_reasons"] == [INSUFFICIENT_EVIDENCE_REASON]
     assert result["trace"]["recommendation_evidence_summary"] == []
 
 
@@ -222,7 +291,7 @@ def test_recommend_filters_evidence_less_items_but_keeps_valid_recommendations()
     assert result["recommendations"][0].expert_id == "2"
     assert result["not_selected_reasons"] == [
         "Existing judge reason",
-        "근거가 충분한 추천 결과를 생성하지 못했습니다.",
+        INSUFFICIENT_EVIDENCE_REASON,
     ]
     assert result["trace"]["recommendation_evidence_summary"] == [
         {"expert_id": "2", "evidence_titles": ["Semiconductor Paper"]}

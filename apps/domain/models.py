@@ -223,7 +223,10 @@ class PlannerOutput(BaseModel):
     soft_preferences: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
     branch_weights: dict[BranchName, float] = Field(default_factory=dict)
-    branch_query_hints: dict[BranchName, str] = Field(default_factory=dict)
+    branch_query_hints: dict[BranchName, str] = Field(
+        default_factory=dict,
+        description="Deprecated. Kept for backward compatibility and not used by retrieval.",
+    )
     top_k: int = 15
 
 

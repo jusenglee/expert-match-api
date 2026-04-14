@@ -10,7 +10,7 @@ from apps.domain.models import RecommendationDecision
 
 
 class FakeRecommendationService:
-    async def recommend(self, *, query, filters_override, exclude_orgs, top_k):
+    async def recommend(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
         return {
             "intent_summary": query,
             "applied_filters": filters_override,
@@ -39,7 +39,7 @@ class FakeRecommendationService:
             },
         }
 
-    async def search_candidates(self, *, query, filters_override, exclude_orgs, top_k):
+    async def search_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
         class Planner:
             intent_summary = query
             hard_filters = filters_override
@@ -48,6 +48,7 @@ class FakeRecommendationService:
                 return {"intent_summary": self.intent_summary, "hard_filters": self.hard_filters}
 
         Planner.exclude_orgs = exclude_orgs
+        Planner.include_orgs = include_orgs
 
         class Card:
             expert_id = "1"
