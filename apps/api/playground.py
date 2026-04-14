@@ -455,7 +455,7 @@ PLAYGROUND_HTML = dedent(
 
               <div class="input-group">
                 <label for="topKInput">추천 인원 수 (top_k)</label>
-                <input id="topKInput" type="number" min="1" max="5" placeholder="기본값 사용">
+                <input id="topKInput" type="number" min="1" max="15" placeholder="기본값 사용">
               </div>
 
               <details>
@@ -464,6 +464,10 @@ PLAYGROUND_HTML = dedent(
                   <div class="input-group">
                     <label for="filtersInput">필터 재정의 (JSON 형식)</label>
                     <textarea id="filtersInput" placeholder='{&#10;  "degree_slct_nm": "박사",&#10;  "art_sci_slct_nm": "SCIE"&#10;}'></textarea>
+                  </div>
+                  <div class="input-group">
+                    <label for="includeInput">검색 대상 기관 (소속 제한)</label>
+                    <textarea id="includeInput" placeholder="줄바꿈 또는 쉼표로 구분하여 입력&#10;예: 한국과학기술정보연구원"></textarea>
                   </div>
                   <div class="input-group">
                     <label for="excludeInput">제외할 기관</label>
@@ -570,6 +574,7 @@ PLAYGROUND_HTML = dedent(
             query,
             top_k: parseInt($('topKInput').value) || undefined,
             filters_override: $('filtersInput').value ? JSON.parse($('filtersInput').value) : {},
+            include_orgs: $('includeInput').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean),
             exclude_orgs: $('excludeInput').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean)
           };
 

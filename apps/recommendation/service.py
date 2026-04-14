@@ -53,6 +53,7 @@ class RecommendationService:
         *,
         query: str,
         filters_override: dict[str, Any] | None = None,
+        include_orgs: list[str] | None = None,
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
@@ -60,6 +61,7 @@ class RecommendationService:
             plan = await self.planner.plan(
                 query=query,
                 filters_override=filters_override,
+                include_orgs=include_orgs,
                 exclude_orgs=exclude_orgs,
                 top_k=top_k,
             )
@@ -94,6 +96,7 @@ class RecommendationService:
         *,
         query: str,
         filters_override: dict[str, Any] | None = None,
+        include_orgs: list[str] | None = None,
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
@@ -103,6 +106,7 @@ class RecommendationService:
         search_result = await self.search_candidates(
             query=query,
             filters_override=filters_override,
+            include_orgs=include_orgs,
             exclude_orgs=exclude_orgs,
             top_k=top_k,
         )

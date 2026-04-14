@@ -15,8 +15,9 @@ from apps.domain.models import RecommendationDecision
 class RecommendationRequest(BaseModel):
     """최종 전문가 추천을 요청할 때 사용하는 스키마입니다."""
     query: str = Field(..., description="평가위원 추천 자연어 질의 (예: '인공지능 분야 전문가 추천')")
-    top_k: int | None = Field(default=None, ge=1, le=5, description="추출할 상위 결과 개수")
+    top_k: int | None = Field(default=None, ge=1, le=15, description="추출할 상위 결과 개수")
     filters_override: dict[str, Any] = Field(default_factory=dict, description="검색 필터를 수동으로 지정할 때 사용")
+    include_orgs: list[str] = Field(default_factory=list, description="검색 대상 기관 목록 (해당 기관 소속 연구자만 추천)")
     exclude_orgs: list[str] = Field(default_factory=list, description="추천에서 제외할 기관 목록")
 
 

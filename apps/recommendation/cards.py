@@ -76,7 +76,7 @@ class CandidateCardBuilder:
                         if kw in content:
                             score += 1
                 
-                # 날짜 키 추출
+                # 날짜 키 추출 및 최신성 가점 (Recency Bonus) 부여
                 date_val = ""
                 if hasattr(item, "publication_year_month"):
                     date_val = item.publication_year_month
@@ -84,6 +84,17 @@ class CandidateCardBuilder:
                     date_val = item.registration_date or item.application_date or ""
                 elif hasattr(item, "project_end_date"):
                     date_val = item.project_end_date or item.project_start_date or ""
+                    
+                # 최근 5년 이내의 실적에 대해 미세 가산점을 부여하여 상위 노출 우선도 증대
+                if date_val and isinstance(date_val, str) and date_val[:4].isdigit():
+                    try:
+                        year = int(date_val[:4])
+                        # 2020년 이후 실적에 대해 최신성에 비례한 가점 (2024 -> 0.5, 2020 -> 0.1)
+                        if year >= 2020:
+                            bonus = max(0.1, min(0.5, (year - 2019) * 0.1))
+                            score += bonus
+                    except ValueError:
+                        pass
                 
                 scored_items.append((score, _date_key(date_val), item))
             

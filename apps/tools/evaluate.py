@@ -49,8 +49,9 @@ GOLDEN_DATA = [
 async def evaluate():
     settings = Settings()
     client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
-    registry = SearchSchemaRegistry()
-    dense_encoder = DenseEncoder(settings.dense_model_path)
+    registry = SearchSchemaRegistry.default()
+    from apps.api.main import build_dense_encoder
+    dense_encoder = build_dense_encoder(settings)
     query_builder = QueryTextBuilder()
     
     planner = OpenAICompatPlanner(settings)
@@ -64,7 +65,7 @@ async def evaluate():
     filter_compiler = QdrantFilterCompiler()
     card_builder = CandidateCardBuilder()
     judge = OpenAICompatJudge(settings)
-    feedback_store = FeedbackStore(settings.db_url)
+    feedback_store = FeedbackStore(settings.feedback_db_path, settings.feedback_table)
     
     service = RecommendationService(
         planner=planner,

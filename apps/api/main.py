@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -97,6 +98,7 @@ async def build_app_runtime(
         url=settings.qdrant_url,
         api_key=settings.qdrant_api_key,
         cloud_inference=settings.qdrant_cloud_inference,
+        timeout=20.0,
     )
     # 로컬 BM25 인코딩 기능 활성화 (fastembed 필요)
     cache_dir = Path(settings.bm25_cache_dir)
@@ -315,9 +317,11 @@ def create_app(
     @app.post("/recommend", response_model=RecommendationResponse)
     async def recommend(request: RecommendationRequest) -> RecommendationResponse:
         service = get_service()
+        normalized_query = re.sub(r'\s+', ' ', request.query).strip()
         result = await service.recommend(
-            query=request.query,
+            query=normalized_query,
             filters_override=request.filters_override,
+            include_orgs=request.include_orgs,
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
         )
@@ -333,9 +337,11 @@ def create_app(
         request: SearchCandidatesRequest,
     ) -> SearchCandidatesResponse:
         service = get_service()
+        normalized_query = re.sub(r'\s+', ' ', request.query).strip()
         result = await service.search_candidates(
-            query=request.query,
+            query=normalized_query,
             filters_override=request.filters_override,
+            include_orgs=request.include_orgs,
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
         )

@@ -12,6 +12,11 @@ TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣]+")
 def normalize_org_name(value: str | None) -> str | None:
     if not value:
         return None
+    # 괄호 안의 문자열(주로 영문 약어나 법인격) 전체 제거
+    value = re.sub(r"\([^)]*\)", "", value)
+    value = re.sub(r"\[[^\]]*\]", "", value)
+    # 대표적인 법인 표기 제거
+    value = re.sub(r"주식회사|유한회사|사단법인|재단법인", "", value)
     collapsed = re.sub(r"[^0-9A-Za-z가-힣]", "", value).upper()
     return collapsed or None
 

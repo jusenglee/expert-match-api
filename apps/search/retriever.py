@@ -21,6 +21,7 @@ from apps.domain.models import ExpertPayload, PlannerOutput, SearchHit
 from apps.search.encoders import DenseEncoder
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
+from apps.search.text_utils import normalize_org_name
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,10 @@ class QdrantHybridRetriever:
         """
         # 1. 브랜치별 최적화된 질의 텍스트 구성
         branch_queries = self.query_builder.build_branch_queries(query, plan)
-        logger.debug("브랜치별 생성 쿼리:\n%s", pprint.pformat(branch_queries, indent=2, width=100))
+        logger.debug(
+            "브랜치별 생성 쿼리:\n%s",
+            pprint.pformat(branch_queries, indent=2, width=100),
+        )
         prefetches: list[models.Prefetch] = []
 
         # 2. 각 데이터 브랜치별로 Prefetch 쿼리 조립
@@ -85,9 +89,14 @@ class QdrantHybridRetriever:
                 logger.info("브랜치 검색 스킵 (가중치 0): %s", branch)
                 continue
 
-            # 의미론적 검색을 위한 Dense 임베딩 생성
-            dense_query = self.dense_encoder.embed(branch_queries[branch])
-            # 키워드 검색을 위한 Sparse 쿼리 구성 (BM25 로컬 인코딩)
+            # 의미론적 검색을 위한 Dense 임베딩 생성 (e5-instruct 등 instruct 모델 최적화)
+            dense_query_text = branch_queries[branch]
+            if "instruct" in getattr(self.dense_encoder, "model_name", "").lower():
+                instruct_prefix = "Instruct: 주어진 질의에 가장 적합한 연구자 프로필이나 논문/특허/과제 실적을 찾으세요.\nQuery: "
+                dense_query_text = f"{instruct_prefix}{dense_query_text}"
+            dense_query = self.dense_encoder.embed(dense_query_text)
+            
+            # 키워드 검색을 위한 Sparse 쿼리 구성 (BM25 로컬 인코딩 - Prefix 절대 넣지 않음)
             sparse_query = models.Document(
                 text=branch_queries[branch], model=self.settings.bm25_model_name
             )
@@ -103,15 +112,18 @@ class QdrantHybridRetriever:
                             query=dense_query,
                             using=self.registry.dense_vector_by_branch[branch],
                             limit=self.settings.branch_prefetch_limit,
+                            filter=query_filter,
                         ),
                         models.Prefetch(
                             query=sparse_query,
                             using=self.registry.sparse_vector_by_branch[branch],
                             limit=self.settings.branch_prefetch_limit,
+                            filter=query_filter,
                         ),
                     ],
                     query=models.FusionQuery(fusion=models.Fusion.RRF),
                     limit=branch_limit,
+                    filter=query_filter,
                 )
             )
 
@@ -128,16 +140,22 @@ class QdrantHybridRetriever:
 
         def _sanitize_payload_for_log(data: Any) -> Any:
             if hasattr(data, "model_dump"):
-                try: data = data.model_dump()
-                except Exception: pass
+                try:
+                    data = data.model_dump()
+                except Exception:
+                    pass
             elif hasattr(data, "dict") and callable(data.dict):
-                try: data = data.dict()
-                except Exception: pass
-                
+                try:
+                    data = data.dict()
+                except Exception:
+                    pass
+
             if isinstance(data, dict):
                 return {k: _sanitize_payload_for_log(v) for k, v in data.items()}
             elif isinstance(data, list):
-                if len(data) > 100 and all(isinstance(x, (float, int)) for x in data[:10]):
+                if len(data) > 100 and all(
+                    isinstance(x, (float, int)) for x in data[:10]
+                ):
                     return f"<Dense Vector: {len(data)} dimensions>"
                 return [_sanitize_payload_for_log(x) for x in data]
             return data
@@ -148,7 +166,12 @@ class QdrantHybridRetriever:
             self.settings.qdrant_collection_name,
             "예" if query_filter else "아니오",
         )
-        logger.info("Qdrant 전달 플랜(Query Payload):\n%s", pprint.pformat(_sanitize_payload_for_log(query_payload), indent=2, width=120))
+        logger.info(
+            "Qdrant 전달 플랜(Query Payload):\n%s",
+            pprint.pformat(
+                _sanitize_payload_for_log(query_payload), indent=2, width=120
+            ),
+        )
         with Timer() as t:
             points = await asyncio.to_thread(self.client.query_points, **query_payload)
         logger.info("Qdrant 검색 완료: 소요시간=%.2fms", t.elapsed_ms)
@@ -186,6 +209,22 @@ class QdrantHybridRetriever:
                 "pat": bool(payload.intellectual_properties),
                 "pjt": bool(payload.research_projects),
             }
+
+            # Qdrant의 exact match 필터에서 누락될 수 있는 부분(띄어쓰기, KISTI 등 영문 병기)을
+            # 보완하기 위한 Python 레벨의 강력한 Post-Filtering
+            if plan.exclude_orgs:
+                org = payload.basic_info.affiliated_organization or ""
+                org_norm = normalize_org_name(org) or ""
+                should_exclude = False
+                for ex_org in plan.exclude_orgs:
+                    ex_org_norm = normalize_org_name(ex_org) or ""
+                    if ex_org_norm and org_norm:
+                        # 한쪽이 다른 한쪽을 완전히 포함하면 제외 (부분 일치 방어)
+                        if (ex_org_norm in org_norm) or (org_norm in ex_org_norm):
+                            should_exclude = True
+                            break
+                if should_exclude:
+                    continue
 
             hits.append(
                 SearchHit(

@@ -101,6 +101,7 @@ class RecordingBatchModel:
         self.shared_not_selected_reason = shared_not_selected_reason
         self.shared_data_gap = shared_data_gap
         self.calls: list[list[str]] = []
+        self.call_kwargs: list[dict[str, object]] = []
         self.in_flight = 0
         self.max_in_flight = 0
 
@@ -109,6 +110,7 @@ class RecordingBatchModel:
         shortlist = payload["shortlist"]
         expert_ids = [card["expert_id"] for card in shortlist]
         self.calls.append(expert_ids)
+        self.call_kwargs.append(dict(kwargs))
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
@@ -254,6 +256,12 @@ def test_openai_compat_judge_uses_single_call_when_shortlist_fits_batch():
 
     assert len(model.calls) == 1
     assert len(model.calls[0]) == 5
+    assert model.call_kwargs[0]["temperature"] == 0.0
+    assert model.call_kwargs[0]["top_p"] == 0.2
+    assert model.call_kwargs[0]["reasoning_effort"] == "low"
+    assert model.call_kwargs[0]["include_reasoning"] is False
+    assert model.call_kwargs[0]["disable_thinking"] is True
+    assert "max_tokens_hint" not in model.call_kwargs[0]
     assert len(result.recommended) == 5
 
 
@@ -306,6 +314,15 @@ def test_openai_compat_judge_batches_large_shortlist_into_tournament_rounds():
 
     assert len(model.calls) == 7
     assert all(len(call) == 10 for call in model.calls)
+    assert all(kwargs["temperature"] == 0.0 for kwargs in model.call_kwargs)
+    assert all(kwargs["top_p"] == 0.2 for kwargs in model.call_kwargs)
+    assert all(kwargs["reasoning_effort"] == "low" for kwargs in model.call_kwargs)
+    assert all(kwargs["include_reasoning"] is False for kwargs in model.call_kwargs)
+    assert all(kwargs["disable_thinking"] is True for kwargs in model.call_kwargs)
+    assert all(
+        kwargs.get("max_tokens_hint") == 3000 for kwargs in model.call_kwargs[:-1]
+    )
+    assert "max_tokens_hint" not in model.call_kwargs[-1]
     assert len(result.recommended) == 5
     assert result.not_selected_reasons == ["shared-reason"]
     assert result.data_gaps == ["shared-gap"]

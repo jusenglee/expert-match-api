@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from apps.core.config import Settings
 from apps.core.json_utils import extract_json_object_text as _extract_json_object_text
+from apps.core.llm_policies import build_consistency_invoke_kwargs
 from apps.core.openai_compat_llm import OpenAICompatChatModel
 from apps.core.timer import Timer
 from apps.core.utils import merge_unique_strings as _merge_unique_strings
@@ -22,6 +23,8 @@ from apps.domain.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+MAP_PHASE_MAX_TOKENS = 3000
 
 
 # _extract_json_object_text 는 apps.core.json_utils 로 이전됨 (import 위 참조)
@@ -272,89 +275,123 @@ class OpenAICompatJudge:
         )
 
     @staticmethod
-    def _build_system_prompt() -> str:
+    def _build_system_prompt(query: str, dumped_shortlist: list[dict[str, Any]]) -> str:
         """최종 Reduce/Single 라운드용 상세 프롬프트입니다.
         추천 사유, 근거, 리스크 등 완전한 심사 결과를 생성합니다."""
-        return """
-            You are the senior recommendation judge for a Korean R&D evaluator recommendation system.
-            Return exactly one JSON object that matches this schema:
-            {
-              "recommended": [
+        shortlist_json = json.dumps(dumped_shortlist, ensure_ascii=False, indent=2)
+        prompt = """
+            # Role
+                당신은 제공된 전문가 이력 데이터를 바탕으로 사용자의 요구사항에 가장 부합하는 전문가를 선별하고 추천하는 '수석 평가위원 매칭 시스템'입니다.
+                당신의 목표는 사용자 질문의 핵심 키워드와 전문가의 실제 이력을 엄격하게 교차 검증하여, 가장 적합한 순서대로 추천 결과를 제공하는 것입니다.
+            
+            # Instructions
+                아래의 [사용자 질문]과 RAG를 통해 검색된 [후보 전문가 데이터]를 분석하여 다음 지침에 따라 답변을 작성하세요.
+            
+                1. 의도 및 키워드 추출: [사용자 질문]에서 핵심 기술 및 도메인 키워드를 추출하세요. (예: '반도체', '공정 자동화', '스마트팩토리')
+                2. 엄격한 필터링 (Zero-Hallucination): [후보 전문가 데이터]에 명시된 경력, 프로젝트, 연구 분야가 추출된 키워드와 직접적으로 연관된 전문가만 선별하세요. 관련성이 모호하거나 데이터에 없는 내용을 유추하여 추천해서는 절대 안 됩니다. 적합한 전문가가 없다면 "적합한 전문가가 없습니다"라고 답변하세요.
+                3. 관련성 점수 부여 및 정렬 (Ranking): 선별된 전문가들이 사용자 질문과 얼마나 일치하는지 100점 만점 기준으로 '관련성 점수'를 내부적으로 계산하고, 반드시 점수가 가장 높은 전문가부터 내림차순으로 정렬하여 출력하세요.
+            
+            # User Query
+                {Query}
+            
+            # Candidate Expert Data
+                {shortlist}
+            
+            # Output Format
+                다음 스키마와 정확히 일치하는 단일 JSON 객체로 답변하세요.
+                
                 {
-                  "rank": 1,
-                  "expert_id": "shortlist expert_id",
-                  "name": "shortlist name",
-                  "organization": "optional organization",
-                  "fit": "높음|중간|보통",
-                  "reasons": ["reason"],
-                  "evidence": [
-                    {
-                      "type": "paper|patent|project|profile",
-                      "title": "exact shortlist evidence title",
-                      "date": "optional date",
-                      "detail": "optional detail"
-                    }
-                  ],
-                  "risks": ["risk"],
-                  "rank_score": 0.0
+                "recommended": [
+                {
+                "rank": 1,
+                "expert_id": "shortlist expert_id",
+                "name": "shortlist name",
+                "organization": "optional organization",
+                "fit": "높음|중간|보통",
+                "reasons": ["reason"],
+                "evidence": [
+                {
+                "type": "paper|patent|project|profile",
+                "title": "exact shortlist evidence title",
+                "date": "optional date",
+                "detail": "optional detail"
                 }
-              ],
-              "not_selected_reasons": ["reason"],
-              "data_gaps": ["gap"]
-            }
-
-            Rules:
-            - IMPORTANT: You MUST recommend up to the number of candidates specified in the plan's `top_k` field. Do NOT just return 1 candidate if there are multiple suitable fits.
-            - IMPORTANT: `rank_score` is a RELATIVE score within this search result (RRF-based), not an absolute suitability percentage. Do not misuse it as a probability.
-            - IMPORTANT: `branch_presence_flags` only indicate that data exists in that branch. It does not guarantee a perfect match. Verify exact suitability from `top_papers`, `top_patents`, etc.
-            - IMPORTANT: In evidence items, `type` must be exactly one of "paper", "patent", "project", or "profile". Do NOT use branch abbreviations like "pjt", "art", or "pat". Research projects (과제) must use "project".
-            - Copy `expert_id` exactly from the shortlist input.
-            - Every recommendation must include `rank`, `expert_id`, `name`, `organization`, `fit`, `reasons`, `evidence`, and `risks`.
-            - `reasons`, `risks`, `not_selected_reasons`, and `data_gaps` must always be arrays of strings, never a single string.
-            - Only use evidence that already exists in `top_papers`, `top_patents`, `top_projects`, or the profile fields of the shortlist input.
-            - If no candidate should be recommended, return `recommended=[]` and explain why in `not_selected_reasons` and/or `data_gaps`.
-            - Do not return markdown, code fences, or any prose outside the JSON object.
+                ],
+                "risks": ["risk"],
+                "rank_score": 0.0
+                }
+                ],
+                "not_selected_reasons": ["reason"],
+                "data_gaps": ["gap"]
+                }
+            
+            규칙:
+                - 중요: 계획의 `top_k` 필드에 지정된 후보자 수 이하로 반드시 추천해야 합니다. 적합한 후보가 여러 명일 경우 1명만 반환하지 마십시오.
+                - 중요: `branch_presence_flags`는 해당 브랜치에 데이터가 존재한다는 것만 나타냅니다. 완벽한 일치를 보장하지는 않습니다. `top_papers`, `top_patents` 등에서 정확한 적합성을 검증하십시오.
+                - 중요: 증거(evidence) 항목의 `type`은 반드시 "paper", "patent", "project", "profile" 중 하나여야 합니다. "pjt", "art", "pat"과 같은 브랜치 약어를 사용하지 마십시오. 연구 과제는 반드시 "project"를 사용해야 합니다.
+                - `expert_id`는 숏리스트(shortlist) 입력에서 정확히 복사하십시오.
+                - 모든 추천에는 `rank`, `expert_id`, `name`, `organization`, `fit`, `reasons`, `evidence`, `risks`가 반드시 포함되어야 합니다.
+                - `reasons`, `risks`, `not_selected_reasons`, `data_gaps`는 단일 문자열이 아닌, 반드시 문자열 배열(arrays of strings)이어야 합니다.
+                - 숏리스트 입력의 `top_papers`, `top_patents`, `top_projects` 또는 프로필 필드에 이미 존재하는 증거만 사용하십시오.
+                - 보수적으로 평가하십시오. 명시되지 않은 자격, 소속, 전문 분야 또는 증거를 임의로 추론하지 마십시오.
+                - 숏리스트의 증거가 빈약하거나 모호한 경우, 후보자를 제외하거나 위험(risk)/데이터 공백(data gap)으로 기록하는 것을 우선하십시오.
+                - 추천할 후보자가 없는 경우 `recommended=[]`를 반환하고, 그 이유를 `not_selected_reasons` 및/또는 `data_gaps`에 설명하십시오.
+                - JSON 객체 외에 마크다운, 코드 블록(code fences) 또는 기타 텍스트를 절대 반환하지 마십시오.
         """
+        prompt = prompt.replace("{Query}", query)
+        prompt = prompt.replace("{shortlist}", shortlist_json)
+        return prompt
 
     @staticmethod
     def _build_map_system_prompt() -> str:
         """중간 Map 라운드용 경량 프롬프트입니다.
         상세 사유 없이 생존자 expert_id 목록만 빠르게 반환합니다."""
         return (
-            "You are a fast screening filter for a Korean R&D evaluator recommendation system.\n"
-            "Your job: from the given shortlist, select the candidates most relevant to the query.\n"
-            "Return ONLY a JSON object. No markdown, no explanation.\n"
-            "First character must be '{', last character must be '}'.\n\n"
-            "Output schema:\n"
+            "당신은 한국 R&D 평가위원 추천 시스템의 고속 선별 필터(fast screening filter)입니다.\n"
+            "당신의 역할: 주어진 숏리스트(shortlist)에서 쿼리와 가장 관련성이 높은 후보자를 선택하는 것입니다.\n"
+            "오직 JSON 객체만 반환하십시오. 마크다운이나 설명은 포함하지 마십시오.\n"
+            "첫 번째 문자는 '{'이어야 하고, 마지막 문자는 '}'이어야 합니다.\n\n"
+            "출력 스키마:\n"
             '{"survivors":[{"expert_id":"...","rank":1},{"expert_id":"...","rank":2}]}\n\n'
-            "Rules:\n"
-            "- Select up to the number specified in plan.top_k (or more if many strong candidates exist).\n"
-            "- Copy expert_id exactly from the shortlist input.\n"
-            "- Rank by relevance to the query (1 = best).\n"
-            "- ONLY output the JSON object. No reasons, no evidence, no explanation.\n"
+            "규칙:\n"
+            "- plan.top_k에 지정된 수만큼 선택하십시오 (단, 강력한 후보가 많을 경우 더 선택할 수 있습니다).\n"
+            "- expert_id는 숏리스트 입력에서 정확히 복사하십시오.\n"
+            "- 중요: 입력에 제공된 rank_score는 고도로 최적화된 검색 엔진의 순위를 반영하므로 이를 전적으로 신뢰해야 합니다.\n"
+            "- 쿼리와의 관련성을 검증하되, 생존자(survivors)의 순위는 주로 rank_score를 기반으로 할당하십시오 (높은 점수 = 순위 1 등).\n"
+            "- 보수적으로 평가하십시오. 숏리스트의 증거가 쿼리를 명확하게 뒷받침하는 경우에만 후보자를 유지하십시오.\n"
+            "- 부분적이거나 관련 없는 제목에서 명시되지 않은 전문성을 임의로 추론하지 마십시오.\n"
+            "- 오직 JSON 객체만 출력하십시오. 이유, 증거, 설명은 절대 포함하지 마십시오.\n"
         )
 
     def _serialize_shortlist(
         self, shortlist: list[CandidateCard]
     ) -> list[dict[str, Any]]:
         """Reduce/Single 라운드용 전체 직렬화 (상세 근거 포함)."""
-        dumped_shortlist = [card.model_dump(mode="json") for card in shortlist]
+        dumped_shortlist = [
+            card.model_dump(mode="json", exclude_none=True) for card in shortlist
+        ]
         for card_dict in dumped_shortlist:
+            keys_to_remove = [
+                k for k, v in card_dict.items() if isinstance(v, list) and not v
+            ]
+            for k in keys_to_remove:
+                del card_dict[k]
+
             for paper in card_dict.get("top_papers", []):
                 if paper.get("abstract"):
-                    paper["abstract"] = paper["abstract"][:150] + "..."
+                    paper["abstract"] = paper["abstract"][:80] + "..."
                 if paper.get("korean_keywords"):
-                    paper["korean_keywords"] = paper["korean_keywords"][:5]
+                    paper["korean_keywords"] = paper["korean_keywords"][:3]
                 if paper.get("english_keywords"):
-                    paper["english_keywords"] = paper["english_keywords"][:5]
+                    paper["english_keywords"] = paper["english_keywords"][:3]
             for proj in card_dict.get("top_projects", []):
                 if proj.get("research_objective_summary"):
                     proj["research_objective_summary"] = (
-                        proj["research_objective_summary"][:150] + "..."
+                        proj["research_objective_summary"][:80] + "..."
                     )
                 if proj.get("research_content_summary"):
                     proj["research_content_summary"] = (
-                        proj["research_content_summary"][:150] + "..."
+                        proj["research_content_summary"][:80] + "..."
                     )
         return dumped_shortlist
 
@@ -379,17 +416,13 @@ class OpenAICompatJudge:
             }
             # 제목만 간결하게 포함 (abstract, 키워드 등 제외)
             if card.top_papers:
-                entry["paper_titles"] = [
-                    p.publication_title for p in card.top_papers
-                ]
+                entry["paper_titles"] = [p.publication_title for p in card.top_papers]
             if card.top_patents:
                 entry["patent_titles"] = [
                     p.intellectual_property_title for p in card.top_patents
                 ]
             if card.top_projects:
-                entry["project_titles"] = [
-                    p.display_title for p in card.top_projects
-                ]
+                entry["project_titles"] = [p.display_title for p in card.top_projects]
             lightweight.append(entry)
         return lightweight
 
@@ -398,8 +431,7 @@ class OpenAICompatJudge:
         shortlist: list[CandidateCard], batch_size: int
     ) -> list[list[CandidateCard]]:
         return [
-            shortlist[i : i + batch_size]
-            for i in range(0, len(shortlist), batch_size)
+            shortlist[i : i + batch_size] for i in range(0, len(shortlist), batch_size)
         ]
 
     def _log_shortlist_token_estimate(
@@ -445,9 +477,9 @@ class OpenAICompatJudge:
                 self.settings.llm_judge_max_concurrency,
                 max_tokens_hint or "unlimited",
             )
-            invoke_kwargs: dict[str, Any] = {}
-            if max_tokens_hint is not None:
-                invoke_kwargs["max_tokens_hint"] = max_tokens_hint
+            invoke_kwargs = build_consistency_invoke_kwargs(
+                max_tokens_hint=max_tokens_hint
+            )
             with Timer() as t:
                 result = await self.model.ainvoke_non_stream(messages, **invoke_kwargs)
             return result, t.elapsed_ms
@@ -467,7 +499,10 @@ class OpenAICompatJudge:
             recommended = raw_payload.get("recommended", [])
             if isinstance(recommended, list) and recommended:
                 survivors = recommended
-                logger.info("Map 응답 호환 처리: 'recommended' 키를 'survivors'로 대체 사용 (항목 수=%d)", len(survivors))
+                logger.info(
+                    "Map 응답 호환 처리: 'recommended' 키를 'survivors'로 대체 사용 (항목 수=%d)",
+                    len(survivors),
+                )
 
         card_lookup: dict[str, CandidateCard] = {c.expert_id: c for c in shortlist}
         recommendations: list[RecommendationDecision] = []
@@ -525,22 +560,25 @@ class OpenAICompatJudge:
         if is_map_phase:
             dumped_shortlist = self._serialize_shortlist_for_map(shortlist)
             system_prompt = self._build_map_system_prompt()
-            max_tokens_hint = 6000
+            max_tokens_hint = MAP_PHASE_MAX_TOKENS
+            user_payload = {
+                "query": query,
+                "plan": plan.model_dump(mode="json"),
+                "shortlist": dumped_shortlist,
+            }
         else:
             dumped_shortlist = self._serialize_shortlist(shortlist)
-            system_prompt = self._build_system_prompt()
+            system_prompt = self._build_system_prompt(query, dumped_shortlist)
             max_tokens_hint = None
+            user_payload = {
+                "plan": plan.model_dump(mode="json"),
+            }
 
         self._log_shortlist_token_estimate(
             dumped_shortlist,
             context_label=context_label,
         )
 
-        user_payload = {
-            "query": query,
-            "plan": plan.model_dump(mode="json"),
-            "shortlist": dumped_shortlist,
-        }
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)),
