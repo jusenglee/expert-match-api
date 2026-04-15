@@ -7,6 +7,7 @@ from apps.domain.models import (
     PublicationEvidence,
     RecommendationDecision,
 )
+from apps.recommendation.evidence_selector import RelevantEvidenceBundle
 from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonedCandidate
 from apps.recommendation.service import (
     EMPTY_RETRIEVAL_KEYWORDS_REASON,
@@ -40,17 +41,56 @@ class DummyCardBuilder:
         raise AssertionError("build_small_cards should not be called in this unit test")
 
 
+class DummyEvidenceSelector:
+    def __init__(self) -> None:
+        self.received_candidate_ids: list[list[str]] = []
+        self.last_trace = {"mode": "test_selector", "candidate_evidence_counts": []}
+
+    def select(self, *, candidates, plan):
+        _ = plan
+        candidate_ids = [candidate.expert_id for candidate in candidates]
+        self.received_candidate_ids.append(candidate_ids)
+        self.last_trace = {
+            "mode": "test_selector",
+            "candidate_evidence_counts": [
+                {
+                    "expert_id": candidate.expert_id,
+                    "papers": 0,
+                    "projects": 0,
+                    "patents": 0,
+                    "total": 0,
+                }
+                for candidate in candidates
+            ],
+        }
+        return {
+            candidate.expert_id: RelevantEvidenceBundle(expert_id=candidate.expert_id)
+            for candidate in candidates
+        }
+
+
 class RecordingReasonGenerator:
     def __init__(self, output: ReasonGenerationOutput) -> None:
         self.output = output
         self.called = False
         self.received_candidate_ids: list[list[str]] = []
+        self.received_relevant_evidence_ids: list[list[str]] = []
         self.last_trace = {"mode": "test"}
 
-    async def generate(self, *, query, plan, candidates):
+    async def generate(
+        self,
+        *,
+        query,
+        plan,
+        candidates,
+        relevant_evidence_by_expert_id=None,
+    ):
         _ = (query, plan)
         self.called = True
         self.received_candidate_ids.append([candidate.expert_id for candidate in candidates])
+        self.received_relevant_evidence_ids.append(
+            sorted((relevant_evidence_by_expert_id or {}).keys())
+        )
         self.last_trace = {
             "mode": "test",
             "candidate_count": len(candidates),
@@ -89,17 +129,19 @@ def _plan(top_k: int = 2) -> PlannerOutput:
 
 def _build_service(
     reason_output: ReasonGenerationOutput,
-) -> tuple[RecommendationService, RecordingReasonGenerator]:
+) -> tuple[RecommendationService, RecordingReasonGenerator, DummyEvidenceSelector]:
     reason_generator = RecordingReasonGenerator(reason_output)
+    evidence_selector = DummyEvidenceSelector()
     service = RecommendationService(
         planner=DummyPlanner(),
         retriever=DummyRetriever(),
         filter_compiler=DummyFilterCompiler(),
         card_builder=DummyCardBuilder(),
+        evidence_selector=evidence_selector,
         reason_generator=reason_generator,
         feedback_store=DummyFeedbackStore(),
     )
-    return service, reason_generator
+    return service, reason_generator, evidence_selector
 
 
 def _bind_search_result(
@@ -153,12 +195,13 @@ def _bind_search_result(
 
 
 def test_recommend_returns_empty_when_no_candidates_are_retrieved():
-    service, reason_generator = _build_service(ReasonGenerationOutput())
+    service, reason_generator, evidence_selector = _build_service(ReasonGenerationOutput())
     _bind_search_result(service, cards=[], retrieved_count=0)
 
     result = asyncio.run(service.recommend(query="Recommend reviewers"))
 
     assert reason_generator.called is False
+    assert evidence_selector.received_candidate_ids == []
     assert result["recommendations"] == []
     assert result["not_selected_reasons"] == [NO_MATCHING_CANDIDATE_REASON]
     assert result["trace"]["reason_generation_trace"] == {}
@@ -166,7 +209,7 @@ def test_recommend_returns_empty_when_no_candidates_are_retrieved():
 
 
 def test_recommend_returns_data_gap_when_retrieval_is_skipped():
-    service, reason_generator = _build_service(ReasonGenerationOutput())
+    service, reason_generator, evidence_selector = _build_service(ReasonGenerationOutput())
     _bind_search_result(
         service,
         cards=[],
@@ -183,12 +226,13 @@ def test_recommend_returns_data_gap_when_retrieval_is_skipped():
     result = asyncio.run(service.recommend(query="Recommend reviewers"))
 
     assert reason_generator.called is False
+    assert evidence_selector.received_candidate_ids == []
     assert result["data_gaps"] == [EMPTY_RETRIEVAL_KEYWORDS_REASON]
     assert result["trace"]["retrieval_skipped_reason"] == EMPTY_RETRIEVAL_KEYWORDS_REASON
 
 
 def test_recommend_sends_only_top_k_to_reason_generator_and_preserves_order():
-    service, reason_generator = _build_service(
+    service, reason_generator, evidence_selector = _build_service(
         ReasonGenerationOutput(
             items=[
                 ReasonedCandidate(
@@ -214,16 +258,19 @@ def test_recommend_sends_only_top_k_to_reason_generator_and_preserves_order():
     result = asyncio.run(service.recommend(query="Recommend reviewers", top_k=2))
 
     assert reason_generator.called is True
+    assert evidence_selector.received_candidate_ids == [["1", "2"]]
     assert reason_generator.received_candidate_ids == [["1", "2"]]
+    assert reason_generator.received_relevant_evidence_ids == [["1", "2"]]
     assert [item.expert_id for item in result["recommendations"]] == ["1", "2"]
     assert result["recommendations"][0].recommendation_reason == "Reason for first candidate"
     assert result["recommendations"][1].recommendation_reason == "Reason for second candidate"
     assert result["trace"]["recommendation_ids"] == ["1", "2"]
     assert result["trace"]["top_k_used"] == 2
+    assert "evidence_selection" in result["trace"]["reason_generation_trace"]
 
 
 def test_recommend_keeps_payload_backed_evidence_on_returned_items():
-    service, _ = _build_service(
+    service, _, _ = _build_service(
         ReasonGenerationOutput(
             items=[
                 ReasonedCandidate(

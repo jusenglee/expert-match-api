@@ -8,6 +8,7 @@ from apps.core.timer import Timer
 from apps.core.utils import merge_unique_strings as _merge_unique_strings
 from apps.domain.models import CandidateCard, EvidenceItem, PlannerOutput, RecommendationDecision
 from apps.recommendation.cards import CandidateCardBuilder
+from apps.recommendation.evidence_selector import EvidenceSelector
 from apps.recommendation.planner import Planner
 from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonGenerator
 from apps.search.filters import QdrantFilterCompiler
@@ -32,6 +33,7 @@ class RecommendationService:
         retriever: QdrantHybridRetriever,
         filter_compiler: QdrantFilterCompiler,
         card_builder: CandidateCardBuilder,
+        evidence_selector: EvidenceSelector,
         reason_generator: ReasonGenerator,
         feedback_store: FeedbackStore,
     ) -> None:
@@ -39,6 +41,7 @@ class RecommendationService:
         self.retriever = retriever
         self.filter_compiler = filter_compiler
         self.card_builder = card_builder
+        self.evidence_selector = evidence_selector
         self.reason_generator = reason_generator
         self.feedback_store = feedback_store
 
@@ -199,16 +202,30 @@ class RecommendationService:
                 timers=search_result.get("timers"),
             )
 
+        with Timer() as evidence_selection_timer:
+            relevant_evidence_by_expert_id = self.evidence_selector.select(
+                candidates=shortlist,
+                plan=plan,
+            )
+
         with Timer() as reason_timer:
             reason_output = await self.reason_generator.generate(
                 query=query,
                 plan=plan,
                 candidates=shortlist,
+                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
             )
 
-        reason_generation_trace = self._extract_component_trace(self.reason_generator)
+        reason_generation_trace = (
+            self._extract_component_trace(self.reason_generator) or {}
+        )
+        evidence_selection_trace = self._extract_component_trace(self.evidence_selector)
+        if evidence_selection_trace is not None:
+            reason_generation_trace = dict(reason_generation_trace)
+            reason_generation_trace["evidence_selection"] = evidence_selection_trace
         recommendations = self._build_recommendations(shortlist, reason_output)
         timers = dict(search_result.get("timers", {}))
+        timers["evidence_selection_ms"] = evidence_selection_timer.elapsed_ms
         timers["reason_generation_ms"] = reason_timer.elapsed_ms
 
         total_timer.stop()

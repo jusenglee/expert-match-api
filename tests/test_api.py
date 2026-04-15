@@ -128,6 +128,8 @@ def test_recommend_endpoint_contract():
     assert response.status_code == 200
     parsed = RecommendationResponse.model_validate(response.json())
     assert parsed.searched_branches == ["basic", "art", "pat", "pjt"]
+    assert response.json()["recommendations"][0]["fit"] == "높음"
+    assert response.json()["recommendations"][0]["reasons"] == ["Publication evidence is available."]
 
 
 def test_playground_route_serves_local_chat_ui():

@@ -13,6 +13,7 @@ from apps.api.main import build_dense_encoder
 from apps.core.config import Settings
 from apps.core.feedback_store import FeedbackStore
 from apps.recommendation.cards import CandidateCardBuilder
+from apps.recommendation.evidence_selector import KeywordEvidenceSelector
 from apps.recommendation.planner import OpenAICompatPlanner
 from apps.recommendation.reasoner import OpenAICompatReasonGenerator
 from apps.recommendation.service import RecommendationService
@@ -48,6 +49,7 @@ async def evaluate() -> None:
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
+        evidence_selector=KeywordEvidenceSelector(),
         reason_generator=OpenAICompatReasonGenerator(settings),
         feedback_store=FeedbackStore(settings.feedback_db_path, settings.feedback_table),
     )

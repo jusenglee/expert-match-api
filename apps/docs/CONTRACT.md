@@ -65,6 +65,7 @@ Current behavior:
 - `rank_score` is derived from retrieval score normalization
 - `shortlist_score` equals `rank_score`
 - `top_papers`, `top_patents`, and `top_projects` are deterministic payload previews
+- `/recommend` may derive query-relevant evidence from those previews before LLM reason generation
 
 ## Reason Generation Contract
 
@@ -79,6 +80,7 @@ Output schema:
       "expert_id": "11008395",
       "fit": "높음",
       "recommendation_reason": "Fire-response publications and projects are present.",
+      "reasons": ["Fire-response publications and projects are present."],
       "risks": []
     }
   ],
@@ -91,6 +93,9 @@ Reason generation rules:
 - the LLM does not rerank candidates
 - the LLM does not drop candidates
 - the LLM does not create new expert ids
+- candidate-internal evidence is re-ranked against planner `core_keywords` before serialization
+- only selected relevant evidence is provided as direct grounding for `recommendation_reason`
+- if no relevant evidence is selected for a candidate, the LLM must not hallucinate direct query evidence
 - output is normalized back to the original candidate order
 - fallback reason generation keeps the same candidate order and does not inject a new ranking policy
 
@@ -100,6 +105,7 @@ Reason generation rules:
 
 - taking the search-ordered Top-k candidates
 - inserting LLM-generated `fit` and `recommendation_reason`
+- exposing `reasons` as a backward-compatible single-item alias of `recommendation_reason`
 - building payload-backed `evidence` deterministically from the candidate preview data
 - returning the same order received from retrieval
 
@@ -112,6 +118,7 @@ Trace keys currently emitted:
 - `planner`
 - `planner_trace`
 - `reason_generation_trace` (`/recommend` only)
+- `reason_generation_trace.evidence_selection` (`/recommend` only, nested)
 - `raw_query`
 - `planner_keywords`
 - `retrieval_keywords`

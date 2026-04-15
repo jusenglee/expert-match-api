@@ -7,7 +7,7 @@ Current request flow:
 3. Retriever runs branch-level dense+sparse hybrid search and RRF.
 4. Final search order is fixed as `RRF score desc -> researcher name asc -> expert_id asc`.
 5. `/search/candidates` returns candidates in that search order.
-6. `/recommend` takes only ordered Top-k candidates, asks the LLM to generate reasons, and returns them in the same order.
+6. `/recommend` takes only ordered Top-k candidates, re-ranks each candidate's internal evidence against planner `core_keywords`, asks the LLM to generate reasons from only that relevant evidence, and returns them in the same order.
 
 ## Endpoint Behavior
 
@@ -17,6 +17,7 @@ Current request flow:
 - `POST /recommend`
   - Uses explicit `top_k` first.
   - If explicit `top_k` is missing, falls back to planner-extracted `top_k`.
+  - Re-ranks each candidate's papers/projects/patents against planner `core_keywords` before reason generation.
   - Sends only ordered Top-k candidates to the LLM for reason generation.
   - Does not rerank after LLM reasoning.
 

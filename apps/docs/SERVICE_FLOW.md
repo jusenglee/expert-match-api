@@ -47,8 +47,9 @@ Behavior:
 `/recommend` reuses the same search path and then:
 
 - selects ordered Top-k candidates
+- re-ranks each candidate's internal evidence against planner `core_keywords`
 - sends only those candidates to the LLM
-- receives `fit` and `recommendation_reason`
+- receives `fit` and `recommendation_reason` grounded on the selected relevant evidence
 - keeps the original retrieval order
 - builds deterministic payload-backed evidence
 

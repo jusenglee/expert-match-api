@@ -37,6 +37,7 @@ from apps.core.runtime_validation import (
     validate_runtime_settings,
 )
 from apps.recommendation.cards import CandidateCardBuilder
+from apps.recommendation.evidence_selector import KeywordEvidenceSelector
 from apps.recommendation.planner import HeuristicPlanner, OpenAICompatPlanner
 from apps.recommendation.reasoner import (
     OpenAICompatReasonGenerator,
@@ -156,6 +157,7 @@ async def build_app_runtime(
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
+        evidence_selector=KeywordEvidenceSelector(),
         reason_generator=reason_generator,
         feedback_store=feedback_store,
     )

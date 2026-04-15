@@ -14,6 +14,7 @@ from apps.core.llm_policies import build_consistency_invoke_kwargs
 from apps.core.openai_compat_llm import OpenAICompatChatModel
 from apps.core.utils import build_deterministic_seed
 from apps.domain.models import CandidateCard, PlannerOutput
+from apps.recommendation.evidence_selector import RelevantEvidenceBundle
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,12 @@ class ReasonGenerationOutput(BaseModel):
 
 class ReasonGenerator(Protocol):
     async def generate(
-        self, *, query: str, plan: PlannerOutput, candidates: list[CandidateCard]
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        candidates: list[CandidateCard],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
     ) -> ReasonGenerationOutput: ...
 
 
@@ -67,9 +73,14 @@ class PassThroughReasonGenerator:
         self.last_trace: dict[str, Any] = {}
 
     async def generate(
-        self, *, query: str, plan: PlannerOutput, candidates: list[CandidateCard]
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        candidates: list[CandidateCard],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
     ) -> ReasonGenerationOutput:
-        _ = (query, plan)
+        _ = (query, plan, relevant_evidence_by_expert_id)
         output = ReasonGenerationOutput(
             items=[
                 ReasonedCandidate(
@@ -111,6 +122,10 @@ class OpenAICompatReasonGenerator:
             - Do not drop candidates.
             - Do not create new expert ids.
             - For each candidate, write one grounded recommendation reason based only on the provided data.
+            - Use only the provided relevant_papers, relevant_projects, and relevant_patents as direct evidence.
+            - Do not claim direct query evidence from counts, profile fields, or missing evidence arrays alone.
+            - If relevant evidence arrays are empty, explicitly say direct evidence matching the query was not found and stay cautious.
+            - Do not hallucinate evidence that is not present in the payload.
             - Keep reasons concise and factual.
             - Risks are optional.
             - Return JSON only.
@@ -131,9 +146,31 @@ class OpenAICompatReasonGenerator:
         return textwrap.dedent(prompt).strip()
 
     @staticmethod
-    def _serialize_candidates(candidates: list[CandidateCard]) -> list[dict[str, Any]]:
+    def _serialize_evidence_items(items: list[Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "title": item.title,
+                "date": item.date,
+                "detail": item.detail,
+                "snippet": item.snippet,
+                "matched_keywords": list(item.matched_keywords),
+            }
+            for item in items
+        ]
+
+    @classmethod
+    def _serialize_candidates(
+        cls,
+        candidates: list[CandidateCard],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
+    ) -> list[dict[str, Any]]:
         serialized: list[dict[str, Any]] = []
+        relevant_evidence_by_expert_id = relevant_evidence_by_expert_id or {}
         for candidate in candidates:
+            relevant_bundle = relevant_evidence_by_expert_id.get(
+                candidate.expert_id,
+                RelevantEvidenceBundle(expert_id=candidate.expert_id),
+            )
             serialized.append(
                 {
                     "expert_id": candidate.expert_id,
@@ -146,31 +183,15 @@ class OpenAICompatReasonGenerator:
                     "counts": dict(candidate.counts),
                     "matched_filter_summary": list(candidate.matched_filter_summary),
                     "data_gaps": list(candidate.data_gaps),
-                    "top_papers": [
-                        {
-                            "title": item.publication_title,
-                            "date": item.publication_year_month,
-                            "detail": item.journal_name,
-                        }
-                        for item in candidate.top_papers[:2]
-                    ],
-                    "top_patents": [
-                        {
-                            "title": item.intellectual_property_title,
-                            "date": item.registration_date or item.application_date,
-                            "detail": item.application_registration_type
-                            or item.application_country,
-                        }
-                        for item in candidate.top_patents[:1]
-                    ],
-                    "top_projects": [
-                        {
-                            "title": item.display_title,
-                            "date": item.project_end_date or item.project_start_date,
-                            "detail": item.managing_agency or item.performing_organization,
-                        }
-                        for item in candidate.top_projects[:2]
-                    ],
+                    "relevant_papers": cls._serialize_evidence_items(
+                        relevant_bundle.papers
+                    ),
+                    "relevant_patents": cls._serialize_evidence_items(
+                        relevant_bundle.patents
+                    ),
+                    "relevant_projects": cls._serialize_evidence_items(
+                        relevant_bundle.projects
+                    ),
                 }
             )
         return serialized
@@ -208,7 +229,12 @@ class OpenAICompatReasonGenerator:
         )
 
     async def generate(
-        self, *, query: str, plan: PlannerOutput, candidates: list[CandidateCard]
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        candidates: list[CandidateCard],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
     ) -> ReasonGenerationOutput:
         if not candidates:
             self.last_trace = {
@@ -218,7 +244,10 @@ class OpenAICompatReasonGenerator:
             }
             return ReasonGenerationOutput()
 
-        serialized_candidates = self._serialize_candidates(candidates)
+        serialized_candidates = self._serialize_candidates(
+            candidates,
+            relevant_evidence_by_expert_id,
+        )
         seed = build_deterministic_seed(
             "reason_generation",
             query,
@@ -257,6 +286,7 @@ class OpenAICompatReasonGenerator:
                 query=query,
                 plan=plan,
                 candidates=candidates,
+                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
             )
             self.last_trace = {
                 "mode": "fallback",

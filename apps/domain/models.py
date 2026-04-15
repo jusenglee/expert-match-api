@@ -316,3 +316,9 @@ class RecommendationDecision(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0
+
+    @computed_field(return_type=list[str])
+    @property
+    def reasons(self) -> list[str]:
+        """Backward-compatible alias for older frontends."""
+        return [self.recommendation_reason] if self.recommendation_reason else []

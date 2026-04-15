@@ -52,11 +52,20 @@
   - final evidence comes from payload-backed preview data
   - evidence is deterministic and does not depend on LLM post-selection
 
+### 8. Relevant evidence selection for reasons
+
+- Input: a query whose recommended candidate has both newer irrelevant evidence and older relevant evidence
+- Expected:
+  - `/recommend` still preserves candidate retrieval order
+  - reason generation receives only query-relevant evidence
+  - newer but irrelevant evidence is not used as direct grounding for `recommendation_reason`
+
 ## Acceptance Criteria
 
 - Retrieval text is built only from planner `core_keywords`.
 - `/search/candidates` preserves retrieval order.
 - `/recommend` preserves retrieval order for returned items.
 - `/recommend` sends only Top-k candidates to the LLM.
+- `/recommend` re-ranks candidate-internal evidence against planner `core_keywords` before LLM reason generation.
 - Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `final_sort_policy`, and `top_k_used`.
 - Legacy verifier, multi-view retrieval, judge, and evidence-resolver traces are no longer part of the active contract.
