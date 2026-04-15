@@ -48,6 +48,46 @@ class QdrantHybridRetriever:
         self.dense_encoder = dense_encoder
         self.query_builder = query_builder
 
+    @staticmethod
+    def _sanitize_payload_for_log(data: Any) -> Any:
+        if hasattr(data, "model_dump"):
+            try:
+                data = data.model_dump()
+            except Exception:
+                pass
+        elif hasattr(data, "dict") and callable(data.dict):
+            try:
+                data = data.dict()
+            except Exception:
+                pass
+
+        if isinstance(data, dict):
+            return {
+                key: QdrantHybridRetriever._sanitize_payload_for_log(value)
+                for key, value in data.items()
+            }
+        if isinstance(data, list):
+            if len(data) > 100 and all(
+                isinstance(value, (float, int)) for value in data[:10]
+            ):
+                return f"<Dense Vector: {len(data)} dimensions>"
+            return [
+                QdrantHybridRetriever._sanitize_payload_for_log(value)
+                for value in data
+            ]
+        return data
+
+    @staticmethod
+    def _sort_hits(hits: list[SearchHit]) -> list[SearchHit]:
+        return sorted(
+            hits,
+            key=lambda hit: (
+                -hit.score,
+                " ".join((hit.payload.basic_info.researcher_name or "").split()),
+                hit.expert_id,
+            ),
+        )
+
     async def search(
         self,
         *,
@@ -55,7 +95,6 @@ class QdrantHybridRetriever:
         plan: PlannerOutput,
         query_filter: models.Filter | None,
     ) -> RetrievalResult:
-        _ = query
         retrieval_keywords = self.query_builder.normalize_keywords(plan.core_keywords)
         branch_queries = self.query_builder.build_branch_queries(query, plan)
         logger.debug(
@@ -73,7 +112,6 @@ class QdrantHybridRetriever:
                 )
                 dense_query_text = f"{instruct_prefix}{dense_query_text}"
             dense_query = self.dense_encoder.embed(dense_query_text)
-
             sparse_query = models.Document(
                 text=branch_queries[branch],
                 model=self.settings.bm25_model_name,
@@ -111,28 +149,6 @@ class QdrantHybridRetriever:
             "with_vectors": False,
         }
 
-        def _sanitize_payload_for_log(data: Any) -> Any:
-            if hasattr(data, "model_dump"):
-                try:
-                    data = data.model_dump()
-                except Exception:
-                    pass
-            elif hasattr(data, "dict") and callable(data.dict):
-                try:
-                    data = data.dict()
-                except Exception:
-                    pass
-
-            if isinstance(data, dict):
-                return {key: _sanitize_payload_for_log(value) for key, value in data.items()}
-            if isinstance(data, list):
-                if len(data) > 100 and all(
-                    isinstance(value, (float, int)) for value in data[:10]
-                ):
-                    return f"<Dense Vector: {len(data)} dimensions>"
-                return [_sanitize_payload_for_log(value) for value in data]
-            return data
-
         logger.info(
             "Qdrant hybrid search: collection=%s filter_applied=%s",
             self.settings.qdrant_collection_name,
@@ -140,7 +156,9 @@ class QdrantHybridRetriever:
         )
         logger.info(
             "Qdrant query payload:\n%s",
-            pprint.pformat(_sanitize_payload_for_log(query_payload), indent=2, width=120),
+            pprint.pformat(
+                self._sanitize_payload_for_log(query_payload), indent=2, width=120
+            ),
         )
         with Timer() as timer:
             points = await asyncio.to_thread(self.client.query_points, **query_payload)
@@ -201,11 +219,14 @@ class QdrantHybridRetriever:
                 )
             )
 
+        hits = self._sort_hits(hits)
+
         if skipped_invalid_payloads:
             logger.info(
-                "Search completed with payload skips: total=%d skipped=%d",
+                "Search completed with payload skips: total=%d skipped=%d returned=%d",
                 len(point_list),
                 skipped_invalid_payloads,
+                len(hits),
             )
         else:
             logger.info("Search completed: hits=%d", len(hits))

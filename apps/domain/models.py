@@ -4,7 +4,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
-
 BranchName = Literal["basic", "art", "pat", "pjt"]
 
 
@@ -22,7 +21,9 @@ def _normalize_string_list(value: Any) -> Any:
         for item in value:
             if item is None or _is_blank_string(item):
                 continue
-            normalized.append(item.strip() if isinstance(item, str) else str(item))
+            normalized_value = item.strip() if isinstance(item, str) else str(item).strip()
+            if normalized_value:
+                normalized.append(normalized_value)
         return normalized
     return value
 
@@ -160,8 +161,6 @@ class ExpertPayload(BaseModel):
     publications: list[PublicationEvidence] = Field(default_factory=list)
     intellectual_properties: list[IntellectualPropertyEvidence] = Field(default_factory=list)
     research_projects: list[ResearchProjectEvidence] = Field(default_factory=list)
-    
-    # Optional legacy fields
     technical_classifications: list[str] = Field(default_factory=list)
     evaluation_activity_cnt: int = 0
     external_activity_cnt: int = 0
@@ -201,7 +200,6 @@ class SeedEvidencePoint(BaseModel):
 
 
 class SeedExpertRecord(BaseModel):
-    # Deprecated: SeedEvidencePoint로 대체 예정
     point_id: str
     payload: ExpertPayload
     basic_text: str
@@ -213,32 +211,23 @@ class SeedExpertRecord(BaseModel):
 class PlannerOutput(BaseModel):
     intent_summary: str
     hard_filters: dict[str, Any] = Field(default_factory=dict)
-    include_orgs: list[str] = Field(
-        default_factory=list,
-        description="추천 대상을 특정 기관 소속으로 제한할 때 사용. "
-                    "'X 소속 연구자 중', 'X에서 추천' 패턴 → must 조건. "
-                    "exclude_orgs(제외)와 반대 개념.",
-    )
+    include_orgs: list[str] = Field(default_factory=list)
     exclude_orgs: list[str] = Field(default_factory=list)
-    soft_preferences: list[str] = Field(default_factory=list)
-    task_terms: list[str] = Field(
-        default_factory=list,
-        description="Non-retrieval task or role terms extracted from the request. Retrieval does not consume these.",
-    )
+    task_terms: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
-    branch_weights: dict[BranchName, float] = Field(default_factory=dict)
-    branch_query_hints: dict[BranchName, str] = Field(
-        default_factory=dict,
-        description="Deprecated. Kept for backward compatibility and not used by retrieval.",
-    )
     top_k: int = 15
+
+    @field_validator("include_orgs", "exclude_orgs", "task_terms", "core_keywords", mode="before")
+    @classmethod
+    def _normalize_string_lists(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
 
 
 class SearchHit(BaseModel):
     expert_id: str
     score: float
     payload: ExpertPayload
-    branch: BranchName | None = None # 매칭된 실적의 종류
+    branch: BranchName | None = None
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -254,8 +243,8 @@ class SearchHit(BaseModel):
 
 class GroupedSearchHit(BaseModel):
     expert_id: str
-    group_score: float # 그룹 내 최고 점수 또는 집계 점수
-    hits: list[SearchHit] # 해당 전문가의 매칭된 실적 리스트
+    group_score: float
+    hits: list[SearchHit]
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -277,19 +266,15 @@ class EvidenceItem(BaseModel):
 
     @field_validator("type", mode="before")
     @classmethod
-    def _normalize_evidence_type(cls, v: Any) -> Any:
-        """LLM이 플래너 브랜치 축약어(pjt, art, pat)를 그대로 출력하는 경우를 방어합니다.
-        내부 브랜치명과 Pydantic 허용값 사이의 스키마 파편화로 발생하는 Validation 오류를
-        자동으로 복구합니다 (브랜치명 → 정규 type 값 매핑).
-        """
-        _BRANCH_ALIAS: dict[str, str] = {
+    def _normalize_evidence_type(cls, value: Any) -> Any:
+        branch_alias = {
             "pjt": "project",
             "art": "paper",
             "pat": "patent",
         }
-        if isinstance(v, str):
-            return _BRANCH_ALIAS.get(v.strip().lower(), v)
-        return v
+        if isinstance(value, str):
+            return branch_alias.get(value.strip().lower(), value)
+        return value
 
 
 class CandidateCard(BaseModel):
@@ -301,7 +286,6 @@ class CandidateCard(BaseModel):
     major: str | None = None
     branch_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
-    keyword_matched_counts: dict[str, int] = Field(default_factory=dict)
     top_papers: list[PublicationEvidence] = Field(default_factory=list)
     top_patents: list[IntellectualPropertyEvidence] = Field(default_factory=list)
     top_projects: list[ResearchProjectEvidence] = Field(default_factory=list)
@@ -328,13 +312,7 @@ class RecommendationDecision(BaseModel):
     name: str
     organization: str | None = None
     fit: Literal["높음", "중간", "보통"]
-    reasons: list[str] = Field(default_factory=list)
+    recommendation_reason: str = ""
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0
-
-
-class JudgeOutput(BaseModel):
-    recommended: list[RecommendationDecision] = Field(default_factory=list)
-    not_selected_reasons: list[str] = Field(default_factory=list)
-    data_gaps: list[str] = Field(default_factory=list)

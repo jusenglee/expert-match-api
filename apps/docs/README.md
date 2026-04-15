@@ -2,58 +2,56 @@
 
 Current request flow:
 
-1. Planner parses the user query into structured retrieval intent.
-2. Verifier rewrites planner output into a retrieval-safe plan.
-3. Query builder assembles retrieval text from verified `core_keywords` only.
-4. Retriever runs Qdrant dense + sparse + RRF search.
-5. Candidate cards are built and shortlisted.
-6. Judge decides final recommendations with single-shot or map-reduce.
-7. Evidence resolver rebuilds UI evidence from the original expert payload.
+1. Planner extracts pure `core_keywords` and non-retrieval `task_terms`.
+2. Query builder joins `core_keywords` into one cleaned retrieval query.
+3. Retriever runs branch-level dense+sparse hybrid search and RRF.
+4. Final search order is fixed as `RRF score desc -> researcher name asc -> expert_id asc`.
+5. `/search/candidates` returns candidates in that search order.
+6. `/recommend` takes only ordered Top-k candidates, asks the LLM to generate reasons, and returns them in the same order.
 
-## Endpoints
+## Endpoint Behavior
 
-- `POST /recommend`
 - `POST /search/candidates`
-- `POST /feedback`
-- `GET /health`
-- `GET /health/ready`
-- `GET /playground`
+  - Returns the search-ordered candidate list.
+  - Uses explicit `top_k` only as a response limit when the caller provides it.
+- `POST /recommend`
+  - Uses explicit `top_k` first.
+  - If explicit `top_k` is missing, falls back to planner-extracted `top_k`.
+  - Sends only ordered Top-k candidates to the LLM for reason generation.
+  - Does not rerank after LLM reasoning.
 
-## Current Retrieval Stability Notes
+## Retrieval Rules
 
-- Planner, verifier, and judge use deterministic seeds.
-- Retrieval text is built from verifier-approved `core_keywords` only.
-- Raw user query is kept in trace, not in retrieval text.
-- `intent_summary` is UI and trace data only.
-- `task_terms` preserves request-role or action meaning but is not used for retrieval.
-- `branch_query_hints` is deprecated and not used by retrieval.
-- Dense and sparse search use the same cleaned query text across all four branches.
-- If planner and verifier still cannot produce safe `core_keywords` after retry, retrieval is skipped.
-- Judge map contraction uses deterministic compression instead of oversized reduce fallback.
-- Final UI evidence is resolved after judge from the original expert payload, not from card preview items alone.
+- Raw natural-language query does not enter retrieval text.
+- Retrieval text is built only from planner `core_keywords`.
+- All four branches receive the same cleaned query text.
+- Branch fusion uses RRF.
+- Final application-level sort uses score first and name only as the tie-breaker.
 
-## API Trace Notes
+## Trace Keys
 
-API trace includes:
+API trace currently includes:
 
+- `planner`
 - `planner_trace`
-- `judge_trace`
+- `reason_generation_trace` (`/recommend` only)
 - `raw_query`
-- `planner_raw_keywords`
-- `verifier_keywords`
+- `planner_keywords`
 - `retrieval_keywords`
 - `planner_retry_count`
-- `verifier_applied`
 - `retrieval_skipped_reason`
 - `branch_queries`
+- `final_sort_policy`
 - `candidate_ids`
-- `evidence_resolution_trace`
+- `recommendation_ids` (`/recommend` only)
+- `top_k_used` (`/recommend` only)
 - `query_payload`
 - `timers`
 
 ## Docs
 
-- `apps/docs/CONTRACT.md`: planner, verifier, retrieval, judge, and trace contracts
-- `apps/docs/SERVICE_FLOW.md`: pipeline behavior and runtime flow
-- `apps/docs/RUNBOOK.md`: operating guidance
+- `apps/docs/CONTRACT.md`: runtime contract for planner, retrieval, reason generation, and trace
+- `apps/docs/SERVICE_FLOW.md`: request-time behavior and ordering semantics
+- `apps/docs/GOLDEN_TESTS.md`: regression scenarios and acceptance criteria
+- `apps/docs/RUNBOOK.md`: operations guidance
 - `apps/docs/ENVIRONMENT.md`: environment settings

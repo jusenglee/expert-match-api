@@ -14,10 +14,10 @@ class QueryTextBuilder:
                 normalized_values.append(normalized)
         return normalized_values
 
+    def build_query_text(self, plan: PlannerOutput) -> str:
+        return "\n".join(self.normalize_keywords(plan.core_keywords))
+
     def build_branch_queries(self, query: str, plan: PlannerOutput) -> dict[str, str]:
         _ = query
-        query_text = self._compose_core_keyword_text(plan)
+        query_text = self.build_query_text(plan)
         return {branch: query_text for branch in BRANCHES}
-
-    def _compose_core_keyword_text(self, plan: PlannerOutput) -> str:
-        return "\n".join(self.normalize_keywords(plan.core_keywords))

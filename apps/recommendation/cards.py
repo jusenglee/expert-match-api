@@ -27,7 +27,7 @@ class CandidateCardBuilder:
             card.rank_score = round(float(normalized_score), 1)
             card.shortlist_score = card.rank_score
 
-        return sorted(cards, key=lambda item: item.rank_score, reverse=True)
+        return cards
 
     def shortlist(self, cards: list[CandidateCard], limit: int) -> list[CandidateCard]:
         return cards[:limit]
@@ -96,10 +96,9 @@ class CandidateCardBuilder:
                 "patent_cnt": payload.researcher_profile.intellectual_property_count,
                 "project_cnt": payload.researcher_profile.research_project_count,
             },
-            keyword_matched_counts={},
-            top_papers=sorted_papers[:2],
-            top_patents=sorted_patents[:1],
-            top_projects=sorted_projects[:2],
+            top_papers=sorted_papers,
+            top_patents=sorted_patents,
+            top_projects=sorted_projects,
             matched_filter_summary=matched_filter_summary,
             risks=risks,
             data_gaps=data_gaps,

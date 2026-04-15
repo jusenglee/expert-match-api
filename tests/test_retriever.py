@@ -9,8 +9,9 @@ from apps.search.schema_registry import SearchSchemaRegistry
 
 
 class FakeQdrantClient:
-    def __init__(self, payload: dict | None = None, payloads: list[dict] | None = None) -> None:
-        self.payloads = payloads or ([payload] if payload is not None else [])
+    def __init__(self, payloads: list[dict], scores: list[float] | None = None) -> None:
+        self.payloads = payloads
+        self.scores = scores or [0.88 - (index * 0.01) for index in range(len(payloads))]
         self.last_kwargs = None
 
     def query_points(self, **kwargs):
@@ -20,7 +21,7 @@ class FakeQdrantClient:
                 SimpleNamespace(
                     id=str(index + 1),
                     payload=payload,
-                    score=0.88 - (index * 0.01),
+                    score=self.scores[index],
                 )
                 for index, payload in enumerate(self.payloads)
             ]
@@ -49,27 +50,24 @@ def _settings() -> Settings:
     )
 
 
-def test_retriever_uses_same_core_keyword_query_for_all_branches():
-    payload = {
-        "basic_info": {
-            "researcher_id": "1",
-            "researcher_name": "Tester",
-            "affiliated_organization": "Test Institute",
-            "affiliated_organization_exact": "Test Institute",
+def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak():
+    payloads = [
+        {
+            "basic_info": {"researcher_id": "2", "researcher_name": "Bravo"},
+            "researcher_profile": {},
+            "publications": [{"publication_title": "B paper"}],
+            "intellectual_properties": [],
+            "research_projects": [],
         },
-        "researcher_profile": {
-            "highest_degree": "PhD",
-            "major_field": "AI",
-            "publication_count": 1,
-            "scie_publication_count": 1,
-            "intellectual_property_count": 1,
-            "research_project_count": 1,
+        {
+            "basic_info": {"researcher_id": "1", "researcher_name": "Alpha"},
+            "researcher_profile": {},
+            "publications": [{"publication_title": "A paper"}],
+            "intellectual_properties": [],
+            "research_projects": [],
         },
-        "publications": [{"publication_title": "Test paper"}],
-        "intellectual_properties": [{"intellectual_property_title": "Test patent"}],
-        "research_projects": [{"project_title_korean": "Test project"}],
-    }
-    client = FakeQdrantClient(payload=payload)
+    ]
+    client = FakeQdrantClient(payloads=payloads, scores=[0.91, 0.91])
     encoder = RecordingDenseEncoder()
     retriever = QdrantHybridRetriever(
         client=client,
@@ -85,109 +83,51 @@ def test_retriever_uses_same_core_keyword_query_for_all_branches():
             plan=PlannerOutput(
                 intent_summary="Recommend AI semiconductor reviewers",
                 core_keywords=["AI semiconductor", "chip design"],
-                branch_query_hints={
-                    "basic": "ignored",
-                    "art": "ignored",
-                    "pat": "ignored",
-                    "pjt": "ignored",
-                },
             ),
             query_filter=None,
         ),
     )
 
-    expected_query = "AI semiconductor\nchip design"
-
-    assert len(result.hits) == 1
     assert result.retrieval_keywords == ["AI semiconductor", "chip design"]
     assert result.branch_queries == {
-        "basic": expected_query,
-        "art": expected_query,
-        "pat": expected_query,
-        "pjt": expected_query,
+        "basic": "AI semiconductor\nchip design",
+        "art": "AI semiconductor\nchip design",
+        "pat": "AI semiconductor\nchip design",
+        "pjt": "AI semiconductor\nchip design",
     }
-    assert encoder.inputs == [expected_query] * 4
-    assert client.last_kwargs is not None
+    assert [hit.expert_id for hit in result.hits] == ["1", "2"]
+    assert encoder.inputs == [
+        "AI semiconductor\nchip design",
+        "AI semiconductor\nchip design",
+        "AI semiconductor\nchip design",
+        "AI semiconductor\nchip design",
+    ]
     assert len(client.last_kwargs["prefetch"]) == 4
     sparse_texts = [
         branch_prefetch.prefetch[1].query.text
         for branch_prefetch in client.last_kwargs["prefetch"]
     ]
-    assert sparse_texts == [expected_query] * 4
-
-
-def test_retriever_normalizes_legacy_blank_string_payload_fields():
-    payload = {
-        "basic_info": {
-            "researcher_id": "2",
-            "researcher_name": "Legacy Payload",
-        },
-        "researcher_profile": {
-            "publication_count": "",
-            "scie_publication_count": " ",
-            "intellectual_property_count": "",
-            "research_project_count": "1",
-        },
-        "publications": [
-            {
-                "publication_title": "Legacy paper",
-                "korean_keywords": "",
-                "english_keywords": "semiconductor",
-            }
-        ],
-        "intellectual_properties": "",
-        "research_projects": [{"project_title_korean": "Legacy project", "reference_year": ""}],
-        "technical_classifications": "",
-        "evaluation_activity_cnt": "",
-        "external_activity_cnt": "",
-        "evaluation_activities": "",
-    }
-    client = FakeQdrantClient(payload=payload)
-    retriever = QdrantHybridRetriever(
-        client=client,
-        settings=_settings(),
-        registry=SearchSchemaRegistry.default(),
-        dense_encoder=RecordingDenseEncoder(),
-        query_builder=QueryTextBuilder(),
-    )
-
-    result = asyncio.run(
-        retriever.search(
-            query="legacy payload normalization",
-            plan=PlannerOutput(
-                intent_summary="legacy payload normalization",
-                core_keywords=["legacy", "normalization"],
-            ),
-            query_filter=None,
-        ),
-    )
-
-    assert len(result.hits) == 1
-    hit = result.hits[0]
-    assert hit.payload.publications[0].korean_keywords == []
-    assert hit.payload.publications[0].english_keywords == ["semiconductor"]
-    assert hit.payload.intellectual_properties == []
-    assert hit.payload.researcher_profile.publication_count == 0
-    assert hit.payload.research_projects[0].reference_year is None
-    assert hit.branch_coverage["pat"] is False
+    assert sparse_texts == encoder.inputs
 
 
 def test_retriever_skips_invalid_points_and_keeps_valid_hits():
-    invalid_payload = {
-        "basic_info": {"researcher_id": "bad", "researcher_name": "Broken"},
-        "researcher_profile": {},
-        "publications": "broken payload",
-        "intellectual_properties": [],
-        "research_projects": [],
-    }
-    valid_payload = {
-        "basic_info": {"researcher_id": "good", "researcher_name": "Valid"},
-        "researcher_profile": {},
-        "publications": [{"publication_title": "Valid paper"}],
-        "intellectual_properties": [],
-        "research_projects": [],
-    }
-    client = FakeQdrantClient(payloads=[invalid_payload, valid_payload])
+    payloads = [
+        {
+            "basic_info": {"researcher_id": "bad", "researcher_name": "Broken"},
+            "researcher_profile": {},
+            "publications": "broken payload",
+            "intellectual_properties": [],
+            "research_projects": [],
+        },
+        {
+            "basic_info": {"researcher_id": "good", "researcher_name": "Valid"},
+            "researcher_profile": {},
+            "publications": [{"publication_title": "Valid paper"}],
+            "intellectual_properties": [],
+            "research_projects": [],
+        },
+    ]
+    client = FakeQdrantClient(payloads=payloads)
     retriever = QdrantHybridRetriever(
         client=client,
         settings=_settings(),

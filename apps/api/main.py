@@ -37,12 +37,11 @@ from apps.core.runtime_validation import (
     validate_runtime_settings,
 )
 from apps.recommendation.cards import CandidateCardBuilder
-from apps.recommendation.evidence import (
-    OpenAICompatEvidenceResolver,
-    PassThroughEvidenceResolver,
-)
-from apps.recommendation.judge import HeuristicJudge, OpenAICompatJudge
 from apps.recommendation.planner import HeuristicPlanner, OpenAICompatPlanner
+from apps.recommendation.reasoner import (
+    OpenAICompatReasonGenerator,
+    PassThroughReasonGenerator,
+)
 from apps.recommendation.service import RecommendationService
 from apps.search.encoders import HashingDenseEncoder, OpenAIEmbeddingEncoder
 from apps.search.filters import QdrantFilterCompiler
@@ -132,15 +131,10 @@ async def build_app_runtime(
         if settings.llm_backend == "heuristic"
         else OpenAICompatPlanner(settings)
     )
-    judge = (
-        HeuristicJudge()
+    reason_generator = (
+        PassThroughReasonGenerator()
         if settings.llm_backend == "heuristic"
-        else OpenAICompatJudge(settings)
-    )
-    evidence_resolver = (
-        PassThroughEvidenceResolver()
-        if settings.llm_backend == "heuristic"
-        else OpenAICompatEvidenceResolver(settings)
+        else OpenAICompatReasonGenerator(settings)
     )
 
     feedback_store = FeedbackStore(settings.feedback_db_path, settings.feedback_table)
@@ -162,13 +156,8 @@ async def build_app_runtime(
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
-        judge=judge,
-        evidence_resolver=evidence_resolver,
+        reason_generator=reason_generator,
         feedback_store=feedback_store,
-        shortlist_limit=settings.shortlist_limit,
-        use_map_reduce_judging=settings.use_map_reduce_judging,
-        final_recommendation_max=settings.final_recommendation_max,
-        final_recommendation_min=settings.final_recommendation_min,
     )
 
     validator = LiveContractValidator(
@@ -380,24 +369,19 @@ def create_app(
             "planner": result["planner"].model_dump(mode="json"),
             "planner_trace": result.get("planner_trace") or {},
             "raw_query": result.get("raw_query", normalized_query),
-            "planner_raw_keywords": (
-                (result.get("planner_trace") or {}).get("planner_raw_keywords") or []
-            ),
-            "verifier_keywords": (
-                (result.get("planner_trace") or {}).get("verifier_keywords") or []
+            "planner_keywords": (
+                (result.get("planner_trace") or {}).get("planner_keywords") or []
             ),
             "retrieval_keywords": result.get("retrieval_keywords") or [],
             "planner_retry_count": (
                 (result.get("planner_trace") or {}).get("planner_retry_count", 0)
-            ),
-            "verifier_applied": (
-                (result.get("planner_trace") or {}).get("verifier_applied", False)
             ),
             "retrieval_skipped_reason": result.get("retrieval_skipped_reason"),
             "branch_queries": result["branch_queries"],
             "include_orgs": result["planner"].include_orgs,
             "exclude_orgs": result["planner"].exclude_orgs,
             "candidate_ids": [card.expert_id for card in result["candidates"]],
+            "final_sort_policy": result.get("final_sort_policy"),
             "query_payload": service._serialize_query_payload(result["query_payload"]),
             "timers": result.get("timers") or {},
         }

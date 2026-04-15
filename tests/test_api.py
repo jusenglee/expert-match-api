@@ -22,7 +22,7 @@ class FakeRecommendationService:
                     expert_id="1",
                     name="Hong Gildong",
                     fit="높음",
-                    reasons=["Publication evidence is available."],
+                    recommendation_reason="Publication evidence is available.",
                     evidence=[{"type": "paper", "title": "Test paper"}],
                     risks=[],
                 )
@@ -31,10 +31,19 @@ class FakeRecommendationService:
             "not_selected_reasons": [],
             "trace": {
                 "planner": {},
-                "branch_queries": {"basic": "basic", "art": "paper", "pat": "patent", "pjt": "project"},
+                "planner_trace": {},
+                "reason_generation_trace": {},
+                "branch_queries": {
+                    "basic": "basic",
+                    "art": "paper",
+                    "pat": "patent",
+                    "pjt": "project",
+                },
                 "exclude_orgs": [],
                 "candidate_ids": ["1"],
-                "recommendation_evidence_summary": [{"expert_id": "1", "evidence_titles": ["Test paper"]}],
+                "recommendation_ids": ["1"],
+                "final_sort_policy": "rrf_score_desc_name_asc",
+                "top_k_used": top_k or 1,
                 "query_payload": {},
             },
         }
@@ -43,12 +52,16 @@ class FakeRecommendationService:
         class Planner:
             intent_summary = query
             hard_filters = filters_override
+            include_orgs = include_orgs
+            exclude_orgs = exclude_orgs
 
             def model_dump(self, mode="json"):
-                return {"intent_summary": self.intent_summary, "hard_filters": self.hard_filters}
-
-        Planner.exclude_orgs = exclude_orgs
-        Planner.include_orgs = include_orgs
+                return {
+                    "intent_summary": self.intent_summary,
+                    "hard_filters": self.hard_filters,
+                    "include_orgs": self.include_orgs,
+                    "exclude_orgs": self.exclude_orgs,
+                }
 
         class Card:
             expert_id = "1"
@@ -62,10 +75,21 @@ class FakeRecommendationService:
 
         return {
             "planner": Planner(),
+            "planner_trace": {"planner_keywords": ["semiconductor"]},
             "retrieved_count": 1,
             "candidates": [Card()],
-            "branch_queries": {"basic": "basic", "art": "paper", "pat": "patent", "pjt": "project"},
+            "branch_queries": {
+                "basic": "basic",
+                "art": "paper",
+                "pat": "patent",
+                "pjt": "project",
+            },
+            "retrieval_keywords": ["semiconductor"],
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
+            "raw_query": query,
+            "retrieval_skipped_reason": None,
+            "final_sort_policy": "rrf_score_desc_name_asc",
+            "timers": {},
         }
 
     def save_feedback(self, *, query, selected_expert_ids, rejected_expert_ids, notes, metadata):
