@@ -67,7 +67,7 @@ class HeuristicPlanner:
             exclude_orgs=list(exclude_orgs or []),
             task_terms=[],
             core_keywords=[],
-            top_k=top_k or 10,
+            top_k=top_k or 15,
         )
         self.last_trace = {
             "mode": "deterministic_fallback",
@@ -97,11 +97,11 @@ class OpenAICompatPlanner:
     def _build_system_prompt() -> str:
         prompt = """
                 # 역할
-                당신은 동질적인 전문가 코퍼스를 검색하는 전문가 추천 시스템의 R&D 질의 플래너입니다.
+                당신은 ***동질적인 전문가 코퍼스***를 검색하는 전문가 추천 시스템의 R&D 질의 플래너입니다.
                 당신은 전문가/평가위원을 모아놓은 qdrant 벡터DB 에 검색 할 쿼리를 만들기 위해, 사용자의 질의에서 키워드를 추출해야합니다.
             
                 # 출력 목표
-                - `core_keywords`: 기술 도메인 명사 또는 명사구만 포함(검색 쿼리용 키워드)
+                - `core_keywords`: 기술 도메인 명사 또는 명사구만 포함(검색 쿼리용 키워드)("평가위원","전문가" 금지)
                 - `task_terms`: 검색 대상이 아닌 요청, 역할, 또는 행동 용어만 포함
                 - `intent_summary`: UI/추적용 짧은 요약 문장
             
@@ -109,7 +109,7 @@ class OpenAICompatPlanner:
                 1. 사용자 질의의 주 언어를 유지하세요. 번역하거나 언어를 섞지 마세요.
                 2. 브랜치별 힌트, 바꿔쓰기, 의미 확장 표현을 생성하지 마세요.
                 3. `core_keywords`에는 도메인 개념, 기술, 재료, 분야만 포함해야 합니다.
-                4. `task_terms`에는 무엇을 검색할지가 아니라, 검색을 위해 core_keywords의 제약조건을 분류하세요( 기후변화 대응 R&D 과제 평가 경험등 ) 
+                4. `task_terms`에는 무엇을 검색할지가 아니라, 검색을 위해 core_keywords의 제약조건을 분류하세요( 기후변화 대응 R&D 과제 평가 경험, 평가위원 추천 등 ) 
                 5. 명시적으로 주어진 기관 제약만 `include_orgs`와 `exclude_orgs`에 복사하세요.
                 6. 명시적으로 지원되는 구조화 필터만 `hard_filters`에 복사하세요.
                 7. 안전한 도메인 키워드가 없으면 `core_keywords`는 빈 리스트로 반환하세요.
@@ -142,7 +142,7 @@ class OpenAICompatPlanner:
                 {
                   "intent_summary": "난접근성 화재 진압과 드론 접목 관련 전문가 탐색",
                   "core_keywords": ["난접근성 화재 진압", "드론",],
-                  "task_terms": ["전문가", "추천", "드론을 화재진압 연구에 사용한 경험"],
+                  "task_terms": ["전문가","평가위원", "추천", "드론을 화재진압 연구에 사용한 경험"],
                   "hard_filters": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
@@ -220,7 +220,7 @@ class OpenAICompatPlanner:
             "filters_override": filters_override or {},
             "include_orgs": include_orgs or [],
             "exclude_orgs": exclude_orgs or [],
-            "top_k": top_k or 10,
+            "top_k": top_k or 15,
         }
         attempts: list[dict[str, Any]] = []
 

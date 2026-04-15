@@ -14,13 +14,14 @@ from apps.domain.models import (
 )
 
 RECENT_YEARS_WINDOW = 5
-MAX_RELEVANT_PAPERS = 2
-MAX_RELEVANT_PROJECTS = 2
-MAX_RELEVANT_PATENTS = 1
-SNIPPET_MAX_LENGTH = 180
+MAX_RELEVANT_PAPERS = 4
+MAX_RELEVANT_PROJECTS = 4
+MAX_RELEVANT_PATENTS = 4
+SNIPPET_MAX_LENGTH = 10000
 
 
 class RelevantEvidenceItem(BaseModel):
+    item_id: str
     type: str
     title: str
     date: str | None = None
@@ -35,6 +36,12 @@ class RelevantEvidenceBundle(BaseModel):
     papers: list[RelevantEvidenceItem] = Field(default_factory=list)
     projects: list[RelevantEvidenceItem] = Field(default_factory=list)
     patents: list[RelevantEvidenceItem] = Field(default_factory=list)
+
+    def all_items(self) -> list[RelevantEvidenceItem]:
+        return [*self.papers, *self.projects, *self.patents]
+
+    def by_item_id(self) -> dict[str, RelevantEvidenceItem]:
+        return {item.item_id: item for item in self.all_items()}
 
 
 class EvidenceSelector(Protocol):
@@ -54,15 +61,57 @@ def _compact_text(value: str | None) -> str:
     return _normalize_text(value).replace(" ", "")
 
 
-def _build_snippet(*values: str | None) -> str | None:
-    for value in values:
-        normalized = " ".join((value or "").split())
-        if not normalized:
-            continue
-        if len(normalized) <= SNIPPET_MAX_LENGTH:
-            return normalized
-        return normalized[: SNIPPET_MAX_LENGTH - 3].rstrip() + "..."
-    return None
+def _build_rich_snippet(
+    *,
+    main_text: str | None,
+    secondary_text: str | None = None,
+    metadata: dict[str, str | None] | None = None,
+    matched_keywords: list[str] | None = None,
+) -> str | None:
+    parts: list[str] = []
+    
+    # 메타데이터 추가 (예: 학술지명, 기관명 등)
+    if metadata:
+        meta_parts = [f"[{k}: {v}]" for k, v in metadata.items() if v]
+        if meta_parts:
+            parts.append(" ".join(meta_parts))
+
+    # 주요 텍스트 추가
+    text_pool = []
+    if main_text:
+        text_pool.append(main_text)
+    if secondary_text:
+        text_pool.append(secondary_text)
+    
+    full_text = " ".join(text_pool)
+    normalized_text = " ".join(full_text.split())
+    
+    if not normalized_text:
+        return " ".join(parts) if parts else None
+
+    # 키워드 주변 문맥 추출 (간소화된 버전)
+    if matched_keywords and len(normalized_text) > 500:
+        # 첫 번째 매칭된 키워드 위치 찾기
+        best_pos = -1
+        for kw in matched_keywords:
+            pos = normalized_text.lower().find(kw.lower())
+            if pos != -1:
+                best_pos = pos
+                break
+        
+        if best_pos != -1:
+            start = max(0, best_pos - 200)
+            end = min(len(normalized_text), best_pos + 600)
+            snippet = normalized_text[start:end]
+            if start > 0: snippet = "..." + snippet
+            if end < len(normalized_text): snippet = snippet + "..."
+            parts.append(snippet)
+        else:
+            parts.append(normalized_text[:800] + "...")
+    else:
+        parts.append(normalized_text[:1000])
+        
+    return "\n".join(parts)
 
 
 def _parse_year(value: str | None) -> int | None:
@@ -137,7 +186,7 @@ class KeywordEvidenceSelector:
         keywords: list[str],
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
-        for item in publications:
+        for index, item in enumerate(publications):
             score, matched_keywords = self._score_evidence(
                 title=item.publication_title,
                 body_parts=[
@@ -153,11 +202,19 @@ class KeywordEvidenceSelector:
                 continue
             ranked.append(
                 RelevantEvidenceItem(
+                    item_id=f"paper:{index}",
                     type="paper",
                     title=item.publication_title,
                     date=item.publication_year_month,
                     detail=item.journal_name,
-                    snippet=_build_snippet(item.abstract),
+                    snippet=_build_rich_snippet(
+                        main_text=item.abstract,
+                        secondary_text=" ".join(
+                            (item.korean_keywords or []) + (item.english_keywords or [])
+                        ),
+                        metadata={"학술지": item.journal_name},
+                        matched_keywords=matched_keywords,
+                    ),
                     matched_keywords=matched_keywords,
                     match_score=score,
                 )
@@ -170,7 +227,7 @@ class KeywordEvidenceSelector:
         keywords: list[str],
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
-        for item in projects:
+        for index, item in enumerate(projects):
             score, matched_keywords = self._score_evidence(
                 title=item.display_title,
                 body_parts=[
@@ -186,13 +243,19 @@ class KeywordEvidenceSelector:
                 continue
             ranked.append(
                 RelevantEvidenceItem(
+                    item_id=f"project:{index}",
                     type="project",
                     title=item.display_title,
                     date=item.project_end_date or item.project_start_date,
                     detail=item.managing_agency or item.performing_organization,
-                    snippet=_build_snippet(
-                        item.research_objective_summary,
-                        item.research_content_summary,
+                    snippet=_build_rich_snippet(
+                        main_text=item.research_objective_summary,
+                        secondary_text=item.research_content_summary,
+                        metadata={
+                            "주관기관": item.performing_organization,
+                            "관리기관": item.managing_agency,
+                        },
+                        matched_keywords=matched_keywords,
                     ),
                     matched_keywords=matched_keywords,
                     match_score=score,
@@ -206,7 +269,7 @@ class KeywordEvidenceSelector:
         keywords: list[str],
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
-        for item in patents:
+        for index, item in enumerate(patents):
             score, matched_keywords = self._score_evidence(
                 title=item.intellectual_property_title,
                 body_parts=[
@@ -220,11 +283,20 @@ class KeywordEvidenceSelector:
                 continue
             ranked.append(
                 RelevantEvidenceItem(
+                    item_id=f"patent:{index}",
                     type="patent",
                     title=item.intellectual_property_title,
                     date=item.registration_date or item.application_date,
                     detail=item.application_registration_type
                     or item.application_country,
+                    snippet=_build_rich_snippet(
+                        main_text=None,
+                        metadata={
+                            "유형": item.application_registration_type,
+                            "국가": item.application_country,
+                        },
+                        matched_keywords=matched_keywords,
+                    ),
                     matched_keywords=matched_keywords,
                     match_score=score,
                 )

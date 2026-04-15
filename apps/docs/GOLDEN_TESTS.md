@@ -60,6 +60,40 @@
   - reason generation receives only query-relevant evidence
   - newer but irrelevant evidence is not used as direct grounding for `recommendation_reason`
 
+### 9. LLM-selected evidence alignment
+
+- Input: a query whose recommended candidate has multiple relevant evidence items
+- Expected:
+  - the LLM receives a bounded per-candidate evidence pool
+  - the LLM returns `selected_evidence_ids` from that pool
+  - final `recommendation.evidence` resolves from those selected ids instead of latest preview data
+  - invalid or empty evidence selections fall back deterministically
+
+### 10. Batched reason generation and server fallback
+
+- Input: a query whose `/recommend` Top-k is larger than 5 and whose LLM output omits or empties some candidates
+- Expected:
+  - reason generation runs in sequential batches of up to 5 candidates
+  - returned recommendations still preserve the original retrieval order
+  - omitted or empty reason candidates receive a conservative server fallback reason
+  - trace exposes per-batch candidate ids and server fallback targets
+
+### 11. Broad raw candidate context in LLM prompt
+
+- Input: a query with returned recommendation candidates
+- Expected:
+  - the LLM payload includes the bounded relevant evidence pool
+  - the same payload also includes broad raw candidate context such as retrieval grounding, evaluation activities, and full paper/project/patent summaries for the Top-k candidates
+  - external API response shape remains unchanged
+
+### 12. Retrieval score provenance trace
+
+- Input: a query with returned candidates
+- Expected:
+  - trace exposes `retrieval_score_traces`
+  - each trace item identifies the returned expert and matched branch list
+  - playground can display the primary retrieval branch and branch-local match ranks
+
 ## Acceptance Criteria
 
 - Retrieval text is built only from planner `core_keywords`.
@@ -67,5 +101,8 @@
 - `/recommend` preserves retrieval order for returned items.
 - `/recommend` sends only Top-k candidates to the LLM.
 - `/recommend` re-ranks candidate-internal evidence against planner `core_keywords` before LLM reason generation.
-- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `final_sort_policy`, and `top_k_used`.
+- `/recommend` batches reason generation in groups of up to 5 candidates.
+- `/recommend` resolves final `recommendation.evidence` from the LLM-selected relevant evidence ids.
+- `/recommend` generates a conservative fallback reason when the LLM omits a candidate or returns an empty reason.
+- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `reason_generation_trace.batches`, and `reason_generation_trace.server_fallback_reasons`.
 - Legacy verifier, multi-view retrieval, judge, and evidence-resolver traces are no longer part of the active contract.

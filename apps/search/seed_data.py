@@ -11,7 +11,7 @@ from copy import deepcopy
 from apps.domain.models import (
     BasicInfo, ResearcherProfile, PublicationEvidence, 
     IntellectualPropertyEvidence, ResearchProjectEvidence, 
-    ExpertPayload, SeedExpertRecord, SeedEvidencePoint
+    ExpertPayload, SeedEvidencePoint
 )
 from apps.search.text_utils import normalize_org_name
 
@@ -207,20 +207,6 @@ def points_from_payload(payload: ExpertPayload) -> list[SeedEvidencePoint]:
         )
 
     return points
-
-
-def record_from_payload(payload: ExpertPayload) -> SeedExpertRecord:
-    """Legacy: 가용성을 위해 유지하지만 내부적으로는 points_from_payload 사용을 권장합니다."""
-    # 하위 호환성을 위해 유지 (필요시 삭제)
-    return SeedExpertRecord(
-        point_id=payload.basic_info.researcher_id,
-        payload=payload,
-        basic_text="DEPRECATED",
-        art_text="DEPRECATED",
-        pat_text="DEPRECATED",
-        pjt_text="DEPRECATED",
-    )
-
 
 def build_synthetic_records_as_points(canonical: ExpertPayload) -> list[SeedEvidencePoint]:
     """

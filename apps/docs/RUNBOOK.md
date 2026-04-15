@@ -39,9 +39,9 @@ python -m pip install -e .[dev]
 uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 ```
 
-- **LLM 일관성 모드**: Planner와 Judge는 환경변수로 노출하지 않은 고정 저변동 샘플링(`temperature=0.0`, `top_p=0.2`, `reasoning_effort=low`, `include_reasoning=false`, `disable_thinking=true`)을 사용합니다. 운영 중 튜닝이 필요하면 코드 변경이 필요합니다.
+- **LLM 일관성 모드**: Planner와 Reasoner는 환경변수로 노출하지 않은 고정 저변동 샘플링(`temperature=0.0`, `top_p=0.2`, `reasoning_effort=low`, `include_reasoning=false`, `disable_thinking=true`)을 사용합니다. 운영 중 튜닝이 필요하면 코드 변경이 필요합니다.
 - **참고**: `NTIS_EMBEDDING_BACKEND=local` 모드 사용 시, 루트의 `multilingual-e5-large-instruct` 폴더 내에 모델 파일들이 온전히 존재해야 합니다.
-- **Judge 병렬화**: `NTIS_USE_MAP_REDUCE_JUDGING=true`이면 OpenAICompatJudge가 shortlist를 `NTIS_LLM_JUDGE_BATCH_SIZE` 단위로 나눠 내부 라운드 심사를 수행하며, 실제 LLM 호출은 `NTIS_LLM_JUDGE_MAX_CONCURRENCY` 상한으로 제한됩니다.
+- **추천 사유 생성**: `/recommend` 요청 시 LLM이 전문가별 추천 사유를 생성하며, 이는 검색 결과의 숏리스트(Top-k)를 대상으로 합니다.
 
 ## 5. 브라우저 플레이그라운드 (Playground) 활용
 

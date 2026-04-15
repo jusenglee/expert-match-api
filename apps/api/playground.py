@@ -516,6 +516,35 @@ PLAYGROUND_HTML = dedent(
 
         const escapeHtml = (val) => String(val ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         
+        function buildRetrievalTraceMap(data) {
+          const traces = data?.trace?.retrieval_score_traces || [];
+          return new Map(traces.map(item => [item.expert_id, item]));
+        }
+
+        function renderRetrievalTrace(expertId, retrievalTraceMap) {
+          const trace = retrievalTraceMap.get(expertId);
+          if (!trace) return '';
+
+          const branchMatches = trace.branch_matches || [];
+          const branchLines = branchMatches.length
+            ? `<ul style="font-size: 0.85rem; margin-top: 0.5rem">
+                ${branchMatches.map(item => `<li>${escapeHtml(item.branch)} branch rank ${escapeHtml(item.rank)} (score ${escapeHtml(item.score)})</li>`).join('')}
+              </ul>`
+            : '<div style="font-size: 0.85rem; margin-top: 0.5rem">branch match trace unavailable</div>';
+
+          return `
+            <details>
+              <summary>검색 점수 근거</summary>
+              <div style="font-size: 0.85rem; margin-top: 0.5rem">
+                <div><b>Primary branch:</b> ${escapeHtml(trace.primary_branch || 'unknown')}</div>
+                <div><b>Point ID:</b> ${escapeHtml(trace.point_id || 'unknown')}</div>
+                <div><b>Final score:</b> ${escapeHtml(trace.final_score)}</div>
+              </div>
+              ${branchLines}
+            </details>
+          `;
+        }
+        
         function pushMessage(role, html, isError = false) {
           const div = document.createElement('div');
           div.className = `msg ${role}`;
@@ -594,6 +623,7 @@ PLAYGROUND_HTML = dedent(
             if (!res.ok) throw new Error(data.detail || '요청 처리 중 오류가 발생했습니다.');
             
             let html = '';
+            const retrievalTraceMap = buildRetrievalTraceMap(data);
             if (state.endpoint === '/recommend') {
               html = `
                 <p><b>분석 요약:</b> ${escapeHtml(data.intent_summary)}</p>
@@ -604,7 +634,8 @@ PLAYGROUND_HTML = dedent(
                 ${data.recommendations.map(r => `
                   <div class="expert-card">
                     <h4>#${r.rank} ${escapeHtml(r.name)} <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500; margin-left: 0.5rem;">${escapeHtml(r.organization || '소속 미상')}</span> <span class="tag" style="margin-left: auto;">${r.fit}</span></h4>
-                    <div style="font-size: 0.9rem; margin-bottom: 0.5rem"><b>추천 사유:</b> <ul>${r.reasons.map(v => `<li>${escapeHtml(v)}</li>`).join('')}</ul></div>
+                    <div style="font-size: 0.9rem; margin-bottom: 0.5rem"><b>추천 사유:</b> ${escapeHtml(r.recommendation_reason || '')}</div>
+                    ${renderRetrievalTrace(r.expert_id, retrievalTraceMap)}
                     <details>
                       <summary>수행 증거 및 실적</summary>
                       <ul style="font-size: 0.85rem; margin-top: 0.5rem">
@@ -627,6 +658,7 @@ PLAYGROUND_HTML = dedent(
                       <div class="stat-box"><span class="label">과제</span><span class="value">${c.counts.project_cnt}</span></div>
                       <div class="stat-box"><span class="label">점수</span><span class="value">${c.shortlist_score.toFixed(2)}</span></div>
                     </div>
+                    ${renderRetrievalTrace(c.expert_id, retrievalTraceMap)}
                   </div>
                 `).join('')}
               `;

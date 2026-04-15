@@ -54,6 +54,7 @@ Current retrieval behavior:
 - `exclude_orgs` is applied after payload validation
 - if planner still returns empty `core_keywords` after retry, retrieval is skipped
 - final application-level sort is `score desc -> researcher_name asc -> expert_id asc`
+- trace includes `retrieval_score_traces` with per-hit branch-level match provenance from the branch-local fused queries
 
 ## Candidate Card Contract
 
@@ -65,7 +66,7 @@ Current behavior:
 - `rank_score` is derived from retrieval score normalization
 - `shortlist_score` equals `rank_score`
 - `top_papers`, `top_patents`, and `top_projects` are deterministic payload previews
-- `/recommend` may derive query-relevant evidence from those previews before LLM reason generation
+- `/recommend` derives a query-relevant evidence pool from those previews before LLM reason generation
 
 ## Reason Generation Contract
 
@@ -80,7 +81,7 @@ Output schema:
       "expert_id": "11008395",
       "fit": "높음",
       "recommendation_reason": "Fire-response publications and projects are present.",
-      "reasons": ["Fire-response publications and projects are present."],
+      "selected_evidence_ids": ["paper:0", "project:1"],
       "risks": []
     }
   ],
@@ -94,6 +95,11 @@ Reason generation rules:
 - the LLM does not drop candidates
 - the LLM does not create new expert ids
 - candidate-internal evidence is re-ranked against planner `core_keywords` before serialization
+- per candidate, the LLM receives up to `paper=4`, `project=4`, `patent=4` relevant evidence items
+- reason generation runs in sequential batches of up to 5 candidates
+- the LLM also receives broad raw candidate context for those same Top-k candidates, including retrieval grounding, evaluation activities, technical classifications, and full payload-backed paper/project/patent summaries
+- each evidence item includes a stable `evidence_id`
+- the LLM returns `selected_evidence_ids` from only that provided pool
 - only selected relevant evidence is provided as direct grounding for `recommendation_reason`
 - if no relevant evidence is selected for a candidate, the LLM must not hallucinate direct query evidence
 - output is normalized back to the original candidate order
@@ -105,8 +111,10 @@ Reason generation rules:
 
 - taking the search-ordered Top-k candidates
 - inserting LLM-generated `fit` and `recommendation_reason`
-- exposing `reasons` as a backward-compatible single-item alias of `recommendation_reason`
-- building payload-backed `evidence` deterministically from the candidate preview data
+- resolving LLM-selected evidence ids back to the relevant evidence pool
+- falling back to the top relevant evidence item when the LLM does not select a valid id
+- falling back to a single `profile` evidence item only when no relevant evidence exists
+- generating a conservative server fallback reason when the LLM omits a candidate or returns an empty `recommendation_reason`
 - returning the same order received from retrieval
 
 `POST /search/candidates` returns the search-ordered candidate list without LLM reason generation.
@@ -118,13 +126,17 @@ Trace keys currently emitted:
 - `planner`
 - `planner_trace`
 - `reason_generation_trace` (`/recommend` only)
+- `reason_generation_trace.batches` (`/recommend` only, nested)
 - `reason_generation_trace.evidence_selection` (`/recommend` only, nested)
+- `reason_generation_trace.selected_evidence` (`/recommend` only, nested)
+- `reason_generation_trace.server_fallback_reasons` (`/recommend` only, nested)
 - `raw_query`
 - `planner_keywords`
 - `retrieval_keywords`
 - `planner_retry_count`
 - `retrieval_skipped_reason`
 - `branch_queries`
+- `retrieval_score_traces`
 - `final_sort_policy`
 - `candidate_ids`
 - `recommendation_ids` (`/recommend` only)

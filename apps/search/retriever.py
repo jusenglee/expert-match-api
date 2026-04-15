@@ -30,6 +30,7 @@ class RetrievalResult:
     query_payload: dict[str, Any]
     branch_queries: dict[str, str]
     retrieval_keywords: list[str]
+    retrieval_score_traces: list[dict[str, Any]]
 
 
 class QdrantHybridRetriever:
@@ -88,6 +89,94 @@ class QdrantHybridRetriever:
             ),
         )
 
+    @staticmethod
+    def _sort_hit_records(
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            records,
+            key=lambda record: (
+                -record["hit"].score,
+                " ".join(
+                    (record["hit"].payload.basic_info.researcher_name or "").split()
+                ),
+                record["hit"].expert_id,
+            ),
+        )
+
+    @staticmethod
+    def _point_key(point_id: Any) -> str:
+        return str(point_id)
+
+    @staticmethod
+    def _infer_point_branch(point_id: str) -> str | None:
+        for branch in BRANCHES:
+            if point_id.endswith(f"_{branch}") or f"_{branch}_" in point_id:
+                return branch
+        return None
+
+    def _build_branch_query_payload(
+        self,
+        *,
+        branch: str,
+        dense_query: list[float],
+        sparse_query: models.Document,
+        query_filter: models.Filter | None,
+    ) -> dict[str, Any]:
+        return {
+            "collection_name": self.settings.qdrant_collection_name,
+            "prefetch": [
+                models.Prefetch(
+                    query=dense_query,
+                    using=self.registry.dense_vector_by_branch[branch],
+                    limit=self.settings.branch_prefetch_limit,
+                    filter=query_filter,
+                ),
+                models.Prefetch(
+                    query=sparse_query,
+                    using=self.registry.sparse_vector_by_branch[branch],
+                    limit=self.settings.branch_prefetch_limit,
+                    filter=query_filter,
+                ),
+            ],
+            "query": models.FusionQuery(fusion=models.Fusion.RRF),
+            "query_filter": query_filter,
+            "limit": self.settings.branch_output_limit,
+            "with_payload": False,
+            "with_vectors": False,
+        }
+
+    @staticmethod
+    def _build_retrieval_score_trace(
+        *,
+        expert_id: str,
+        point_id: str,
+        final_score: float,
+        branch_matches: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        sorted_branch_matches = sorted(
+            branch_matches,
+            key=lambda item: (item["rank"], -item["score"], item["branch"]),
+        )
+        primary_branch = (
+            sorted_branch_matches[0]["branch"] if sorted_branch_matches else None
+        )
+        return {
+            "expert_id": expert_id,
+            "point_id": point_id,
+            "point_branch_hint": QdrantHybridRetriever._infer_point_branch(point_id),
+            "final_score": round(float(final_score), 6),
+            "primary_branch": primary_branch,
+            "branch_matches": [
+                {
+                    "branch": item["branch"],
+                    "rank": item["rank"],
+                    "score": round(float(item["score"]), 6),
+                }
+                for item in sorted_branch_matches
+            ],
+        }
+
     async def search(
         self,
         *,
@@ -101,6 +190,7 @@ class QdrantHybridRetriever:
             "Generated branch queries:\n%s",
             pprint.pformat(branch_queries, indent=2, width=100),
         )
+        branch_query_payloads: dict[str, dict[str, Any]] = {}
         prefetches: list[models.Prefetch] = []
 
         for branch in BRANCHES:
@@ -116,23 +206,16 @@ class QdrantHybridRetriever:
                 text=branch_queries[branch],
                 model=self.settings.bm25_model_name,
             )
+            branch_query_payloads[branch] = self._build_branch_query_payload(
+                branch=branch,
+                dense_query=dense_query,
+                sparse_query=sparse_query,
+                query_filter=query_filter,
+            )
 
             prefetches.append(
                 models.Prefetch(
-                    prefetch=[
-                        models.Prefetch(
-                            query=dense_query,
-                            using=self.registry.dense_vector_by_branch[branch],
-                            limit=self.settings.branch_prefetch_limit,
-                            filter=query_filter,
-                        ),
-                        models.Prefetch(
-                            query=sparse_query,
-                            using=self.registry.sparse_vector_by_branch[branch],
-                            limit=self.settings.branch_prefetch_limit,
-                            filter=query_filter,
-                        ),
-                    ],
+                    prefetch=branch_query_payloads[branch]["prefetch"],
                     query=models.FusionQuery(fusion=models.Fusion.RRF),
                     limit=self.settings.branch_output_limit,
                     filter=query_filter,
@@ -161,10 +244,45 @@ class QdrantHybridRetriever:
             ),
         )
         with Timer() as timer:
-            points = await asyncio.to_thread(self.client.query_points, **query_payload)
+            query_results = await asyncio.gather(
+                asyncio.to_thread(self.client.query_points, **query_payload),
+                *[
+                    asyncio.to_thread(self.client.query_points, **branch_payload)
+                    for branch_payload in branch_query_payloads.values()
+                ],
+                return_exceptions=True,
+            )
+        if isinstance(query_results[0], Exception):
+            raise query_results[0]
+        points = query_results[0]
         logger.info("Qdrant search finished: elapsed_ms=%.2f", timer.elapsed_ms)
 
-        hits: list[SearchHit] = []
+        branch_trace_map: dict[str, list[dict[str, Any]]] = {}
+        branch_query_results = dict(zip(BRANCHES, query_results[1:]))
+        for branch, branch_result in branch_query_results.items():
+            if isinstance(branch_result, Exception):
+                logger.warning(
+                    "Skipping retrieval branch trace for %s: %s",
+                    branch,
+                    branch_result,
+                )
+                continue
+            branch_points = getattr(branch_result, "points", branch_result)
+            for rank, point in enumerate(branch_points, start=1):
+                point_id = getattr(point, "id", None)
+                if point_id is None and isinstance(point, dict):
+                    point_id = point.get("id")
+                if point_id is None:
+                    continue
+                branch_trace_map.setdefault(self._point_key(point_id), []).append(
+                    {
+                        "branch": branch,
+                        "rank": rank,
+                        "score": float(getattr(point, "score", 0.0)),
+                    }
+                )
+
+        hit_records: list[dict[str, Any]] = []
         skipped_invalid_payloads = 0
         point_list = getattr(points, "points", points)
         for point in point_list:
@@ -188,7 +306,7 @@ class QdrantHybridRetriever:
                 continue
 
             data_presence_flags = {
-                "basic": True,
+                "basic": False,
                 "art": bool(payload.publications),
                 "pat": bool(payload.intellectual_properties),
                 "pjt": bool(payload.research_projects),
@@ -210,16 +328,46 @@ class QdrantHybridRetriever:
                 if should_exclude:
                     continue
 
-            hits.append(
-                SearchHit(
-                    expert_id=payload.basic_info.researcher_id,
-                    score=float(getattr(point, "score", 0.0)),
-                    payload=payload,
-                    data_presence_flags=data_presence_flags,
-                )
+            hit = SearchHit(
+                expert_id=payload.basic_info.researcher_id,
+                score=float(getattr(point, "score", 0.0)),
+                payload=payload,
+                data_presence_flags=data_presence_flags,
+            )
+            point_key = self._point_key(point_id)
+            hit_records.append(
+                {
+                    "hit": hit,
+                    "point_id": point_key,
+                    "branch_matches": branch_trace_map.get(point_key, []),
+                }
             )
 
-        hits = self._sort_hits(hits)
+        hit_records = self._sort_hit_records(hit_records)
+        hits = [record["hit"] for record in hit_records]
+        trace_gap_records = [
+            {
+                "expert_id": record["hit"].expert_id,
+                "point_id": record["point_id"],
+            }
+            for record in hit_records
+            if not record["branch_matches"]
+        ]
+        retrieval_score_traces = [
+            self._build_retrieval_score_trace(
+                expert_id=record["hit"].expert_id,
+                point_id=record["point_id"],
+                final_score=record["hit"].score,
+                branch_matches=record["branch_matches"],
+            )
+            for record in hit_records
+        ]
+        if trace_gap_records:
+            logger.warning(
+                "Retrieval score traces missing branch matches: count=%d samples=%s",
+                len(trace_gap_records),
+                trace_gap_records[:5],
+            )
 
         if skipped_invalid_payloads:
             logger.info(
@@ -236,4 +384,5 @@ class QdrantHybridRetriever:
             query_payload=query_payload,
             branch_queries=branch_queries,
             retrieval_keywords=retrieval_keywords,
+            retrieval_score_traces=retrieval_score_traces,
         )

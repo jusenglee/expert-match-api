@@ -12,10 +12,16 @@ class FakeQdrantClient:
     def __init__(self, payloads: list[dict], scores: list[float] | None = None) -> None:
         self.payloads = payloads
         self.scores = scores or [0.88 - (index * 0.01) for index in range(len(payloads))]
-        self.last_kwargs = None
+        self.calls: list[dict] = []
+        self.main_kwargs = None
+        self.branch_kwargs: list[dict] = []
 
     def query_points(self, **kwargs):
-        self.last_kwargs = kwargs
+        self.calls.append(kwargs)
+        if kwargs.get("with_payload"):
+            self.main_kwargs = kwargs
+        else:
+            self.branch_kwargs.append(kwargs)
         return SimpleNamespace(
             points=[
                 SimpleNamespace(
@@ -102,12 +108,22 @@ def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak
         "AI semiconductor\nchip design",
         "AI semiconductor\nchip design",
     ]
-    assert len(client.last_kwargs["prefetch"]) == 4
+    assert client.main_kwargs is not None
+    assert len(client.main_kwargs["prefetch"]) == 4
     sparse_texts = [
         branch_prefetch.prefetch[1].query.text
-        for branch_prefetch in client.last_kwargs["prefetch"]
+        for branch_prefetch in client.main_kwargs["prefetch"]
     ]
     assert sparse_texts == encoder.inputs
+    assert len(client.branch_kwargs) == 4
+    assert len(result.retrieval_score_traces) == 2
+    assert result.retrieval_score_traces[0]["expert_id"] == "1"
+    assert {item["branch"] for item in result.retrieval_score_traces[0]["branch_matches"]} == {
+        "basic",
+        "art",
+        "pat",
+        "pjt",
+    }
 
 
 def test_retriever_skips_invalid_points_and_keeps_valid_hits():
@@ -149,3 +165,5 @@ def test_retriever_skips_invalid_points_and_keeps_valid_hits():
 
     assert len(result.hits) == 1
     assert result.hits[0].expert_id == "good"
+    assert len(result.retrieval_score_traces) == 1
+    assert result.retrieval_score_traces[0]["expert_id"] == "good"

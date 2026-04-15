@@ -57,6 +57,7 @@ def test_selector_is_case_insensitive_for_english_keywords():
 
     assert bundles["1"].papers[0].title == "Medical Imaging Assessment for CT"
     assert bundles["1"].papers[0].matched_keywords == ["medical imaging"]
+    assert bundles["1"].papers[0].item_id == "paper:0"
 
 
 def test_selector_prefers_keyword_matched_evidence_over_newer_irrelevant_items():
@@ -88,32 +89,32 @@ def test_selector_enforces_branch_limits():
     card.top_papers = [
         PublicationEvidence(
             publication_title=f"Medical imaging paper {index}",
-            publication_year_month=f"2024-0{index}",
+            publication_year_month=f"2024-{index:02d}",
             abstract="Imaging",
         )
-        for index in range(1, 4)
+        for index in range(1, 6)
     ]
     card.top_projects = [
         ResearchProjectEvidence(
             project_title_korean=f"의료영상 과제 {index}",
-            project_end_date=f"2024-0{index}-01",
+            project_end_date=f"2024-{index:02d}-01",
             research_objective_summary="의료영상 분석",
         )
-        for index in range(1, 4)
+        for index in range(1, 6)
     ]
     card.top_patents = [
         IntellectualPropertyEvidence(
             intellectual_property_title=f"medical imaging patent {index}",
-            application_date=f"2024-0{index}-01",
+            application_date=f"2024-{index:02d}-01",
         )
-        for index in range(1, 3)
+        for index in range(1, 6)
     ]
 
     bundles = selector.select(candidates=[card], plan=_plan("medical imaging", "의료영상"))
 
-    assert len(bundles["1"].papers) == 2
-    assert len(bundles["1"].projects) == 2
-    assert len(bundles["1"].patents) == 1
+    assert len(bundles["1"].papers) == 4
+    assert len(bundles["1"].projects) == 4
+    assert len(bundles["1"].patents) == 4
 
 
 def test_selector_returns_empty_relevant_evidence_when_keywords_are_empty():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import apps.api.main as main_module
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from apps.api.main import create_app
 from apps.api.schemas import RecommendationResponse, ReadinessResponse
@@ -42,6 +43,18 @@ class FakeRecommendationService:
                 "exclude_orgs": [],
                 "candidate_ids": ["1"],
                 "recommendation_ids": ["1"],
+                "retrieval_score_traces": [
+                    {
+                        "expert_id": "1",
+                        "point_id": "1_basic",
+                        "point_branch_hint": "basic",
+                        "final_score": 17.0,
+                        "primary_branch": "basic",
+                        "branch_matches": [
+                            {"branch": "basic", "rank": 1, "score": 17.0}
+                        ],
+                    }
+                ],
                 "final_sort_policy": "rrf_score_desc_name_asc",
                 "top_k_used": top_k or 1,
                 "query_payload": {},
@@ -49,12 +62,7 @@ class FakeRecommendationService:
         }
 
     async def search_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
-        class Planner:
-            intent_summary = query
-            hard_filters = filters_override
-            include_orgs = include_orgs
-            exclude_orgs = exclude_orgs
-
+        class Planner(SimpleNamespace):
             def model_dump(self, mode="json"):
                 return {
                     "intent_summary": self.intent_summary,
@@ -67,14 +75,24 @@ class FakeRecommendationService:
             expert_id = "1"
             name = "Hong Gildong"
             organization = "Test Institute"
-            branch_coverage = {"basic": True, "art": True, "pat": False, "pjt": True}
+            branch_presence_flags = {
+                "basic": True,
+                "art": True,
+                "pat": False,
+                "pjt": True,
+            }
             counts = {"article_cnt": 2, "scie_cnt": 1, "patent_cnt": 0, "project_cnt": 3}
             data_gaps = ["Patent evidence is missing."]
             risks = []
             shortlist_score = 17.0
 
         return {
-            "planner": Planner(),
+            "planner": Planner(
+                intent_summary=query,
+                hard_filters=filters_override,
+                include_orgs=include_orgs,
+                exclude_orgs=exclude_orgs,
+            ),
             "planner_trace": {"planner_keywords": ["semiconductor"]},
             "retrieved_count": 1,
             "candidates": [Card()],
@@ -85,6 +103,18 @@ class FakeRecommendationService:
                 "pjt": "project",
             },
             "retrieval_keywords": ["semiconductor"],
+            "retrieval_score_traces": [
+                {
+                    "expert_id": "1",
+                    "point_id": "1_basic",
+                    "point_branch_hint": "basic",
+                    "final_score": 17.0,
+                    "primary_branch": "basic",
+                    "branch_matches": [
+                        {"branch": "basic", "rank": 1, "score": 17.0}
+                    ],
+                }
+            ],
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
             "raw_query": query,
             "retrieval_skipped_reason": None,
@@ -128,8 +158,12 @@ def test_recommend_endpoint_contract():
     assert response.status_code == 200
     parsed = RecommendationResponse.model_validate(response.json())
     assert parsed.searched_branches == ["basic", "art", "pat", "pjt"]
+    assert response.json()["trace"]["retrieval_score_traces"][0]["primary_branch"] == "basic"
     assert response.json()["recommendations"][0]["fit"] == "높음"
-    assert response.json()["recommendations"][0]["reasons"] == ["Publication evidence is available."]
+    assert (
+        response.json()["recommendations"][0]["recommendation_reason"]
+        == "Publication evidence is available."
+    )
 
 
 def test_playground_route_serves_local_chat_ui():
@@ -146,7 +180,24 @@ def test_playground_route_serves_local_chat_ui():
     assert 'id="chatForm"' in response.text
     assert "/recommend" in response.text
     assert "/search/candidates" in response.text
+    assert "Primary branch:" in response.text
     assert "Readiness details" in response.text
+
+
+def test_search_candidates_endpoint_includes_retrieval_score_trace():
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=FakeRecommendationService(),
+        validator=FakeValidator(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/search/candidates",
+            json={"query": "Recommend AI semiconductor reviewers"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["trace"]["retrieval_score_traces"][0]["primary_branch"] == "basic"
 
 
 def test_feedback_endpoint_contract():

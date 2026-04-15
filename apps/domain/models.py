@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 BranchName = Literal["basic", "art", "pat", "pjt"]
 
@@ -56,18 +56,6 @@ def _normalize_optional_int(value: Any) -> Any:
         except ValueError:
             return value
     return value
-
-
-def _backfill_branch_flags(
-    data: Any, *, source_key: str = "branch_coverage", target_key: str
-) -> Any:
-    if not isinstance(data, dict):
-        return data
-    if target_key in data or source_key not in data:
-        return data
-    normalized = dict(data)
-    normalized[target_key] = normalized[source_key]
-    return normalized
 
 
 class BasicInfo(BaseModel):
@@ -199,15 +187,6 @@ class SeedEvidencePoint(BaseModel):
     payload: ExpertPayload
 
 
-class SeedExpertRecord(BaseModel):
-    point_id: str
-    payload: ExpertPayload
-    basic_text: str
-    art_text: str
-    pat_text: str
-    pjt_text: str
-
-
 class PlannerOutput(BaseModel):
     intent_summary: str
     hard_filters: dict[str, Any] = Field(default_factory=dict)
@@ -230,16 +209,6 @@ class SearchHit(BaseModel):
     branch: BranchName | None = None
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _backfill_legacy_branch_coverage(cls, data: Any) -> Any:
-        return _backfill_branch_flags(data, target_key="data_presence_flags")
-
-    @computed_field
-    @property
-    def branch_coverage(self) -> dict[BranchName, bool]:
-        return self.data_presence_flags
-
 
 class GroupedSearchHit(BaseModel):
     expert_id: str
@@ -247,34 +216,12 @@ class GroupedSearchHit(BaseModel):
     hits: list[SearchHit]
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _backfill_legacy_branch_coverage(cls, data: Any) -> Any:
-        return _backfill_branch_flags(data, target_key="data_presence_flags")
-
-    @computed_field
-    @property
-    def branch_coverage(self) -> dict[BranchName, bool]:
-        return self.data_presence_flags
-
 
 class EvidenceItem(BaseModel):
     type: Literal["paper", "patent", "project", "profile"]
     title: str
     date: str | None = None
     detail: str | None = None
-
-    @field_validator("type", mode="before")
-    @classmethod
-    def _normalize_evidence_type(cls, value: Any) -> Any:
-        branch_alias = {
-            "pjt": "project",
-            "art": "paper",
-            "pat": "patent",
-        }
-        if isinstance(value, str):
-            return branch_alias.get(value.strip().lower(), value)
-        return value
 
 
 class CandidateCard(BaseModel):
@@ -286,6 +233,9 @@ class CandidateCard(BaseModel):
     major: str | None = None
     branch_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
+    technical_classifications: list[str] = Field(default_factory=list)
+    evaluation_activity_cnt: int = 0
+    evaluation_activities: list[EvaluationActivity] = Field(default_factory=list)
     top_papers: list[PublicationEvidence] = Field(default_factory=list)
     top_patents: list[IntellectualPropertyEvidence] = Field(default_factory=list)
     top_projects: list[ResearchProjectEvidence] = Field(default_factory=list)
@@ -294,16 +244,6 @@ class CandidateCard(BaseModel):
     data_gaps: list[str] = Field(default_factory=list)
     shortlist_score: float = 0.0
     rank_score: float = 0.0
-
-    @model_validator(mode="before")
-    @classmethod
-    def _backfill_legacy_branch_coverage(cls, data: Any) -> Any:
-        return _backfill_branch_flags(data, target_key="branch_presence_flags")
-
-    @computed_field
-    @property
-    def branch_coverage(self) -> dict[BranchName, bool]:
-        return self.branch_presence_flags
 
 
 class RecommendationDecision(BaseModel):
@@ -316,9 +256,3 @@ class RecommendationDecision(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0
-
-    @computed_field(return_type=list[str])
-    @property
-    def reasons(self) -> list[str]:
-        """Backward-compatible alias for older frontends."""
-        return [self.recommendation_reason] if self.recommendation_reason else []

@@ -28,6 +28,7 @@ Planner does not:
 - runs dense + sparse search per branch
 - fuses each branch with RRF
 - fuses branch outputs with RRF
+- records per-hit branch provenance in `retrieval_score_traces`
 - applies deterministic final sorting:
   - `score desc`
   - `name asc` on score ties
@@ -48,10 +49,13 @@ Behavior:
 
 - selects ordered Top-k candidates
 - re-ranks each candidate's internal evidence against planner `core_keywords`
-- sends only those candidates to the LLM
-- receives `fit` and `recommendation_reason` grounded on the selected relevant evidence
+- builds an LLM evidence pool of up to `paper=4`, `project=4`, `patent=4` per candidate
+- sends only those candidates and that evidence pool to the LLM in sequential batches of up to 5 candidates
+- sends additional raw candidate context for those same Top-k candidates, including retrieval grounding, evaluation activities, technical classifications, and full paper/project/patent summaries
+- receives `fit`, `recommendation_reason`, and selected evidence ids grounded on the provided pool
 - keeps the original retrieval order
-- builds deterministic payload-backed evidence
+- resolves final `recommendation.evidence` from the LLM-selected evidence ids with deterministic fallback
+- generates a conservative server fallback reason when the LLM omits a candidate or returns an empty reason
 
 The LLM does not:
 
@@ -74,12 +78,17 @@ Current active trace fields:
 - `planner`
 - `planner_trace`
 - `reason_generation_trace`
+- `reason_generation_trace.batches`
+- `reason_generation_trace.evidence_selection`
+- `reason_generation_trace.selected_evidence`
+- `reason_generation_trace.server_fallback_reasons`
 - `raw_query`
 - `planner_keywords`
 - `retrieval_keywords`
 - `planner_retry_count`
 - `retrieval_skipped_reason`
 - `branch_queries`
+- `retrieval_score_traces`
 - `final_sort_policy`
 - `candidate_ids`
 - `recommendation_ids`
