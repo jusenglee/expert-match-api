@@ -211,15 +211,16 @@ class OpenAICompatReasonGenerator:
         [배경 및 데이터 활용]
         - 이 후보자들은 시스템에 의해 질의와 관련된 인물로 이미 판별된 상태입니다.
         - `relevant_papers`, `relevant_projects`, `relevant_patents`와 같은 직접적인 증거와 함께, `technical_classifications`, `evaluation_activities` 등의 부가 컨텍스트를 최대한 활용하세요.
-        - **[중요]** 만약 제공된 증거만으로 사용자 질의와의 직접적인 연관성이 다소 부족해 보이더라도, 후보자의 전공, 소속, 과거 이력 등을 바탕으로 유추하여 어떻게든 합리적이고 긍정적인 추천 사유를 생성해야 합니다 (합리적인 수준의 유추/부분적 환각 허용).
+        - **[중요]** 만약 제공된 증거만으로 사용자 질의와의 직접적인 연관성이 다소 부족해 보이더라도, 후보자의 전공, 소속, 과거 이력 등을 바탕으로 유추하여 어떻게든 합리적이고 긍정적인 추천 사유를 생성해야 합니다.
         - 증거를 인용할 때는 반드시 제공된 증거 ID(`relevant_*`에 있는 ID)만 사용하세요.
 
         [출력 규칙]
         - `fit`은 다음 중 하나여야 합니다: {FIT_HIGH}, {FIT_MEDIUM}, {FIT_NORMAL}
         - `recommendation_reason`은 1~2문장의 간결하고 구체적인 한국어 문장으로 작성하며, 320자를 넘지 마세요.
-        - `selected_evidence_ids`는 제공된 `evidence_id` 문자열을 그대로 복사해서 최대 {MAX_SELECTED_EVIDENCE_IDS}개까지 선택하세요.
+        - `recommendation_reason`에는 반드시 해당 `expert_id` 본인의 이름만 사용하세요. 배치 내 다른 후보자의 이름을 절대 포함하지 마세요.
+        - `selected_evidence_ids`는 해당 후보자의 `available_evidence_ids` 목록에 있는 값만 그대로 복사해서 최대 {MAX_SELECTED_EVIDENCE_IDS}개까지 선택하세요.
         - `selected_evidence_ids`에는 `paper:<number>`, `project:<number>`, `patent:<number>` 형식의 ID만 넣으세요.
-        - `selected_evidence_ids`에 날짜, 제목, 범위 표기, 또는 임의로 만든 ID를 넣지 마세요.
+        - `available_evidence_ids`에 없는 ID(예: 범위를 벗어난 인덱스, 임의로 만든 ID, 날짜, 제목)는 절대 넣지 마세요.
         - 적절한 직접 증거 ID가 없으면 `selected_evidence_ids`는 빈 배열(`[]`)로 두세요.
         - `risks`는 매우 짧고 사실적인 유의사항(예: 최근 실적 부족, 특정 분야 편중 등)만 적거나 비워두세요.
 
@@ -491,6 +492,17 @@ class OpenAICompatReasonGenerator:
                         relevant_bundle.projects,
                         limit=profile["relevant_limit"],
                         profile=profile,
+                    ),
+                    "available_evidence_ids": sorted(
+                        {
+                            item.item_id
+                            for item in [
+                                *relevant_bundle.papers[: profile["relevant_limit"]],
+                                *relevant_bundle.patents[: profile["relevant_limit"]],
+                                *relevant_bundle.projects[: profile["relevant_limit"]],
+                            ]
+                            if item.item_id
+                        }
                     ),
                     "all_papers": cls._serialize_all_publications(
                         candidate.top_papers,
@@ -768,6 +780,9 @@ class OpenAICompatReasonGenerator:
             {"use_tools": False, "profile": RETRY_PAYLOAD_PROFILE},
         ]
         attempt_history: list[dict[str, Any]] = []
+        expected_candidate_ids = [candidate.expert_id for candidate in candidates]
+        last_successful_output: ReasonGenerationOutput | None = None
+        last_successful_trace: dict[str, Any] | None = None
 
         for retry_index, attempt_spec in enumerate(attempt_specs):
             try:
@@ -781,8 +796,42 @@ class OpenAICompatReasonGenerator:
                     use_tools=attempt_spec["use_tools"],
                     profile=attempt_spec["profile"],
                 )
+                last_successful_output = output
+                last_successful_trace = dict(trace)
+                returned_ids = list(trace.get("returned_ids", []))
+                is_incomplete = (
+                    len(returned_ids) != len(expected_candidate_ids)
+                    or set(returned_ids) != set(expected_candidate_ids)
+                )
+                if is_incomplete and retry_index < len(attempt_specs) - 1:
+                    failed_mode = (
+                        "tool_call" if attempt_spec["use_tools"] else "json_fallback_retry"
+                    )
+                    reason = (
+                        "incomplete candidate ids: "
+                        f"expected={expected_candidate_ids} returned={returned_ids}"
+                    )
+                    logger.warning(
+                        "Reason generator %s attempt incomplete: retry=%d reason=%s",
+                        failed_mode,
+                        retry_index,
+                        reason,
+                    )
+                    attempt_history.append(
+                        {
+                            "mode": failed_mode,
+                            "retry_index": retry_index,
+                            "prompt_budget_mode": attempt_spec["profile"]["name"],
+                            "trim_applied": bool(
+                                attempt_spec["profile"]["trim_applied"]
+                            ),
+                            "reason": reason,
+                        }
+                    )
+                    continue
                 trace["retry_count"] = retry_index
                 trace["attempts"] = [*attempt_history, dict(trace)]
+                trace["reason_generation_incomplete"] = is_incomplete
                 self.last_trace = trace
                 return output
             except Exception as exc:
@@ -804,6 +853,16 @@ class OpenAICompatReasonGenerator:
                         "reason": str(exc),
                     }
                 )
+
+        if last_successful_output is not None and last_successful_trace is not None:
+            last_successful_trace["retry_count"] = len(attempt_specs) - 1
+            last_successful_trace["attempts"] = [
+                *attempt_history,
+                dict(last_successful_trace),
+            ]
+            last_successful_trace["reason_generation_incomplete"] = True
+            self.last_trace = last_successful_trace
+            return last_successful_output
 
         logger.warning(
             "Reason generator fallback activated after retries: attempts=%s",
@@ -844,4 +903,4 @@ class OpenAICompatReasonGenerator:
             ),
             "attempts": attempt_history,
         }
-        return fallback_output
+        re

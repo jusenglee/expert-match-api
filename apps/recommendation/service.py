@@ -17,6 +17,7 @@ from apps.recommendation.planner import Planner
 from apps.recommendation.reasoner import (
     ReasonGenerationOutput,
     ReasonGenerator,
+    ReasonedCandidate,
     VALID_EVIDENCE_ID_PATTERN,
 )
 from apps.search.filters import QdrantFilterCompiler
@@ -233,11 +234,21 @@ class RecommendationService:
                 relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
                 retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
             )
+            reason_output, retry_trace = await self._retry_reason_generation_for_candidates(
+                query=query,
+                plan=plan,
+                candidates=shortlist,
+                reason_output=reason_output,
+                batch_traces=reason_batch_traces,
+                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+                retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+            )
 
         reason_generation_trace = self._build_reason_generation_trace(
             candidates=shortlist,
             reason_output=reason_output,
             batch_traces=reason_batch_traces,
+            retry_trace=retry_trace,
         )
         evidence_selection_trace = self._extract_component_trace(self.evidence_selector)
         if evidence_selection_trace is not None:
@@ -251,6 +262,9 @@ class RecommendationService:
             shortlist,
             reason_output,
             relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            reason_generation_failed_candidate_ids=list(
+                retry_trace.get("reason_generation_failed_candidate_ids", [])
+            ),
         )
         reason_generation_trace = dict(reason_generation_trace)
         reason_generation_trace["selected_evidence"] = selected_evidence_trace
@@ -330,6 +344,88 @@ class RecommendationService:
             for index in range(0, len(candidates), batch_size)
         ]
 
+    async def _run_single_batch(
+        self,
+        *,
+        batch_index: int,
+        batch_total: int,
+        candidate_batch: list[CandidateCard],
+        query: str,
+        plan: PlannerOutput,
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]],
+    ) -> tuple[ReasonGenerationOutput, dict[str, Any]]:
+        """단일 배치를 실행하고 (output, trace) 쌍을 반환합니다.
+        last_trace 공유 충돌을 피하기 위해 generate() 직후 trace를 즉시 캡처합니다."""
+        batch_candidate_ids = [candidate.expert_id for candidate in candidate_batch]
+        logger.info(
+            "Reason generation batch started: batch=%d/%d size=%d candidate_ids=%s",
+            batch_index,
+            batch_total,
+            len(candidate_batch),
+            batch_candidate_ids,
+        )
+        batch_output = await self.reason_generator.generate(
+            query=query,
+            plan=plan,
+            candidates=candidate_batch,
+            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+        )
+        # generate() 완료 직후 trace 즉시 캡처 (병렬 실행 시 덮어쓰기 방지)
+        raw_trace = dict(self._extract_component_trace(self.reason_generator) or {})
+        batch_trace = {
+            "batch_index": batch_index,
+            "batch_size": len(candidate_batch),
+            "candidate_ids": batch_candidate_ids,
+            "returned_ids": list(raw_trace.get("returned_ids", [])),
+            "missing_candidate_ids": list(
+                raw_trace.get("missing_candidate_ids", [])
+            ),
+            "empty_reason_candidate_ids": list(
+                raw_trace.get("empty_reason_candidate_ids", [])
+            ),
+            "empty_selected_evidence_candidate_ids": list(
+                raw_trace.get("empty_selected_evidence_candidate_ids", [])
+            ),
+            "invalid_selected_evidence_candidate_ids": list(
+                raw_trace.get("invalid_selected_evidence_candidate_ids", [])
+            ),
+            "invalid_selected_evidence_ids_by_candidate": dict(
+                raw_trace.get("invalid_selected_evidence_ids_by_candidate", {})
+            ),
+            "mode": raw_trace.get("mode", "unknown"),
+            "seed": raw_trace.get("seed"),
+            "retry_count": raw_trace.get("retry_count", 0),
+            "returned_ratio": raw_trace.get(
+                "returned_ratio",
+                round(
+                    len(list(raw_trace.get("returned_ids", []))) / len(candidate_batch),
+                    3,
+                )
+                if candidate_batch
+                else 0.0,
+            ),
+            "prompt_budget_mode": raw_trace.get("prompt_budget_mode"),
+            "trim_applied": raw_trace.get("trim_applied", False),
+            "payload_token_estimate": raw_trace.get("payload_token_estimate"),
+            "attempts": list(raw_trace.get("attempts", [])),
+            "raw_output_count": raw_trace.get(
+                "raw_output_count", len(batch_output.items)
+            ),
+            "output_count": raw_trace.get("output_count", len(batch_output.items)),
+        }
+        logger.info(
+            "Reason generation batch completed: batch=%d/%d size=%d returned=%d missing=%d empty_reasons=%d",
+            batch_index,
+            batch_total,
+            len(candidate_batch),
+            len(batch_trace["returned_ids"]),
+            len(batch_trace["missing_candidate_ids"]),
+            len(batch_trace["empty_reason_candidate_ids"]),
+        )
+        return batch_output, batch_trace
+
     async def _generate_reasons_in_batches(
         self,
         *,
@@ -339,94 +435,191 @@ class RecommendationService:
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
         retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]],
     ) -> tuple[ReasonGenerationOutput, list[dict[str, Any]]]:
-        batch_outputs: list[ReasonGenerationOutput] = []
-        batch_traces: list[dict[str, Any]] = []
+        import asyncio as _asyncio
+
         candidate_batches = self._chunk_candidates(
             candidates, batch_size=REASON_GENERATION_BATCH_SIZE
         )
+        batch_total = len(candidate_batches)
 
-        for batch_index, candidate_batch in enumerate(candidate_batches, start=1):
-            batch_candidate_ids = [candidate.expert_id for candidate in candidate_batch]
-            logger.info(
-                "Reason generation batch started: batch=%d/%d size=%d candidate_ids=%s",
-                batch_index,
-                len(candidate_batches),
-                len(candidate_batch),
-                batch_candidate_ids,
-            )
-            batch_output = await self.reason_generator.generate(
-                query=query,
-                plan=plan,
-                candidates=candidate_batch,
-                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
-                retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
-            )
-            batch_outputs.append(batch_output)
-
-            raw_trace = dict(self._extract_component_trace(self.reason_generator) or {})
-            batch_trace = {
-                "batch_index": batch_index,
-                "batch_size": len(candidate_batch),
-                "candidate_ids": batch_candidate_ids,
-                "returned_ids": list(raw_trace.get("returned_ids", [])),
-                "missing_candidate_ids": list(
-                    raw_trace.get("missing_candidate_ids", [])
-                ),
-                "empty_reason_candidate_ids": list(
-                    raw_trace.get("empty_reason_candidate_ids", [])
-                ),
-                "empty_selected_evidence_candidate_ids": list(
-                    raw_trace.get("empty_selected_evidence_candidate_ids", [])
-                ),
-                "invalid_selected_evidence_candidate_ids": list(
-                    raw_trace.get("invalid_selected_evidence_candidate_ids", [])
-                ),
-                "invalid_selected_evidence_ids_by_candidate": dict(
-                    raw_trace.get("invalid_selected_evidence_ids_by_candidate", {})
-                ),
-                "mode": raw_trace.get("mode", "unknown"),
-                "seed": raw_trace.get("seed"),
-                "retry_count": raw_trace.get("retry_count", 0),
-                "returned_ratio": raw_trace.get(
-                    "returned_ratio",
-                    round(
-                        len(list(raw_trace.get("returned_ids", []))) / len(candidate_batch),
-                        3,
+        # 모든 배치를 병렬 실행 — 각 태스크는 완료 즉시 trace를 캡처하므로 안전
+        results: list[tuple[ReasonGenerationOutput, dict[str, Any]]] = (
+            await _asyncio.gather(
+                *[
+                    self._run_single_batch(
+                        batch_index=batch_index,
+                        batch_total=batch_total,
+                        candidate_batch=candidate_batch,
+                        query=query,
+                        plan=plan,
+                        relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+                        retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
                     )
-                    if candidate_batch
-                    else 0.0,
-                ),
-                "prompt_budget_mode": raw_trace.get("prompt_budget_mode"),
-                "trim_applied": raw_trace.get("trim_applied", False),
-                "payload_token_estimate": raw_trace.get("payload_token_estimate"),
-                "attempts": list(raw_trace.get("attempts", [])),
-                "raw_output_count": raw_trace.get(
-                    "raw_output_count", len(batch_output.items)
-                ),
-                "output_count": raw_trace.get("output_count", len(batch_output.items)),
-            }
-            batch_traces.append(batch_trace)
-            logger.info(
-                "Reason generation batch completed: batch=%d/%d size=%d returned=%d missing=%d empty_reasons=%d",
-                batch_index,
-                len(candidate_batches),
-                len(candidate_batch),
-                len(batch_trace["returned_ids"]),
-                len(batch_trace["missing_candidate_ids"]),
-                len(batch_trace["empty_reason_candidate_ids"]),
+                    for batch_index, candidate_batch in enumerate(candidate_batches, start=1)
+                ]
             )
+        )
 
         merged_data_gaps: list[str] = []
         merged_items: list[Any] = []
-        for batch_output in batch_outputs:
+        batch_traces: list[dict[str, Any]] = []
+        for batch_output, batch_trace in results:
             merged_items.extend(batch_output.items)
             merged_data_gaps = _merge_unique_strings(
                 [*merged_data_gaps, *batch_output.data_gaps]
             )
+            batch_traces.append(batch_trace)
 
         return (
             ReasonGenerationOutput(items=merged_items, data_gaps=merged_data_gaps),
             batch_traces,
+        )
+
+    @staticmethod
+    def _collect_retry_candidate_ids(batch_traces: list[dict[str, Any]]) -> list[str]:
+        retry_candidate_ids: list[str] = []
+        for trace in batch_traces:
+            for key in ("missing_candidate_ids", "empty_reason_candidate_ids"):
+                for expert_id in trace.get(key, []):
+                    if expert_id not in retry_candidate_ids:
+                        retry_candidate_ids.append(expert_id)
+        return retry_candidate_ids
+
+    @staticmethod
+    def _merge_reason_output_items(
+        *,
+        candidates: list[CandidateCard],
+        reason_output: ReasonGenerationOutput,
+        replacements: dict[str, ReasonedCandidate],
+        data_gaps_to_add: list[str] | None = None,
+    ) -> ReasonGenerationOutput:
+        existing_items = {item.expert_id: item for item in reason_output.items}
+        merged_items: list[ReasonedCandidate] = []
+        for candidate in candidates:
+            merged_items.append(
+                replacements.get(
+                    candidate.expert_id,
+                    existing_items.get(
+                        candidate.expert_id,
+                        ReasonedCandidate(expert_id=candidate.expert_id),
+                    ),
+                )
+            )
+        return ReasonGenerationOutput(
+            items=merged_items,
+            data_gaps=_merge_unique_strings(
+                [*list(reason_output.data_gaps), *(data_gaps_to_add or [])]
+            ),
+        )
+
+    async def _retry_reason_generation_for_candidates(
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        candidates: list[CandidateCard],
+        reason_output: ReasonGenerationOutput,
+        batch_traces: list[dict[str, Any]],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]],
+    ) -> tuple[ReasonGenerationOutput, dict[str, Any]]:
+        retry_candidate_ids = self._collect_retry_candidate_ids(batch_traces)
+        if not retry_candidate_ids:
+            return (
+                reason_output,
+                {
+                    "retry_candidate_ids": [],
+                    "retry_success_candidate_ids": [],
+                    "retry_failed_candidate_ids": [],
+                    "reason_generation_failed_candidate_ids": [],
+                    "retries": [],
+                },
+            )
+
+        candidates_by_expert_id = {
+            candidate.expert_id: candidate for candidate in candidates
+        }
+        replacements: dict[str, ReasonedCandidate] = {}
+        retry_success_candidate_ids: list[str] = []
+        retry_failed_candidate_ids: list[str] = []
+        retry_data_gaps: list[str] = []
+        retries: list[dict[str, Any]] = []
+
+        for expert_id in retry_candidate_ids:
+            candidate = candidates_by_expert_id.get(expert_id)
+            if candidate is None:
+                retry_failed_candidate_ids.append(expert_id)
+                continue
+
+            logger.warning(
+                "Reason generation candidate retry scheduled: expert_id=%s",
+                expert_id,
+            )
+            retry_output = await self.reason_generator.generate(
+                query=query,
+                plan=plan,
+                candidates=[candidate],
+                relevant_evidence_by_expert_id={
+                    expert_id: relevant_evidence_by_expert_id.get(
+                        expert_id,
+                        RelevantEvidenceBundle(expert_id=expert_id),
+                    )
+                },
+                retrieval_score_traces_by_expert_id={
+                    expert_id: retrieval_score_traces_by_expert_id.get(expert_id, {})
+                },
+            )
+            retry_reason_trace = dict(
+                self._extract_component_trace(self.reason_generator) or {}
+            )
+            retry_item = retry_output.items[0] if retry_output.items else None
+            retry_failed = bool(retry_reason_trace.get("missing_candidate_ids"))
+            retry_failed = retry_failed or retry_item is None
+            retry_failed = retry_failed or not (
+                retry_item.recommendation_reason if retry_item is not None else ""
+            )
+
+            retries.append(
+                {
+                    "expert_id": expert_id,
+                    "returned_ids": list(retry_reason_trace.get("returned_ids", [])),
+                    "mode": retry_reason_trace.get("mode", "unknown"),
+                    "success": not retry_failed,
+                }
+            )
+
+            if retry_failed:
+                retry_failed_candidate_ids.append(expert_id)
+                logger.warning(
+                    "Reason generation candidate retry failed: expert_id=%s returned_ids=%s",
+                    expert_id,
+                    retry_reason_trace.get("returned_ids", []),
+                )
+                continue
+
+            replacements[expert_id] = retry_item
+            retry_success_candidate_ids.append(expert_id)
+            retry_data_gaps.extend(list(retry_output.data_gaps))
+            logger.info(
+                "Reason generation candidate retry succeeded: expert_id=%s",
+                expert_id,
+            )
+
+        merged_output = self._merge_reason_output_items(
+            candidates=candidates,
+            reason_output=reason_output,
+            replacements=replacements,
+            data_gaps_to_add=retry_data_gaps,
+        )
+        return (
+            merged_output,
+            {
+                "retry_candidate_ids": retry_candidate_ids,
+                "retry_success_candidate_ids": retry_success_candidate_ids,
+                "retry_failed_candidate_ids": retry_failed_candidate_ids,
+                "reason_generation_failed_candidate_ids": retry_failed_candidate_ids,
+                "retries": retries,
+            },
         )
 
     @staticmethod
@@ -435,6 +628,7 @@ class RecommendationService:
         candidates: list[CandidateCard],
         reason_output: ReasonGenerationOutput,
         batch_traces: list[dict[str, Any]],
+        retry_trace: dict[str, Any],
     ) -> dict[str, Any]:
         modes = {
             trace.get("mode")
@@ -449,7 +643,19 @@ class RecommendationService:
             "batch_size": REASON_GENERATION_BATCH_SIZE,
             "reason_generation_failed": any(
                 float(trace.get("returned_ratio", 0.0)) == 0.0 for trace in batch_traces
+            )
+            or bool(retry_trace.get("reason_generation_failed_candidate_ids")),
+            "retry_candidate_ids": list(retry_trace.get("retry_candidate_ids", [])),
+            "retry_success_candidate_ids": list(
+                retry_trace.get("retry_success_candidate_ids", [])
             ),
+            "retry_failed_candidate_ids": list(
+                retry_trace.get("retry_failed_candidate_ids", [])
+            ),
+            "reason_generation_failed_candidate_ids": list(
+                retry_trace.get("reason_generation_failed_candidate_ids", [])
+            ),
+            "retries": list(retry_trace.get("retries", [])),
             "batches": batch_traces,
         }
 
@@ -631,10 +837,12 @@ class RecommendationService:
         reason_output: ReasonGenerationOutput,
         *,
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+        reason_generation_failed_candidate_ids: list[str] | None = None,
     ) -> tuple[list[RecommendationDecision], list[dict[str, Any]], list[dict[str, Any]]]:
         generated_by_expert_id = {
             item.expert_id: item for item in reason_output.items
         }
+        failed_candidate_ids = set(reason_generation_failed_candidate_ids or [])
         recommendations: list[RecommendationDecision] = []
         selected_evidence_trace: list[dict[str, Any]] = []
         server_fallback_reasons: list[dict[str, Any]] = []
@@ -659,6 +867,25 @@ class RecommendationService:
             )
             selected_evidence_trace.append(evidence_trace)
             if not recommendation_reason:
+                if card.expert_id in failed_candidate_ids:
+                    logger.warning(
+                        "Recommendation reason generation failed and fallback suppressed: expert_id=%s",
+                        card.expert_id,
+                    )
+                    recommendations.append(
+                        RecommendationDecision(
+                            rank=rank,
+                            expert_id=card.expert_id,
+                            name=card.name,
+                            organization=card.organization,
+                            fit=fit,
+                            recommendation_reason="",
+                            evidence=evidence,
+                            risks=risks,
+                            rank_score=card.rank_score,
+                        )
+                    )
+                    continue
                 logger.warning(
                     "Recommendation reason is empty after reason generation: expert_id=%s fit=%s resolved_evidence_ids=%s fallback=%s",
                     card.expert_id,

@@ -125,7 +125,7 @@ class OpenAICompatPlanner:
                   "include_orgs": ["string"],
                   "exclude_orgs": ["string"],
                   "soft_preferences": ["string"],
-                  "top_k": ["integer"]
+                  "top_k": "integer"
                 }
             
                 # 예시
