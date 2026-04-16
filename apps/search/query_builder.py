@@ -15,7 +15,7 @@ class QueryTextBuilder:
         return normalized_values
 
     def build_query_text(self, plan: PlannerOutput) -> str:
-        return "\n".join(self.normalize_keywords(plan.core_keywords))
+        return ", ".join(self.normalize_keywords(plan.core_keywords))
 
     def build_branch_queries(self, query: str, plan: PlannerOutput) -> dict[str, str]:
         _ = query

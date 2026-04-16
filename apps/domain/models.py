@@ -256,3 +256,9 @@ class RecommendationDecision(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0
+
+    @computed_field(return_type=list[str])
+    @property
+    def reasons(self) -> list[str]:
+        normalized_reason = " ".join(self.recommendation_reason.split())
+        return [normalized_reason] if normalized_reason else []

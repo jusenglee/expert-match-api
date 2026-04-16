@@ -11,7 +11,12 @@ from apps.domain.models import RecommendationDecision
 
 
 class FakeRecommendationService:
+    def __init__(self):
+        self.last_recommend_query = None
+        self.last_search_query = None
+
     async def recommend(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
+        self.last_recommend_query = query
         return {
             "intent_summary": query,
             "applied_filters": filters_override,
@@ -62,6 +67,7 @@ class FakeRecommendationService:
         }
 
     async def search_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
+        self.last_search_query = query
         class Planner(SimpleNamespace):
             def model_dump(self, mode="json"):
                 return {
@@ -147,9 +153,10 @@ class FakeValidator:
 
 
 def test_recommend_endpoint_contract():
+    service = FakeRecommendationService()
     app = create_app(
         settings=Settings(app_env="test", strict_runtime_validation=False),
-        service=FakeRecommendationService(),
+        service=service,
         validator=FakeValidator(),
     )
     with TestClient(app) as client:
@@ -164,6 +171,28 @@ def test_recommend_endpoint_contract():
         response.json()["recommendations"][0]["recommendation_reason"]
         == "Publication evidence is available."
     )
+    assert response.json()["recommendations"][0]["reasons"] == [
+        "Publication evidence is available."
+    ]
+
+
+def test_recommend_endpoint_normalizes_multiline_query_with_commas():
+    service = FakeRecommendationService()
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=service,
+        validator=FakeValidator(),
+    )
+    multiline_query = "인공지능 모델 개발\n벡터DB 구축\n파인튜닝\n학습데이터 구축"
+
+    with TestClient(app) as client:
+        response = client.post("/recommend", json={"query": multiline_query})
+
+    assert response.status_code == 200
+    assert service.last_recommend_query == (
+        "인공지능 모델 개발, 벡터DB 구축, 파인튜닝, 학습데이터 구축"
+    )
+    assert response.json()["intent_summary"] == service.last_recommend_query
 
 
 def test_playground_route_serves_local_chat_ui():
@@ -185,9 +214,10 @@ def test_playground_route_serves_local_chat_ui():
 
 
 def test_search_candidates_endpoint_includes_retrieval_score_trace():
+    service = FakeRecommendationService()
     app = create_app(
         settings=Settings(app_env="test", strict_runtime_validation=False),
-        service=FakeRecommendationService(),
+        service=service,
         validator=FakeValidator(),
     )
     with TestClient(app) as client:
@@ -198,6 +228,25 @@ def test_search_candidates_endpoint_includes_retrieval_score_trace():
 
     assert response.status_code == 200
     assert response.json()["trace"]["retrieval_score_traces"][0]["primary_branch"] == "basic"
+
+
+def test_search_candidates_endpoint_normalizes_multiline_query_with_commas():
+    service = FakeRecommendationService()
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=service,
+        validator=FakeValidator(),
+    )
+    multiline_query = "인공지능 모델 개발\n벡터DB 구축\n파인튜닝\n학습데이터 구축"
+
+    with TestClient(app) as client:
+        response = client.post("/search/candidates", json={"query": multiline_query})
+
+    assert response.status_code == 200
+    assert service.last_search_query == (
+        "인공지능 모델 개발, 벡터DB 구축, 파인튜닝, 학습데이터 구축"
+    )
+    assert response.json()["intent_summary"] == service.last_search_query
 
 
 def test_feedback_endpoint_contract():

@@ -402,6 +402,9 @@ def test_recommend_falls_back_to_top_relevant_evidence_when_llm_selection_is_mis
     recommendation: RecommendationDecision = result["recommendations"][0]
     assert recommendation.evidence[0].title == "Paper 1"
     assert recommendation.recommendation_reason == "Strong publication history"
+    assert recommendation.model_dump(mode="json")["reasons"] == [
+        "Strong publication history"
+    ]
     assert result["trace"]["reason_generation_trace"]["selected_evidence"][0]["fallback"] == "top_relevant"
     assert recommendation.fit == "보통"
 
@@ -479,6 +482,20 @@ def test_recommend_logs_empty_reason_and_invalid_evidence_selection(caplog):
     assert "Selected evidence ids could not be resolved" in caplog.text
     assert "Recommendation reason is empty after reason generation" in caplog.text
     assert "Recommendation reason fallback generated" in caplog.text
+
+
+def test_recommendation_decision_serializes_empty_legacy_reasons_array():
+    recommendation = RecommendationDecision(
+        rank=1,
+        expert_id="1",
+        name="Alpha",
+        fit="보통",
+        recommendation_reason="",
+        evidence=[],
+        risks=[],
+    )
+
+    assert recommendation.model_dump(mode="json")["reasons"] == []
 
 
 def test_recommend_profile_fallback_trace_exposes_empty_relevant_bundle():
