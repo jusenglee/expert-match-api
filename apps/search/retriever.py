@@ -5,20 +5,23 @@ Hybrid Qdrant retriever for NTIS expert search.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import pprint
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import ValidationError
 from qdrant_client import QdrantClient, models
 
+from apps.core.cache import RetrievalResultCache
 from apps.core.config import Settings
 from apps.core.timer import Timer
 from apps.domain.models import ExpertPayload, PlannerOutput, SearchHit
-from apps.search.encoders import DenseEncoder
-from apps.search.query_builder import QueryTextBuilder
+from apps.search.encoders import DenseEncoder, SparseEncoder
+from apps.search.query_builder import CompiledBranchQueries, QueryTextBuilder
 from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
+from apps.search.sparse_runtime import SparseRuntimeConfig
 from apps.search.text_utils import normalize_org_name
 
 logger = logging.getLogger(__name__)
@@ -28,9 +31,26 @@ logger = logging.getLogger(__name__)
 class RetrievalResult:
     hits: list[SearchHit]
     query_payload: dict[str, Any]
-    branch_queries: dict[str, str]
+    branch_queries: dict[str, CompiledBranchQueries]
     retrieval_keywords: list[str]
     retrieval_score_traces: list[dict[str, Any]]
+    expanded_shadow_hits: list[SearchHit] = field(default_factory=list)
+    filtered_out_candidates: list[dict[str, Any]] = field(default_factory=list)
+    cache_hit: bool = False
+
+
+# 가중치 설정 (아키텍처 가이드라인 준수)
+BRANCH_WEIGHTS = {
+    "basic": 0.6,
+    "art": 1.0,
+    "pat": 0.8,
+    "pjt": 1.0,
+}
+
+PATH_WEIGHTS = {
+    "stable": 1.0,
+    "expanded": 0.25,
+}
 
 
 class QdrantHybridRetriever:
@@ -42,12 +62,18 @@ class QdrantHybridRetriever:
         registry: SearchSchemaRegistry,
         dense_encoder: DenseEncoder,
         query_builder: QueryTextBuilder,
+        sparse_encoder: SparseEncoder | None = None,
+        sparse_runtime: SparseRuntimeConfig | None = None,
+        l3_cache: RetrievalResultCache | None = None,
     ) -> None:
         self.client = client
         self.settings = settings
         self.registry = registry
         self.dense_encoder = dense_encoder
         self.query_builder = query_builder
+        self.sparse_encoder = sparse_encoder
+        self.sparse_runtime = sparse_runtime
+        self.l3_cache = l3_cache
 
     @staticmethod
     def _sanitize_payload_for_log(data: Any) -> Any:
@@ -90,21 +116,6 @@ class QdrantHybridRetriever:
         )
 
     @staticmethod
-    def _sort_hit_records(
-        records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        return sorted(
-            records,
-            key=lambda record: (
-                -record["hit"].score,
-                " ".join(
-                    (record["hit"].payload.basic_info.researcher_name or "").split()
-                ),
-                record["hit"].expert_id,
-            ),
-        )
-
-    @staticmethod
     def _point_key(point_id: Any) -> str:
         return str(point_id)
 
@@ -120,7 +131,7 @@ class QdrantHybridRetriever:
         *,
         branch: str,
         dense_query: list[float],
-        sparse_query: models.Document,
+        sparse_query: models.Document | models.SparseVector,
         query_filter: models.Filter | None,
     ) -> dict[str, Any]:
         return {
@@ -142,7 +153,7 @@ class QdrantHybridRetriever:
             "query": models.FusionQuery(fusion=models.Fusion.RRF),
             "query_filter": query_filter,
             "limit": self.settings.branch_output_limit,
-            "with_payload": False,
+            "with_payload": True,
             "with_vectors": False,
         }
 
@@ -184,208 +195,214 @@ class QdrantHybridRetriever:
         plan: PlannerOutput,
         query_filter: models.Filter | None,
     ) -> RetrievalResult:
-        retrieval_keywords = self.query_builder.normalize_keywords(plan.core_keywords)
-        dense_branch_queries = self.query_builder.build_dense_branch_queries(query, plan)
-        sparse_branch_queries = self.query_builder.build_sparse_branch_queries(query, plan)
-        
-        logger.debug(
-            "Generated branch queries:\ndense: %s\nsparse: %s",
-            pprint.pformat(dense_branch_queries, indent=2, width=100),
-            pprint.pformat(sparse_branch_queries, indent=2, width=100),
-        )
-        branch_query_payloads: dict[str, dict[str, Any]] = {}
-        prefetches: list[models.Prefetch] = []
+        # 1. 쿼리 컴파일
+        branch_compiled_queries = self.query_builder.build_branch_queries(query, plan)
+        retrieval_keywords = self.query_builder.normalize_keywords(plan.retrieval_core)
 
+        # L3 캐시 키 준비
+        compiled_json = json.dumps({b: {"s": q.stable, "e": q.expanded} for b, q in branch_compiled_queries.items()}, sort_keys=True)
+        filter_json = str(query_filter)
+        snapshot_id = self.settings.qdrant_collection_release_id
+
+        # 2. L3 캐시 조회
+        if self.l3_cache and self.settings.cache_enabled:
+            cached_data = self.l3_cache.get(compiled_json, filter_json, snapshot_id)
+            if cached_data:
+                logger.info("Retriever cache hit (L3)")
+                hits = [SearchHit.model_validate(h) for h in cached_data]
+                return RetrievalResult(
+                    hits=hits,
+                    query_payload={"cache": "hit", "l3": True},
+                    branch_queries=branch_compiled_queries,
+                    retrieval_keywords=retrieval_keywords,
+                    retrieval_score_traces=[],
+                    cache_hit=True
+                )
+
+        # 3. 실행할 브랜치/경로 조합 정의
+        tasks_meta = []
         for branch in BRANCHES:
-            dense_query_text = dense_branch_queries[branch]
-            if "instruct" in getattr(self.dense_encoder, "model_name", "").lower():
-                instruct_prefix = (
-                    "Instruct: Find experts whose profile, papers, patents, or projects "
-                    "match the given query.\nQuery: "
-                )
-                dense_query_text = f"{instruct_prefix}{dense_query_text}"
-            dense_query = self.dense_encoder.embed(dense_query_text)
-            sparse_query = models.Document(
-                text=sparse_branch_queries[branch],
-                model=self.settings.bm25_model_name,
-            )
-            branch_query_payloads[branch] = self._build_branch_query_payload(
-                branch=branch,
-                dense_query=dense_query,
-                sparse_query=sparse_query,
-                query_filter=query_filter,
-            )
+            tasks_meta.append((branch, "stable", branch_compiled_queries[branch].stable))
+            if branch in ["art", "pjt"]:
+                tasks_meta.append((branch, "expanded", branch_compiled_queries[branch].expanded))
 
-            prefetches.append(
-                models.Prefetch(
-                    prefetch=branch_query_payloads[branch]["prefetch"],
-                    query=models.FusionQuery(fusion=models.Fusion.RRF),
-                    limit=self.settings.branch_output_limit,
-                    filter=query_filter,
-                )
-            )
-
-        query_payload = {
-            "collection_name": self.settings.qdrant_collection_name,
-            "prefetch": prefetches,
-            "query": models.FusionQuery(fusion=models.Fusion.RRF),
-            "query_filter": query_filter,
-            "limit": self.settings.retrieval_limit,
-            "with_payload": True,
-            "with_vectors": False,
-        }
-
-        logger.info(
-            "Qdrant hybrid search: collection=%s filter_applied=%s",
-            self.settings.qdrant_collection_name,
-            query_filter is not None,
-        )
-        logger.info(
-            "Qdrant query payload:\n%s",
-            pprint.pformat(
-                self._sanitize_payload_for_log(query_payload), indent=2, width=120
-            ),
-        )
-        with Timer() as timer:
-            query_results = await asyncio.gather(
-                asyncio.to_thread(self.client.query_points, **query_payload),
-                *[
-                    asyncio.to_thread(self.client.query_points, **branch_payload)
-                    for branch_payload in branch_query_payloads.values()
-                ],
-                return_exceptions=True,
-            )
-        if isinstance(query_results[0], Exception):
-            raise query_results[0]
-        points = query_results[0]
-        logger.info("Qdrant search finished: elapsed_ms=%.2f", timer.elapsed_ms)
-
-        branch_trace_map: dict[str, list[dict[str, Any]]] = {}
-        branch_query_results = dict(zip(BRANCHES, query_results[1:]))
-        for branch, branch_result in branch_query_results.items():
-            if isinstance(branch_result, Exception):
-                logger.warning(
-                    "Skipping retrieval branch trace for %s: %s",
-                    branch,
-                    branch_result,
-                )
-                continue
-            branch_points = getattr(branch_result, "points", branch_result)
-            for rank, point in enumerate(branch_points, start=1):
-                point_id = getattr(point, "id", None)
-                if point_id is None and isinstance(point, dict):
-                    point_id = point.get("id")
-                if point_id is None:
-                    continue
-                branch_trace_map.setdefault(self._point_key(point_id), []).append(
-                    {
-                        "branch": branch,
-                        "rank": rank,
-                        "score": float(getattr(point, "score", 0.0)),
-                    }
-                )
-
-        hit_records: list[dict[str, Any]] = []
-        skipped_invalid_payloads = 0
-        point_list = getattr(points, "points", points)
-        for point in point_list:
-            point_id = getattr(point, "id", None)
-            if point_id is None and isinstance(point, dict):
-                point_id = point.get("id")
-
-            payload_data = (
-                point.payload if hasattr(point, "payload") else point.get("payload", {})
-            )
-
-            try:
-                payload = ExpertPayload.model_validate(payload_data)
-            except ValidationError as exc:
-                skipped_invalid_payloads += 1
-                logger.warning(
-                    "Skipping invalid payload: point_id=%s errors=%s",
-                    point_id,
-                    exc.errors(include_url=False),
-                )
-                continue
-
-            data_presence_flags = {
-                "basic": False,
-                "art": bool(payload.publications),
-                "pat": bool(payload.intellectual_properties),
-                "pjt": bool(payload.research_projects),
-            }
-
-            if plan.exclude_orgs:
-                organization = payload.basic_info.affiliated_organization or ""
-                normalized_org = normalize_org_name(organization) or ""
-                should_exclude = False
-                for excluded_org in plan.exclude_orgs:
-                    normalized_excluded_org = normalize_org_name(excluded_org) or ""
-                    if normalized_excluded_org and normalized_org:
-                        if (
-                            normalized_excluded_org in normalized_org
-                            or normalized_org in normalized_excluded_org
-                        ):
-                            should_exclude = True
-                            break
-                if should_exclude:
-                    continue
-
-            hit = SearchHit(
-                expert_id=payload.basic_info.researcher_id,
-                score=float(getattr(point, "score", 0.0)),
-                payload=payload,
-                data_presence_flags=data_presence_flags,
-            )
-            point_key = self._point_key(point_id)
-            hit_records.append(
-                {
-                    "hit": hit,
-                    "point_id": point_key,
-                    "branch_matches": branch_trace_map.get(point_key, []),
-                }
-            )
-
-        hit_records = self._sort_hit_records(hit_records)
-        hits = [record["hit"] for record in hit_records]
-        trace_gap_records = [
-            {
-                "expert_id": record["hit"].expert_id,
-                "point_id": record["point_id"],
-            }
-            for record in hit_records
-            if not record["branch_matches"]
+        # 4. 병렬 검색 실행
+        search_tasks = [
+            self._execute_single_path_query_with_path(branch, path, q_text, query_filter)
+            for branch, path, q_text in tasks_meta
         ]
+            
+        with Timer() as timer:
+            raw_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        
+        logger.info("Multi-path parallel search finished: elapsed_ms=%.2f", timer.elapsed_ms)
+
+        # 5. 결과 집계 및 Weighted RRF 계산
+        aggregator: dict[str, dict[str, Any]] = {}
+        for result in raw_results:
+            if isinstance(result, Exception):
+                logger.error("Query task failed: %s", result)
+                continue
+            
+            branch, path, points = result
+            weight = BRANCH_WEIGHTS[branch] * PATH_WEIGHTS[path]
+            
+            for rank, pt in enumerate(points, start=1):
+                pt_id = getattr(pt, "id", None) or (pt.get("id") if isinstance(pt, dict) else None)
+                payload_data = getattr(pt, "payload", {}) or (pt.get("payload", {}) if isinstance(pt, dict) else {})
+                try:
+                    payload = ExpertPayload.model_validate(payload_data)
+                except ValidationError: continue
+                
+                eid = payload.basic_info.researcher_id
+                rrf_contribution = weight * (1.0 / (rank + 60))
+                
+                if eid not in aggregator:
+                    aggregator[eid] = {
+                        "score": 0.0, "stable_hits": 0, "expanded_hits": 0,
+                        "branches": set(), "payload": payload, "point_id": self._point_key(pt_id),
+                        "branch_matches": []
+                    }
+                
+                entry = aggregator[eid]
+                entry["score"] += rrf_contribution
+                entry["branches"].add(branch)
+                if path == "stable": entry["stable_hits"] += 1
+                else: entry["expanded_hits"] += 1
+                
+                entry["branch_matches"].append({
+                    "branch": branch, "path": path, "rank": rank,
+                    "score": float(getattr(pt, "score", 0.0) if hasattr(pt, "score") else pt.get("score", 0.0))
+                })
+
+        # 6. Support Rule 필터링 및 결과 생성
+        final_hits: list[SearchHit] = []
+        filtered_out: list[dict[str, Any]] = []
+        
+        s_min = self.settings.support_rule_stable_min
+        e_min = self.settings.support_rule_expanded_min
+
+        for eid, data in aggregator.items():
+            if plan.exclude_orgs:
+                organization = data["payload"].basic_info.affiliated_organization or ""
+                normalized_org = normalize_org_name(organization) or ""
+                if any((normalize_org_name(ex) in normalized_org for ex in plan.exclude_orgs if normalize_org_name(ex))):
+                    continue
+
+            is_supported = (data["stable_hits"] >= s_min) or (data["expanded_hits"] >= e_min and len(data["branches"]) >= e_min)
+            
+            hit = SearchHit(
+                expert_id=eid,
+                score=data["score"],
+                payload=data["payload"],
+                data_presence_flags={
+                    "basic": False,
+                    "art": bool(data["payload"].publications),
+                    "pat": bool(data["payload"].intellectual_properties),
+                    "pjt": bool(data["payload"].research_projects),
+                },
+                stable_support_count=data["stable_hits"],
+                expanded_support_count=data["expanded_hits"],
+                support_branches=list(data["branches"])
+            )
+
+            if is_supported:
+                final_hits.append(hit)
+            else:
+                filtered_out.append({
+                    "expert_id": eid,
+                    "name": data["payload"].basic_info.researcher_name,
+                    "stable_hits": data["stable_hits"],
+                    "expanded_hits": data["expanded_hits"],
+                    "branches": list(data["branches"]),
+                    "reason": f"Insufficient support (stable < {s_min} and expanded_branches < {e_min})"
+                })
+
+        final_hits = self._sort_hits(final_hits)
+        
+        if self.l3_cache and self.settings.cache_enabled and final_hits:
+            self.l3_cache.set(
+                compiled_json, filter_json, snapshot_id,
+                [h.model_dump(mode="json") for h in final_hits]
+            )
+
         retrieval_score_traces = [
             self._build_retrieval_score_trace(
-                expert_id=record["hit"].expert_id,
-                point_id=record["point_id"],
-                final_score=record["hit"].score,
-                branch_matches=record["branch_matches"],
-            )
-            for record in hit_records
+                expert_id=hit.expert_id,
+                point_id=aggregator[hit.expert_id]["point_id"],
+                final_score=hit.score,
+                branch_matches=aggregator[hit.expert_id]["branch_matches"]
+            ) for hit in final_hits
         ]
-        if trace_gap_records:
-            logger.warning(
-                "Retrieval score traces missing branch matches: count=%d samples=%s",
-                len(trace_gap_records),
-                trace_gap_records[:5],
-            )
 
-        if skipped_invalid_payloads:
-            logger.info(
-                "Search completed with payload skips: total=%d skipped=%d returned=%d",
-                len(point_list),
-                skipped_invalid_payloads,
-                len(hits),
-            )
-        else:
-            logger.info("Search completed: hits=%d", len(hits))
+        expanded_shadow = [
+            SearchHit(expert_id=eid, score=d["score"], payload=d["payload"])
+            for eid, d in aggregator.items() if d["stable_hits"] == 0 and d["expanded_hits"] > 0
+        ]
 
         return RetrievalResult(
-            hits=hits,
-            query_payload=query_payload,
-            branch_queries=dense_branch_queries, # Maintain compatibility with trace
+            hits=final_hits,
+            query_payload={"weighted_rrf": True, "support_rules": {"s_min": s_min, "e_min": e_min}},
+            branch_queries=branch_compiled_queries,
             retrieval_keywords=retrieval_keywords,
             retrieval_score_traces=retrieval_score_traces,
+            expanded_shadow_hits=expanded_shadow,
+            filtered_out_candidates=filtered_out
         )
+
+    async def _execute_single_path_query(
+        self, 
+        branch: str, 
+        query_text: str, 
+        query_filter: models.Filter | None
+    ) -> tuple[str, str, Any]:
+        """단일 브랜치/경로에 대해 Qdrant 하이브리드 검색을 수행합니다."""
+        processed_query = query_text
+        if "instruct" in getattr(self.dense_encoder, "model_name", "").lower():
+            instruct_prefix = (
+                "Instruct: Find experts whose profile, papers, patents, or projects "
+                "match the given query.\nQuery: "
+            )
+            processed_query = f"{instruct_prefix}{query_text}"
+        
+        dense_query = self.dense_encoder.embed(processed_query)
+
+        # Sparse 임베딩 생성 (커스텀 인코더 우선 활용)
+        if self.sparse_encoder:
+            sparse_map = self.sparse_encoder.embed(query_text)
+            sparse_query = models.SparseVector(
+                indices=list(sparse_map.keys()),
+                values=list(sparse_map.values())
+            )
+        else:
+            sparse_model_name = (
+                self.sparse_runtime.active_model_name
+                if self.sparse_runtime is not None
+                else self.settings.sparse_model_name
+            )
+            sparse_query = models.Document(
+                text=query_text,
+                model=sparse_model_name,
+            )
+        
+        payload = self._build_branch_query_payload(
+            branch=branch,
+            dense_query=dense_query,
+            sparse_query=sparse_query,
+            query_filter=query_filter,
+        )
+        
+        result = await asyncio.to_thread(self.client.query_points, **payload)
+        points = getattr(result, "points", result)
+        
+        return branch, "", points
+
+    async def _execute_single_path_query_with_path(
+        self, 
+        branch: str, 
+        path: str,
+        query_text: str, 
+        query_filter: models.Filter | None
+    ) -> tuple[str, str, Any]:
+        _, _, points = await self._execute_single_path_query(branch, query_text, query_filter)
+        return branch, path, points

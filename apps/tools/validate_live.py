@@ -11,8 +11,13 @@ from qdrant_client import QdrantClient
 
 from apps.core.config import get_settings
 from apps.core.runtime_validation import validate_runtime_settings
+from apps.search.encoders import SpladeSparseEncoder
 from apps.search.live_validator import LiveContractValidator
 from apps.search.schema_registry import SearchSchemaRegistry
+from apps.search.sparse_runtime import (
+    prepare_sparse_runtime_environment,
+    resolve_sparse_runtime,
+)
 
 
 def main() -> int:
@@ -30,12 +35,20 @@ def main() -> int:
         api_key=settings.qdrant_api_key,
         cloud_inference=settings.qdrant_cloud_inference,
     )
+    cache_dir = prepare_sparse_runtime_environment(settings)
+    sparse_runtime, _ = resolve_sparse_runtime(
+        client=client,
+        settings=settings,
+        cache_dir=cache_dir,
+        sparse_encoder_factory=SpladeSparseEncoder,
+    )
     
     # 실시간 데이터 규약 검증기 생성 및 실행
     validator = LiveContractValidator(
         client=client,
         settings=settings,
         registry=SearchSchemaRegistry.default(),
+        sparse_runtime=sparse_runtime,
     )
     
     report = validator.validate()

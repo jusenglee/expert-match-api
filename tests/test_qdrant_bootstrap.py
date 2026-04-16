@@ -7,6 +7,7 @@ from qdrant_client import models
 from apps.core.config import Settings
 from apps.search.qdrant_bootstrap import QdrantBootstrapper
 from apps.search.schema_registry import BRANCHES, PAYLOAD_INDEX_FIELDS, SearchSchemaRegistry
+from apps.search.sparse_runtime import SparseRuntimeConfig
 
 
 class FakeBootstrapClient:
@@ -42,12 +43,18 @@ class FakeBootstrapClient:
         self.payload_indexes.append((field_name, field_schema, wait))
 
 
-def test_bootstrapper_repairs_sparse_vector_modifiers_on_existing_collection():
+def test_bootstrapper_repairs_sparse_vector_modifiers_for_bm25_runtime():
     client = FakeBootstrapClient(sparse_modifier=None)
     bootstrapper = QdrantBootstrapper(
         client=client,
         settings=Settings(),
         registry=SearchSchemaRegistry.default(),
+        sparse_runtime=SparseRuntimeConfig(
+            backend="fastembed_builtin",
+            active_model_name="Qdrant/bm25",
+            requires_idf_modifier=True,
+            used_fallback=True,
+        ),
     )
 
     bootstrapper.ensure_collection()
@@ -60,3 +67,24 @@ def test_bootstrapper_repairs_sparse_vector_modifiers_on_existing_collection():
     }
     assert all(params.modifier == models.Modifier.IDF for params in updated_sparse_vectors.values())
     assert len(client.payload_indexes) == len(PAYLOAD_INDEX_FIELDS)
+
+
+def test_bootstrapper_clears_idf_modifier_for_splade_runtime():
+    client = FakeBootstrapClient(sparse_modifier=models.Modifier.IDF)
+    bootstrapper = QdrantBootstrapper(
+        client=client,
+        settings=Settings(),
+        registry=SearchSchemaRegistry.default(),
+        sparse_runtime=SparseRuntimeConfig(
+            backend="custom_splade",
+            active_model_name="telepix/PIXIE-Splade-v1.0",
+            requires_idf_modifier=False,
+        ),
+    )
+
+    bootstrapper.ensure_collection()
+
+    assert client.created_collection is None
+    assert client.updated_collection is not None
+    updated_sparse_vectors = client.updated_collection["sparse_vectors_config"]
+    assert all(params.modifier is None for params in updated_sparse_vectors.values())

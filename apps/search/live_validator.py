@@ -14,6 +14,7 @@ from qdrant_client import QdrantClient
 from apps.core.config import Settings
 from apps.core.runtime_validation import RuntimeDependencyValidator
 from apps.search.schema_registry import BRANCHES, PAYLOAD_INDEX_FIELDS, SearchSchemaRegistry
+from apps.search.sparse_runtime import SparseRuntimeConfig, model_requires_idf_modifier
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,13 @@ class LiveContractValidator:
         settings: Settings,
         registry: SearchSchemaRegistry,
         dependency_validator: RuntimeDependencyValidator | None = None,
+        sparse_runtime: SparseRuntimeConfig | None = None,
     ) -> None:
         self.client = client
         self.settings = settings
         self.registry = registry
         self.dependency_validator = dependency_validator or RuntimeDependencyValidator(settings)
+        self.sparse_runtime = sparse_runtime
 
     def _build_report(
         self,
@@ -105,6 +108,16 @@ class LiveContractValidator:
             if normalized == "idf" or "modifier.idf" in normalized:
                 return True
         return False
+
+    def _requires_idf_modifier(self) -> bool:
+        if self.sparse_runtime is not None:
+            return self.sparse_runtime.requires_idf_modifier
+        return model_requires_idf_modifier(self.settings.sparse_model_name)
+
+    def _modifier_matches_expected(self, modifier: Any) -> bool:
+        if self._requires_idf_modifier():
+            return self._modifier_is_idf(modifier)
+        return modifier is None
 
     def _build_sample_checks(self, sample_payload: dict[str, Any]) -> dict[str, bool]:
         """특정 샘플 포인트의 페이로드가 내부 데이터 규약을 준수하는지 점검합니다."""
@@ -223,13 +236,17 @@ class LiveContractValidator:
             issues.append("필수 Sparse 벡터 구성이 컬렉션에 없습니다.")
 
         checks["sparse_vectors_idf"] = True
+        expects_idf_modifier = self._requires_idf_modifier()
         for branch in BRANCHES:
             vector_name = self.registry.sparse_vector_by_branch[branch]
             params = sparse_config.get(vector_name) if isinstance(sparse_config, dict) else None
             modifier = getattr(params, "modifier", None)
-            if not self._modifier_is_idf(modifier):
+            if not self._modifier_matches_expected(modifier):
                 checks["sparse_vectors_idf"] = False
-                issues.append(f"{vector_name}의 Sparse 벡터 수정자가 IDF가 아닙니다.")
+                expected = "IDF" if expects_idf_modifier else "None"
+                issues.append(
+                    f"{vector_name}의 Sparse 벡터 수정자가 기대값({expected})과 일치하지 않습니다."
+                )
                 break
 
         # 5. 페이로드 인덱스 존재 여부 확인

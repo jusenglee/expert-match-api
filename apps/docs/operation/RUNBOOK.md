@@ -14,7 +14,7 @@ python -m pip install -e .[dev]
 
 - Qdrant 서버가 구동 중인지, 설정된 URL에 접근 가능한지 확인합니다.
 - 기본 컬렉션 이름은 `researcher_recommend_proto`이며, 필요 시 환경 변수 `NTIS_QDRANT_COLLECTION_NAME`으로 덮어쓸 수 있습니다.
-- 애플리케이션 시작 시, 설정된 컬렉션의 Sparse Vector 수정자(`IDF`)를 자동으로 확인하고 필요 시 복구를 시도합니다.
+- 애플리케이션 시작 시, 실제로 선택된 sparse backend 에 맞춰 컬렉션의 Sparse Vector 수정자(`IDF` 또는 없음)를 자동으로 확인하고 필요 시 복구를 시도합니다.
 
 ## 3. 시스템 준비 상태 점검 (Readiness)
 
@@ -23,6 +23,8 @@ python -m pip install -e .[dev]
 1. `ntis-validate-live` 명령 실행 (CLI 도구)
 2. `GET /health` 호출 (기본 헬스체크)
 3. `GET /health/ready` 호출 (상세 준비 상태 확인)
+
+`ntis-validate-live` 는 앱 startup 과 동일한 sparse backend 선택 로직을 사용합니다. 따라서 local/online PIXIE 가 모두 실패해 `Qdrant/bm25` fallback 이 선택되면 sparse vector modifier 기대값은 `None` 이 아니라 `IDF` 입니다.
 
 만약 `/health/ready` 결과가 `503` 에러 또는 `ready: false`를 반환한다면 다음 항목을 점검하십시오:
 - Qdrant 컬렉션 존재 여부
@@ -41,6 +43,9 @@ uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 
 - **LLM 일관성 모드**: Planner와 Reasoner는 환경변수로 노출하지 않은 고정 저변동 샘플링(`temperature=0.0`, `top_p=0.2`, `reasoning_effort=low`, `include_reasoning=false`, `disable_thinking=true`)을 사용합니다. 운영 중 튜닝이 필요하면 코드 변경이 필요합니다.
 - **참고**: `NTIS_EMBEDDING_BACKEND=local` 모드 사용 시, 루트의 `multilingual-e5-large-instruct` 폴더 내에 모델 파일들이 온전히 존재해야 합니다.
+- **참고**: sparse backend 는 `로컬 PIXIE -> online PIXIE -> Qdrant/bm25` 순서로 선택됩니다. online PIXIE 는 `telepix/PIXIE-Splade-v1.0` 를 사용합니다.
+- **참고**: `NTIS_HF_HUB_OFFLINE=true` 또는 `NTIS_SPARSE_LOCAL_FILES_ONLY=true` 이면 online PIXIE 단계는 건너뛰고 `Qdrant/bm25` fallback 을 시도합니다.
+- **참고**: `Qdrant/bm25` fallback 은 FastEmbed/Qdrant builtin sparse 경로를 사용하므로 startup 성공 시 서비스는 계속 기동됩니다. 이때 sparse vector modifier 는 `IDF` 여야 하고, PIXIE/SPLADE 가 선택된 경우에는 modifier 가 없어야 합니다.
 - **추천 사유 생성**: `/recommend` 요청 시 LLM이 전문가별 추천 사유를 생성하며, 이는 검색 결과의 숏리스트(Top-k)를 대상으로 합니다.
 
 ## 5. 브라우저 플레이그라운드 (Playground) 활용

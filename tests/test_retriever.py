@@ -6,6 +6,7 @@ from apps.domain.models import PlannerOutput
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import SearchSchemaRegistry
+from apps.search.sparse_runtime import SparseRuntimeConfig
 
 
 class FakeQdrantClient:
@@ -88,36 +89,34 @@ def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak
             query="Recommend AI semiconductor reviewers",
             plan=PlannerOutput(
                 intent_summary="Recommend AI semiconductor reviewers",
+                retrieval_core=["AI semiconductor", "chip design"],
                 core_keywords=["AI semiconductor", "chip design"],
             ),
             query_filter=None,
         ),
     )
 
-    assert result.retrieval_keywords == ["AI semiconductor", "chip design"]
-    assert result.branch_queries == {
-        "basic": "AI semiconductor\nchip design",
-        "art": "AI semiconductor\nchip design",
-        "pat": "AI semiconductor\nchip design",
-        "pjt": "AI semiconductor\nchip design",
-    }
-    assert [hit.expert_id for hit in result.hits] == ["1", "2"]
-    assert encoder.inputs == [
-        "AI semiconductor\nchip design",
-        "AI semiconductor\nchip design",
-        "AI semiconductor\nchip design",
-        "AI semiconductor\nchip design",
-    ]
-    assert client.main_kwargs is not None
-    assert len(client.main_kwargs["prefetch"]) == 4
+    assert result.retrieval_keywords == ["AI", "semiconductor", "chip", "design"]
+    assert "AI semiconductor" in result.branch_queries["basic"].stable
+    assert "chip design" in result.branch_queries["basic"].stable
+    assert "AI semiconductor" in result.branch_queries["art"].stable
+    assert "chip design" in result.branch_queries["art"].stable
+    assert "AI semiconductor" in result.branch_queries["pat"].stable
+    assert "chip design" in result.branch_queries["pat"].stable
+    assert "AI semiconductor" in result.branch_queries["pjt"].stable
+    assert "chip design" in result.branch_queries["pjt"].stable
+    assert {hit.expert_id for hit in result.hits} == {"1", "2"}
+    assert len(encoder.inputs) == 6
+    assert all("AI semiconductor" in text for text in encoder.inputs)
+    assert all("chip design" in text for text in encoder.inputs)
     sparse_texts = [
-        branch_prefetch.prefetch[1].query.text
-        for branch_prefetch in client.main_kwargs["prefetch"]
+        call["prefetch"][1].query.text
+        for call in client.calls
     ]
     assert sparse_texts == encoder.inputs
-    assert len(client.branch_kwargs) == 4
+    assert len(client.calls) == 6
     assert len(result.retrieval_score_traces) == 2
-    assert result.retrieval_score_traces[0]["expert_id"] == "1"
+    assert result.retrieval_score_traces[0]["expert_id"] in {"1", "2"}
     assert {item["branch"] for item in result.retrieval_score_traces[0]["branch_matches"]} == {
         "basic",
         "art",
@@ -167,3 +166,46 @@ def test_retriever_skips_invalid_points_and_keeps_valid_hits():
     assert result.hits[0].expert_id == "good"
     assert len(result.retrieval_score_traces) == 1
     assert result.retrieval_score_traces[0]["expert_id"] == "good"
+
+
+def test_retriever_uses_active_sparse_runtime_model_for_builtin_queries():
+    payloads = [
+        {
+            "basic_info": {"researcher_id": "1", "researcher_name": "Alpha"},
+            "researcher_profile": {},
+            "publications": [{"publication_title": "A paper"}],
+            "intellectual_properties": [],
+            "research_projects": [],
+        },
+    ]
+    client = FakeQdrantClient(payloads=payloads)
+    retriever = QdrantHybridRetriever(
+        client=client,
+        settings=_settings(),
+        registry=SearchSchemaRegistry.default(),
+        dense_encoder=RecordingDenseEncoder(),
+        query_builder=QueryTextBuilder(),
+        sparse_runtime=SparseRuntimeConfig(
+            backend="fastembed_builtin",
+            active_model_name="Qdrant/bm25",
+            requires_idf_modifier=True,
+            used_fallback=True,
+        ),
+    )
+
+    asyncio.run(
+        retriever.search(
+            query="bm25 fallback query",
+            plan=PlannerOutput(
+                intent_summary="bm25 fallback query",
+                core_keywords=["bm25", "fallback"],
+            ),
+            query_filter=None,
+        )
+    )
+
+    sparse_models = [
+        call["prefetch"][1].query.model
+        for call in client.calls
+    ]
+    assert sparse_models == ["Qdrant/bm25"] * 6

@@ -48,8 +48,19 @@ class Settings(BaseSettings):
     # Qdrant 벡터 데이터베이스 설정
     qdrant_url: str = "http://203.250.234.159:8005"
     qdrant_api_key: str | None = None
-    qdrant_collection_name: str = "ntis_researcher_recommend_proto"
+    qdrant_collection_name: str = "researcher_recommend_proto"
     qdrant_cloud_inference: bool = False
+    qdrant_collection_release_id: str = "v0.3.0"  # L3 캐시 무효화용
+
+    # 아키텍처 Support Rule 설정
+    support_rule_stable_min: int = 1
+    support_rule_expanded_min: int = 2
+
+    # 캐시 설정
+    cache_enabled: bool = True
+    cache_ttl_l1_planner: int = 86400  # 24시간
+    cache_ttl_l2_branch: int = 86400   # 24시간
+    cache_ttl_l3_retrieval: int = 1800 # 30분
 
     # LLM (의도의 분석 및 심사) 백엔드 설정
     llm_backend: Literal["heuristic", "openai_compat"] = "openai_compat"
@@ -68,10 +79,16 @@ class Settings(BaseSettings):
     )
     embedding_vector_size: int = 1024
 
-    # BM25 (희소 벡터 생성) 모델 설정
-    bm25_model_name: str = "Qdrant/bm25"
-    bm25_cache_dir: str = "../../Models/hub/"
-    bm25_local_files_only: bool = False
+    # Sparse (희소 벡터 생성) 모델 설정
+    sparse_model_name: str = Field(
+        default_factory=lambda: str(
+            Path(__file__).resolve().parents[2] / "models" / "PIXIE-Splade-v1.0"
+        )
+    )
+    sparse_cache_dir: str = Field(
+        default_factory=lambda: str(Path(__file__).resolve().parents[2] / "models")
+    )
+    sparse_local_files_only: bool = False
     hf_hub_offline: bool = False
 
     # 검색 및 추천 오케스트레이션 파라미터

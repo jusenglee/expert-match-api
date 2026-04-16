@@ -37,6 +37,8 @@ NTIS_LLM_BASE_URL=https://api.openai.com/v1
 NTIS_LLM_API_KEY=your-api-key
 ```
 
+기본 로컬 모델 경로는 Dense 용 `multilingual-e5-large-instruct`, Sparse 용 `models/PIXIE-Splade-v1.0` 입니다. Sparse backend 는 `로컬 PIXIE -> online telepix/PIXIE-Splade-v1.0 -> Qdrant/bm25` 순서로 fallback 하며, `Qdrant/bm25` 는 FastEmbed/Qdrant builtin sparse 경로를 사용합니다. `NTIS_HF_HUB_OFFLINE=true` 또는 `NTIS_SPARSE_LOCAL_FILES_ONLY=true` 이면 online PIXIE 단계는 건너뜁니다. `ntis-validate-live` 와 readiness 검증도 같은 resolver 를 사용하므로, bm25 fallback 시 sparse modifier 기대값은 `IDF` 입니다.
+
 ### 3. 서버 실행
 ```bash
 uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload

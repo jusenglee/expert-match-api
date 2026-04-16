@@ -7,11 +7,9 @@ NTIS 전문가 추천 시스템의 메인 API 엔트리포인트입니다.
 from __future__ import annotations
 
 import logging
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -29,6 +27,7 @@ from apps.api.schemas import (
     SearchCandidatesRequest,
     SearchCandidatesResponse,
 )
+from apps.core.cache import PlanCache, RetrievalResultCache
 from apps.core.config import Settings, get_settings
 from apps.core.feedback_store import FeedbackStore
 from apps.core.logging import configure_logging, request_id_ctx, captured_logs_ctx
@@ -44,13 +43,21 @@ from apps.recommendation.reasoner import (
     PassThroughReasonGenerator,
 )
 from apps.recommendation.service import RecommendationService
-from apps.search.encoders import HashingDenseEncoder, OpenAIEmbeddingEncoder
+from apps.search.encoders import (
+    HashingDenseEncoder, 
+    OpenAIEmbeddingEncoder, 
+    SpladeSparseEncoder
+)
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.live_validator import LiveContractValidator
 from apps.search.qdrant_bootstrap import QdrantBootstrapper
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
+from apps.search.sparse_runtime import (
+    prepare_sparse_runtime_environment,
+    resolve_sparse_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +102,6 @@ async def build_app_runtime(
         settings.app_name,
     )
     if settings.hf_hub_offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"
         logger.info("HuggingFace Hub 오프라인 모드 강제 설정 (HF_HUB_OFFLINE=1)")
 
     validate_runtime_settings(settings)
@@ -107,30 +113,27 @@ async def build_app_runtime(
         cloud_inference=settings.qdrant_cloud_inference,
         timeout=20.0,
     )
-    # 로컬 BM25 인코딩 기능 활성화 (fastembed 필요)
-    cache_dir = Path(settings.bm25_cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["FASTEMBED_CACHE_PATH"] = str(cache_dir)
-
-    try:
-        client.set_sparse_model(
-            embedding_model_name=settings.bm25_model_name,
-            cache_dir=str(cache_dir),
-        )
-        logger.info(
-            "Qdrant sparse 모델 설정 완료: name=%s, cache=%s",
-            settings.bm25_model_name,
-            str(cache_dir),
-        )
-    except Exception as exc:
-        logger.warning("Qdrant sparse 모델 설정 실패: %s", exc)
+    # 로컬 Sparse 인코딩 기능 활성화 (fastembed 필요 모델용)
+    cache_dir = prepare_sparse_runtime_environment(settings)
 
     dense_encoder = build_dense_encoder(settings)
+    sparse_runtime, sparse_encoder = resolve_sparse_runtime(
+        client=client,
+        settings=settings,
+        cache_dir=cache_dir,
+        sparse_encoder_factory=SpladeSparseEncoder,
+    )
+
+    # L1 캐시 초기화 (Canonical Plan Cache)
+    plan_cache = PlanCache(cache_dir=settings.runtime_dir / "cache" / "planner")
+    
+    # L3 캐시 초기화 (Retrieval Result Cache)
+    retrieval_cache = RetrievalResultCache(cache_dir=settings.runtime_dir / "cache" / "retrieval")
 
     planner = (
         HeuristicPlanner()
         if settings.llm_backend == "heuristic"
-        else OpenAICompatPlanner(settings)
+        else OpenAICompatPlanner(settings, cache=plan_cache)
     )
     reason_generator = (
         PassThroughReasonGenerator()
@@ -142,7 +145,10 @@ async def build_app_runtime(
     feedback_store.initialize()
 
     bootstrapper = QdrantBootstrapper(
-        client=client, settings=settings, registry=registry
+        client=client,
+        settings=settings,
+        registry=registry,
+        sparse_runtime=sparse_runtime,
     )
     bootstrapper.ensure_collection(recreate=settings.seed_allow_recreate_collection)
 
@@ -153,7 +159,10 @@ async def build_app_runtime(
             settings=settings,
             registry=registry,
             dense_encoder=dense_encoder,
+            sparse_encoder=sparse_encoder,
+            sparse_runtime=sparse_runtime,
             query_builder=QueryTextBuilder(),
+            l3_cache=retrieval_cache,
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
@@ -167,6 +176,7 @@ async def build_app_runtime(
         settings=settings,
         registry=registry,
         dependency_validator=RuntimeDependencyValidator(settings),
+        sparse_runtime=sparse_runtime,
     )
 
     return service, validator
@@ -353,8 +363,12 @@ def create_app(
         # 캡처된 로그 주입
         logs = captured_logs_ctx.get()
 
-        candidate_items = [
-            SearchCandidateItem(
+        candidate_items = []
+        for card in result["candidates"]:
+            # hits_with_support에서 매칭되는 원본 히트를 찾아 지지 정보 추출
+            support_hit = next((h for h in result.get("hits_with_support", []) if h.expert_id == card.expert_id), None)
+            
+            item = SearchCandidateItem(
                 expert_id=card.expert_id,
                 name=card.name,
                 organization=card.organization,
@@ -363,26 +377,51 @@ def create_app(
                 data_gaps=card.data_gaps,
                 risks=card.risks,
                 shortlist_score=card.shortlist_score,
+                stable_hits=support_hit.stable_support_count if support_hit else 0,
+                expanded_hits=support_hit.expanded_support_count if support_hit else 0,
+                support_branches=support_hit.support_branches if support_hit else [],
             )
-            for card in result["candidates"]
-        ]
+            candidate_items.append(item)
+
+        planner_payload = result["planner"].model_dump(mode="json")
 
         trace = {
-            "planner": result["planner"].model_dump(mode="json"),
+            "planner": planner_payload,
             "planner_trace": result.get("planner_trace") or {},
             "raw_query": result.get("raw_query", normalized_query),
             "planner_keywords": (
                 (result.get("planner_trace") or {}).get("planner_keywords") or []
             ),
             "retrieval_keywords": result.get("retrieval_keywords") or [],
+            "bundle_ids": planner_payload.get("bundle_ids", []),
+            "expanded_shadow_hits": result.get("expanded_shadow_hits") or [],
+            "removed_role_terms": (
+                (result.get("planner_trace") or {}).get("removed_role_terms") or []
+            ),
+            "cache": {
+                "canonical_plan": (result.get("planner_trace") or {}).get("cache", {}).get("canonical_plan", "miss"),
+                "retrieval": "hit" if result.get("cache_hit") else "miss"
+            },
             "planner_retry_count": (
                 (result.get("planner_trace") or {}).get("planner_retry_count", 0)
             ),
+            "support_rule_applied": True,
+            "filtered_out_count": len(result.get("filtered_out_candidates") or []),
+            "filtered_out_candidates": result.get("filtered_out_candidates") or [],
             "retrieval_skipped_reason": result.get("retrieval_skipped_reason"),
             "branch_queries": result["branch_queries"],
             "include_orgs": result["planner"].include_orgs,
             "exclude_orgs": result["planner"].exclude_orgs,
             "candidate_ids": [card.expert_id for card in result["candidates"]],
+            "candidate_support_info": [
+                {
+                    "expert_id": hit.expert_id,
+                    "stable_hits": hit.stable_support_count,
+                    "expanded_hits": hit.expanded_support_count,
+                    "support_branches": hit.support_branches,
+                }
+                for hit in result.get("hits_with_support", [])
+            ],
             "retrieval_score_traces": result.get("retrieval_score_traces") or [],
             "final_sort_policy": result.get("final_sort_policy"),
             "query_payload": service._serialize_query_payload(result["query_payload"]),

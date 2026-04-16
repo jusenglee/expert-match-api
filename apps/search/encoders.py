@@ -1,19 +1,23 @@
 """
-텍스트를 고차원 벡터로 변환하는 Dense Encoder들을 정의하는 모듈입니다.
-OpenAI API, 로컬 SentenceTransformer, 그리고 테스트용 Hashing Encoder 등
-다양한 벡터화 방식을 지원합니다.
+텍스트를 고차원 벡터로 변환하는 Dense 및 Sparse Encoder들을 정의하는 모듈입니다.
+OpenAI API, 로컬 SentenceTransformer, 그리고 커스텀 SPLADE 인코더 등을 지원합니다.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Any
 
+import torch
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 from openai import OpenAI
 
 from apps.search.text_utils import stable_unit_vector
+
+logger = logging.getLogger(__name__)
 
 
 class DenseEncoder(Protocol):
@@ -26,55 +30,84 @@ class DenseEncoder(Protocol):
         ...
 
 
-def _resolve_local_model_path(model_name: str) -> Path | None:
-    """모델 이름이 로컬 파일 경로인지 확인하고 절대 경로를 반환합니다."""
-    model_path = Path(model_name).expanduser()
-    if not model_path.exists():
-        return None
-    return model_path.resolve()
+class SparseEncoder(Protocol):
+    """희소 벡터(Sparse Vector) 생성을 위한 인코더 인터페이스 정의입니다."""
+    model_name: str
+
+    def embed(self, text: str) -> dict[int, float]:
+        """텍스트를 {token_id: weight} 형태의 희소 벡터로 변환합니다."""
+        ...
 
 
-def _validate_local_sentence_transformer_bundle(model_path: Path) -> None:
-    """로컬에 저장된 SentenceTransformer 모델의 구성 파일들이 온전한지 검증합니다."""
-    modules_path = model_path / "modules.json"
-    if not modules_path.is_file():
-        return
+@dataclass(slots=True)
+class SpladeSparseEncoder:
+    """
+    Transformers를 사용하여 SPLADE(Sparse Lexical and Semantic) 희소 벡터를 생성합니다.
+    fastembed가 지원하지 않는 모델(예: PIXIE-Splade)을 로컬에서 실행하기 위해 사용합니다.
+    """
+    model_name: str
+    local_files_only: bool = False
+    _tokenizer: Any = field(init=False, repr=False)
+    _model: Any = field(init=False, repr=False)
+    _device: str = field(init=False, repr=False)
 
-    modules = json.loads(modules_path.read_text(encoding="utf-8"))
-    missing_module_dirs = [
-        str(model_path / module_path)
-        for module in modules
-        if (module_path := module.get("path")) and not (model_path / module_path).is_dir()
-    ]
-    if missing_module_dirs:
-        missing_dirs_text = ", ".join(missing_module_dirs)
-        raise FileNotFoundError(
-            "Local sentence-transformer bundle is incomplete. "
-            f"Missing module directories: {missing_dirs_text}"
-        )
+    def __post_init__(self) -> None:
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            resolved_model_name, load_kwargs = _prepare_model_reference(
+                self.model_name,
+                local_files_only=self.local_files_only,
+            )
+            self.model_name = resolved_model_name
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                resolved_model_name, **load_kwargs
+            )
+            self._model = AutoModelForMaskedLM.from_pretrained(
+                resolved_model_name, **load_kwargs
+            )
+            self._model.to(self._device)
+            self._model.eval()
+            logger.info("SpladeSparseEncoder initialized on %s: %s", self._device, self.model_name)
+        except Exception as exc:
+            logger.error("Failed to initialize SpladeSparseEncoder: %s", exc)
+            raise
+
+    def embed(self, text: str) -> dict[int, float]:
+        """텍스트를 SPLADE 희소 벡터(가중치 맵)로 변환합니다."""
+        if not text or not text.strip():
+            return {}
+
+        inputs = self._tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(self._device)
+        
+        with torch.no_grad():
+            logits = self._model(**inputs).logits
+            
+        # SPLADE log(1 + ReLU(logits)) * attention_mask
+        weights = torch.log(1 + torch.relu(logits))
+        # Max pooling across tokens
+        input_mask = inputs.attention_mask.unsqueeze(-1).expand_as(weights)
+        sparse_vector = torch.max(weights * input_mask, dim=1).values[0]
+        
+        # 0이 아닌 가중치만 추출
+        indices = torch.nonzero(sparse_vector).flatten()
+        values = sparse_vector[indices]
+        
+        return {int(idx): float(val) for idx, val in zip(indices, values)}
 
 
 @dataclass(slots=True)
 class HashingDenseEncoder:
-    """
-    결정론적 해싱(Deterministic Hashing) 기반의 테스트용 인코더입니다.
-    실제 의미론적 분석은 수행하지 않으며, 외부 API 없이 시스템 통합 테스트를 할 때 사용합니다.
-    """
+    """테스트용 해싱 기반 인코더입니다."""
     model_name: str
     vector_size: int
 
     def embed(self, text: str) -> list[float]:
-        # 테스트 전용 encoder다.
-        # 실운영에서는 사용하지 않고, 외부 임베딩 서버 없이 검색 조립만 검증할 때만 쓴다.
         return stable_unit_vector(text, self.vector_size)
 
 
 @dataclass(slots=True)
 class OpenAIEmbeddingEncoder:
-    """
-    OpenAI 호환 임베딩 API를 사용하는 인코더입니다.
-    운영 환경에서 가장 높은 검색 품질을 보장합니다.
-    """
+    """OpenAI API를 사용하는 임베딩 인코더입니다."""
     model_name: str
     vector_size: int
     base_url: str
@@ -82,54 +115,79 @@ class OpenAIEmbeddingEncoder:
     _client: OpenAI = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """OpenAI 클라이언트를 초기화합니다."""
         self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
 
     def embed(self, text: str) -> list[float]:
-        """OpenAI API를 호출하여 텍스트 임베딩을 생성합니다."""
-        # 실운영에서는 이 경로를 통해 실제 임베딩 서버에 질의한다.
         response = self._client.embeddings.create(model=self.model_name, input=text)
         vector = list(response.data[0].embedding)
-        
-        # 설정된 벡터 차원과 실제 응답 차원이 일치하는지 확인
         if len(vector) != self.vector_size:
-            raise ValueError(
-                f"Embedding dimension mismatch for {self.model_name}: "
-                f"expected {self.vector_size}, got {len(vector)}"
-            )
+            raise ValueError(f"Embedding dimension mismatch: expected {self.vector_size}, got {len(vector)}")
         return vector
 
 
 @dataclass(slots=True)
 class LocalSentenceTransformerEncoder:
-    """
-    로컬 CPU/GPU 자원을 사용하여 SentenceTransformer 모델을 실행하는 인코더입니다.
-    인터넷 연결이 제한된 환경이나 비용 절감이 필요한 경우에 적합합니다.
-    """
+    """SentenceTransformer를 사용하는 로컬 인코더입니다."""
     model_name: str
     vector_size: int
     _model: object = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """SentenceTransformer 모델을 로드합니다."""
         from sentence_transformers import SentenceTransformer
 
-        # 로컬 경로에 모델이 있는지 먼저 확인
-        local_model_path = _resolve_local_model_path(self.model_name)
-        if local_model_path is not None:
-            _validate_local_sentence_transformer_bundle(local_model_path)
-            self._model = SentenceTransformer(str(local_model_path), local_files_only=True)
-            return
-
-        # 로컬에 없으면 HuggingFace Hub 등에서 다운로드 (또는 이미 다운로드된 캐시 사용)
-        self._model = SentenceTransformer(self.model_name)
+        resolved_model_name, load_kwargs = _prepare_model_reference(
+            self.model_name,
+            required_files=("modules.json", "1_Pooling/config.json"),
+        )
+        self.model_name = resolved_model_name
+        self._model = SentenceTransformer(resolved_model_name, **load_kwargs)
 
     def embed(self, text: str) -> list[float]:
-        """로컬 모델을 사용하여 텍스트 임베딩을 추론합니다."""
         vector = self._model.encode(text).tolist()
         if len(vector) != self.vector_size:
-            raise ValueError(
-                f"Embedding dimension mismatch for {self.model_name}: "
-                f"expected {self.vector_size}, got {len(vector)}"
-            )
+            raise ValueError(f"Embedding dimension mismatch: expected {self.vector_size}, got {len(vector)}")
         return vector
+
+
+def _resolve_local_model_path(model_name: str) -> Path | None:
+    path = Path(model_name).expanduser()
+    return path.resolve() if path.exists() else None
+
+
+def _looks_like_local_model_reference(model_name: str) -> bool:
+    path = Path(model_name).expanduser()
+    if path.is_absolute() or model_name.startswith((".", "~")) or "\\" in model_name:
+        return True
+
+    parts = [part for part in path.parts if part not in ("", ".")]
+    if len(parts) > 2:
+        return True
+
+    return bool(parts) and Path(parts[0]).exists()
+
+
+def _validate_local_bundle(model_path: Path, required_files: tuple[str, ...]) -> None:
+    for relative_path in required_files:
+        required_path = model_path / relative_path
+        if not required_path.exists():
+            raise FileNotFoundError(
+                f"Local model bundle is missing required file: {required_path}"
+            )
+
+
+def _prepare_model_reference(
+    model_name: str,
+    *,
+    local_files_only: bool = False,
+    required_files: tuple[str, ...] = (),
+) -> tuple[str, dict[str, Any]]:
+    local_model_path = _resolve_local_model_path(model_name)
+    if local_model_path is not None:
+        _validate_local_bundle(local_model_path, required_files)
+        return str(local_model_path), {"local_files_only": True}
+
+    if _looks_like_local_model_reference(model_name):
+        requested_path = Path(model_name).expanduser().resolve(strict=False)
+        raise FileNotFoundError(f"Local model path does not exist: {requested_path}")
+
+    return model_name, {"local_files_only": local_files_only}
