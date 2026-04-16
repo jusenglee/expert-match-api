@@ -538,75 +538,32 @@ class RecommendationService:
         generated: Any | None,
         relevant_bundle: RelevantEvidenceBundle,
     ) -> tuple[list[EvidenceItem], dict[str, Any]]:
-        evidence_lookup = relevant_bundle.by_item_id()
-        provided_evidence_ids = [
-            item.item_id for item in cls._sort_relevant_items(relevant_bundle)
-        ]
-        requested_ids = list(getattr(generated, "selected_evidence_ids", []) or [])[:4]
-        invalid_selected_evidence_ids = [
-            item_id
-            for item_id in requested_ids
-            if not VALID_EVIDENCE_ID_PATTERN.fullmatch(item_id)
-        ]
-        unresolved_selected_evidence_ids = [
-            item_id
-            for item_id in requested_ids
-            if item_id not in invalid_selected_evidence_ids and item_id not in evidence_lookup
-        ]
+        # 구조 리팩토링: EvidenceSelector가 이미 최상위 3개를 엄선했으므로
+        # LLM의 선택 결과와 상관없이 relevant_bundle의 모든 항목을 최종 증거로 확정함.
+        # 이를 통해 추천 사유와 증거 간의 100% 싱크를 보장함.
+        resolved_items = relevant_bundle.all_items()
+        provided_evidence_ids = [item.item_id for item in resolved_items]
+        
+        # LLM이 선택한 ID (트래킹용)
+        requested_ids = list(getattr(generated, "selected_evidence_ids", []) or [])
 
-        resolved_items: list[RelevantEvidenceItem] = []
-        seen_ids: set[str] = set()
-        for item_id in requested_ids:
-            item = evidence_lookup.get(item_id)
-            if item is None or item_id in seen_ids:
-                continue
-            resolved_items.append(item)
-            seen_ids.add(item_id)
-
-        fallback = "none"
         if not resolved_items:
-            if requested_ids:
-                logger.warning(
-                    "Selected evidence ids could not be resolved; using fallback: expert_id=%s requested_ids=%s invalid_ids=%s unresolved_ids=%s available_ids=%s",
-                    card.expert_id,
-                    requested_ids,
-                    invalid_selected_evidence_ids,
-                    unresolved_selected_evidence_ids,
-                    provided_evidence_ids,
-                )
-            ranked_items = cls._sort_relevant_items(relevant_bundle)
-            if ranked_items:
-                resolved_items = [ranked_items[0]]
-                fallback = "top_relevant"
-            else:
-                profile_item = cls._build_profile_evidence(card)
-                if profile_item is not None:
-                    return [profile_item], {
-                        "expert_id": card.expert_id,
-                        "provided_evidence_ids": provided_evidence_ids,
-                        "selected_evidence_ids": requested_ids,
-                        "llm_selected_evidence_ids": requested_ids,
-                        "resolver_available_evidence_ids": provided_evidence_ids,
-                        "invalid_selected_evidence_ids": invalid_selected_evidence_ids,
-                        "unresolved_selected_evidence_ids": unresolved_selected_evidence_ids,
-                        "resolved_evidence_ids": ["profile"],
-                        "relevant_evidence_count": len(provided_evidence_ids),
-                        "relevant_bundle_empty": not provided_evidence_ids,
-                        "fallback": "profile",
-                    }
-                return [], {
+            profile_item = cls._build_profile_evidence(card)
+            if profile_item is not None:
+                return [profile_item], {
                     "expert_id": card.expert_id,
-                    "provided_evidence_ids": provided_evidence_ids,
+                    "provided_evidence_ids": [],
                     "selected_evidence_ids": requested_ids,
-                    "llm_selected_evidence_ids": requested_ids,
-                    "resolver_available_evidence_ids": provided_evidence_ids,
-                    "invalid_selected_evidence_ids": invalid_selected_evidence_ids,
-                    "unresolved_selected_evidence_ids": unresolved_selected_evidence_ids,
-                    "resolved_evidence_ids": [],
-                    "relevant_evidence_count": len(provided_evidence_ids),
-                    "relevant_bundle_empty": not provided_evidence_ids,
-                    "fallback": "empty",
+                    "resolved_evidence_ids": ["profile"],
+                    "fallback": "profile",
                 }
+            return [], {
+                "expert_id": card.expert_id,
+                "provided_evidence_ids": [],
+                "selected_evidence_ids": requested_ids,
+                "resolved_evidence_ids": [],
+                "fallback": "empty",
+            }
 
         return (
             [cls._build_evidence_item(item) for item in resolved_items],
@@ -614,14 +571,8 @@ class RecommendationService:
                 "expert_id": card.expert_id,
                 "provided_evidence_ids": provided_evidence_ids,
                 "selected_evidence_ids": requested_ids,
-                "llm_selected_evidence_ids": requested_ids,
-                "resolver_available_evidence_ids": provided_evidence_ids,
-                "invalid_selected_evidence_ids": invalid_selected_evidence_ids,
-                "unresolved_selected_evidence_ids": unresolved_selected_evidence_ids,
-                "resolved_evidence_ids": [item.item_id for item in resolved_items],
-                "relevant_evidence_count": len(provided_evidence_ids),
-                "relevant_bundle_empty": not provided_evidence_ids,
-                "fallback": fallback,
+                "resolved_evidence_ids": provided_evidence_ids,
+                "fallback": "none",
             },
         )
 

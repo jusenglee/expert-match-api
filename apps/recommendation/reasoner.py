@@ -205,23 +205,23 @@ class OpenAICompatReasonGenerator:
         prompt = f"""
         당신은 R&D 전문가 추천 시스템의 추천 사유 생성기입니다.
 
-        당신의 임무는 이미 추천 랭킹이 확정된 후보자 배치를 받아, 각 후보자가 추천된 '그럴듯한 사유'를 생성하는 것입니다.
+        당신의 임무는 이미 추천 랭킹이 확정된 후보자 배치를 받아, 각 후보자가 추천된 객관적인 사유를 생성하는 것입니다.
         입력된 후보자의 전문가 ID(expert_id)를 단 하나도 누락하거나 중복하거나 임의로 생성하지 마세요.
 
         [배경 및 데이터 활용]
         - 이 후보자들은 시스템에 의해 질의와 관련된 인물로 이미 판별된 상태입니다.
-        - `relevant_papers`, `relevant_projects`, `relevant_patents`와 같은 직접적인 증거와 함께, `technical_classifications`, `evaluation_activities` 등의 부가 컨텍스트를 최대한 활용하세요.
-        - **[중요]** 만약 제공된 증거만으로 사용자 질의와의 직접적인 연관성이 다소 부족해 보이더라도, 후보자의 전공, 소속, 과거 이력 등을 바탕으로 유추하여 어떻게든 합리적이고 긍정적인 추천 사유를 생성해야 합니다 (합리적인 수준의 유추/부분적 환각 허용).
+        - **[중요]** 절대 없는 사실을 지어내지 마세요(환각 금지). 반드시 제공된 증거(`relevant_papers`, `relevant_projects`, `relevant_patents`)의 내용에 기반하여 작성해야 합니다.
+        - `technical_classifications`, `evaluation_activities` 등의 부가 컨텍스트는 보조적으로만 활용하세요.
         - 증거를 인용할 때는 반드시 제공된 증거 ID(`relevant_*`에 있는 ID)만 사용하세요.
 
         [출력 규칙]
         - `fit`은 다음 중 하나여야 합니다: {FIT_HIGH}, {FIT_MEDIUM}, {FIT_NORMAL}
         - `recommendation_reason`은 1~2문장의 간결하고 구체적인 한국어 문장으로 작성하며, 320자를 넘지 마세요.
-        - `selected_evidence_ids`는 제공된 `evidence_id` 문자열을 그대로 복사해서 최대 {MAX_SELECTED_EVIDENCE_IDS}개까지 선택하세요.
+        - **추천 사유는 반드시 제공된 증거의 실적명이나 연구 내용을 언급하여 작성해야 합니다.**
+        - `selected_evidence_ids`는 제공된 모든 `evidence_id` 문자열을 그대로 포함시키세요 (최대 {MAX_SELECTED_EVIDENCE_IDS}개).
         - `selected_evidence_ids`에는 `paper:<number>`, `project:<number>`, `patent:<number>` 형식의 ID만 넣으세요.
-        - `selected_evidence_ids`에 날짜, 제목, 범위 표기, 또는 임의로 만든 ID를 넣지 마세요.
         - 적절한 직접 증거 ID가 없으면 `selected_evidence_ids`는 빈 배열(`[]`)로 두세요.
-        - `risks`는 매우 짧고 사실적인 유의사항(예: 최근 실적 부족, 특정 분야 편중 등)만 적거나 비워두세요.
+        - `risks`는 매우 짧고 사실적인 유의사항만 적거나 비워두세요.
 
         {output_instruction}
         """

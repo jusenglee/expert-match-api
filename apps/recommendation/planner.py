@@ -101,13 +101,14 @@ class OpenAICompatPlanner:
                 당신은 전문가/평가위원을 모아놓은 qdrant 벡터DB 에 검색 할 쿼리를 만들기 위해, 사용자의 질의에서 키워드를 추출해야합니다.
             
                 # 출력 목표
-                - `core_keywords`: 기술 도메인 명사 또는 명사구만 포함(검색 쿼리용 키워드)("평가위원","전문가" 금지)
+                - `core_keywords`: 기술 도메인 명사 또는 명사구만 포함(BM25/정확도 검색용)("평가위원","전문가" 금지)
+                - `semantic_query`: 검색 의도를 담은 자연어 문장(Vector 검색용). 핵심 기술 키워드와 맥락을 포함하세요.
                 - `task_terms`: 검색 대상이 아닌 요청, 역할, 또는 행동 용어만 포함
                 - `intent_summary`: UI/추적용 짧은 요약 문장
             
                 # 규칙
                 1. 사용자 질의의 주 언어를 유지하세요. 번역하거나 언어를 섞지 마세요.
-                2. 브랜치별 힌트, 바꿔쓰기, 의미 확장 표현을 생성하지 마세요.
+                2. `semantic_query`는 벡터 검색 성능을 극대화하기 위해 질의의 핵심 기술적 맥락을 자연스럽게 요약하여 작성하세요.
                 3. `core_keywords`에는 도메인 개념, 기술, 재료, 분야만 포함해야 합니다.
                 4. `task_terms`에는 무엇을 검색할지가 아니라, 검색을 위해 core_keywords의 제약조건을 분류하세요( 기후변화 대응 R&D 과제 평가 경험, 평가위원 추천 등 ) 
                 5. 명시적으로 주어진 기관 제약만 `include_orgs`와 `exclude_orgs`에 복사하세요.
@@ -120,6 +121,7 @@ class OpenAICompatPlanner:
                 {
                   "intent_summary": "string",
                   "core_keywords": ["string"],
+                  "semantic_query": "string",
                   "task_terms": ["string"],
                   "hard_filters": {},
                   "include_orgs": ["string"],
@@ -141,8 +143,9 @@ class OpenAICompatPlanner:
                 Output:
                 {
                   "intent_summary": "난접근성 화재 진압과 드론 접목 관련 전문가 탐색",
-                  "core_keywords": ["난접근성 화재 진압", "드론",],
-                  "task_terms": ["전문가","평가위원", "추천", "드론을 화재진압 연구에 사용한 경험"],
+                  "core_keywords": ["난접근성 화재 진압", "드론"],
+                  "semantic_query": "난접근성 화재 현장의 화재 진압을 위한 드론 및 무인 로봇 활용 연구 전문가",
+                  "task_terms": ["전문가", "평가위원", "추천", "드론을 화재진압 연구에 사용한 경험"],
                   "hard_filters": {},
                   "include_orgs": [],
                   "exclude_orgs": [],

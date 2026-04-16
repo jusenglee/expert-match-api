@@ -405,7 +405,8 @@ def test_recommend_falls_back_to_top_relevant_evidence_when_llm_selection_is_mis
     assert recommendation.model_dump(mode="json")["reasons"] == [
         "Strong publication history"
     ]
-    assert result["trace"]["reason_generation_trace"]["selected_evidence"][0]["fallback"] == "top_relevant"
+    # 구조 리팩토링 후에는 별도의 fallback 라벨 없이 항상 EvidenceSelector의 결과가 사용됨
+    assert result["trace"]["reason_generation_trace"]["selected_evidence"][0]["fallback"] == "none"
     assert recommendation.fit == "보통"
 
 
@@ -429,29 +430,14 @@ def test_recommend_ignores_invalid_selected_evidence_ids_and_uses_fallback():
 
     recommendation: RecommendationDecision = result["recommendations"][0]
     assert recommendation.evidence[0].title == "Paper 1"
+    # LLM이 잘못된 ID를 선택했더라도 EvidenceSelector가 확정한 paper:0이 최종적으로 사용됨
     assert (
         result["trace"]["reason_generation_trace"]["selected_evidence"][0]["selected_evidence_ids"]
         == ["project:99", "paper:999"]
     )
     assert (
-        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["resolver_available_evidence_ids"]
-        == ["paper:0"]
-    )
-    assert (
-        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["invalid_selected_evidence_ids"]
-        == []
-    )
-    assert (
-        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["unresolved_selected_evidence_ids"]
-        == ["project:99", "paper:999"]
-    )
-    assert (
         result["trace"]["reason_generation_trace"]["selected_evidence"][0]["resolved_evidence_ids"]
         == ["paper:0"]
-    )
-    assert (
-        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["relevant_bundle_empty"]
-        is False
     )
     assert recommendation.fit == "보통"
 
@@ -479,7 +465,7 @@ def test_recommend_logs_empty_reason_and_invalid_evidence_selection(caplog):
     assert result["recommendations"][0].recommendation_reason == (
         "'Paper 1' 논문이 확인되어 질의와 관련된 전문성 근거로 참고할 수 있습니다."
     )
-    assert "Selected evidence ids could not be resolved" in caplog.text
+    # 리팩토링 후에는 EvidenceSelector 결과가 우선되므로 ID 미매칭 로그는 더 이상 출력되지 않음
     assert "Recommendation reason is empty after reason generation" in caplog.text
     assert "Recommendation reason fallback generated" in caplog.text
 
@@ -525,10 +511,8 @@ def test_recommend_profile_fallback_trace_exposes_empty_relevant_bundle():
 
     selected_trace = result["trace"]["reason_generation_trace"]["selected_evidence"][0]
     recommendation: RecommendationDecision = result["recommendations"][0]
-    assert selected_trace["resolver_available_evidence_ids"] == []
-    assert selected_trace["invalid_selected_evidence_ids"] == ["pat:2009-12-09"]
-    assert selected_trace["unresolved_selected_evidence_ids"] == []
-    assert selected_trace["relevant_bundle_empty"] is True
+    assert selected_trace["provided_evidence_ids"] == []
+    assert selected_trace["selected_evidence_ids"] == ["pat:2009-12-09"]
     assert selected_trace["fallback"] == "profile"
     assert recommendation.evidence[0].type == "profile"
 
@@ -561,7 +545,7 @@ def test_recommend_generates_fallback_reason_for_omitted_candidate():
     assert result["trace"]["reason_generation_trace"]["server_fallback_reasons"] == [
         {
             "expert_id": "2",
-            "source": "top_relevant",
+            "source": "selected_evidence",
             "resolved_evidence_ids": ["paper:0"],
         }
     ]

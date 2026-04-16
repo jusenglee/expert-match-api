@@ -194,9 +194,16 @@ class PlannerOutput(BaseModel):
     exclude_orgs: list[str] = Field(default_factory=list)
     task_terms: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
+    semantic_query: str = ""
     top_k: int = 15
 
-    @field_validator("include_orgs", "exclude_orgs", "task_terms", "core_keywords", mode="before")
+    @field_validator(
+        "include_orgs",
+        "exclude_orgs",
+        "task_terms",
+        "core_keywords",
+        mode="before",
+    )
     @classmethod
     def _normalize_string_lists(cls, value: Any) -> Any:
         return _normalize_string_list(value)

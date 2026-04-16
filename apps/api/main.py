@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_query_text(query: str) -> str:
-    return " ".join(query.split())
+    return ", ".join(line.strip() for line in query.splitlines() if line.strip())
 
 
 def build_dense_encoder(settings: Settings):

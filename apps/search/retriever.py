@@ -185,16 +185,19 @@ class QdrantHybridRetriever:
         query_filter: models.Filter | None,
     ) -> RetrievalResult:
         retrieval_keywords = self.query_builder.normalize_keywords(plan.core_keywords)
-        branch_queries = self.query_builder.build_branch_queries(query, plan)
+        dense_branch_queries = self.query_builder.build_dense_branch_queries(query, plan)
+        sparse_branch_queries = self.query_builder.build_sparse_branch_queries(query, plan)
+        
         logger.debug(
-            "Generated branch queries:\n%s",
-            pprint.pformat(branch_queries, indent=2, width=100),
+            "Generated branch queries:\ndense: %s\nsparse: %s",
+            pprint.pformat(dense_branch_queries, indent=2, width=100),
+            pprint.pformat(sparse_branch_queries, indent=2, width=100),
         )
         branch_query_payloads: dict[str, dict[str, Any]] = {}
         prefetches: list[models.Prefetch] = []
 
         for branch in BRANCHES:
-            dense_query_text = branch_queries[branch]
+            dense_query_text = dense_branch_queries[branch]
             if "instruct" in getattr(self.dense_encoder, "model_name", "").lower():
                 instruct_prefix = (
                     "Instruct: Find experts whose profile, papers, patents, or projects "
@@ -203,7 +206,7 @@ class QdrantHybridRetriever:
                 dense_query_text = f"{instruct_prefix}{dense_query_text}"
             dense_query = self.dense_encoder.embed(dense_query_text)
             sparse_query = models.Document(
-                text=branch_queries[branch],
+                text=sparse_branch_queries[branch],
                 model=self.settings.bm25_model_name,
             )
             branch_query_payloads[branch] = self._build_branch_query_payload(
@@ -382,7 +385,7 @@ class QdrantHybridRetriever:
         return RetrievalResult(
             hits=hits,
             query_payload=query_payload,
-            branch_queries=branch_queries,
+            branch_queries=dense_branch_queries, # Maintain compatibility with trace
             retrieval_keywords=retrieval_keywords,
             retrieval_score_traces=retrieval_score_traces,
         )
