@@ -10,6 +10,7 @@ from apps.core.config import Settings
 from apps.core.runtime_validation import validate_runtime_settings
 from apps.search.live_validator import LiveContractValidator
 from apps.search.schema_registry import BRANCHES, PAYLOAD_INDEX_FIELDS, SearchSchemaRegistry
+from apps.search.sparse_runtime import SparseRuntimeConfig
 
 
 def build_valid_sample_payload() -> dict[str, object]:
@@ -62,7 +63,7 @@ class FakeQdrantClient:
         missing_index: bool = False,
         no_points: bool = False,
         malformed_payload: bool = False,
-        sparse_modifier: object = models.Modifier.IDF,
+        sparse_modifier: object = None,
         sample_payloads: list[object] | None = None,
     ):
         dense_vectors = {
@@ -175,6 +176,31 @@ def test_live_validator_accepts_modifier_like_object_with_idf_name():
         settings=settings,
         registry=SearchSchemaRegistry.default(),
         dependency_validator=FakeDependencyValidator(),
+        sparse_runtime=SparseRuntimeConfig(
+            backend="fastembed_builtin",
+            active_model_name="Qdrant/bm25",
+            requires_idf_modifier=True,
+        ),
+    )
+
+    report = validator.validate()
+
+    assert report.ready is True
+    assert report.checks["sparse_vectors_idf"] is True
+
+
+def test_live_validator_accepts_none_modifier_for_splade_runtime():
+    settings = Settings()
+    validator = LiveContractValidator(
+        client=FakeQdrantClient(sparse_modifier=None),
+        settings=settings,
+        registry=SearchSchemaRegistry.default(),
+        dependency_validator=FakeDependencyValidator(),
+        sparse_runtime=SparseRuntimeConfig(
+            backend="custom_splade",
+            active_model_name="telepix/PIXIE-Splade-v1.0",
+            requires_idf_modifier=False,
+        ),
     )
 
     report = validator.validate()
@@ -197,6 +223,15 @@ def test_settings_default_local_embedding_bundle_contains_required_modules():
     assert (model_path / "modules.json").is_file()
     assert (model_path / "1_Pooling" / "config.json").is_file()
     assert (model_path / "2_Normalize").is_dir()
+
+
+def test_settings_default_local_sparse_model_path_points_to_repo_bundle():
+    settings = Settings()
+    model_path = Path(settings.sparse_model_name)
+    expected_path = Path(__file__).resolve().parents[1] / "models" / "PIXIE-Splade-v1.0"
+
+    assert model_path == expected_path
+    assert model_path.parent.name == "models"
 
 
 def test_live_validator_reports_missing_vector_and_index():

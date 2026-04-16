@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from apps.search.encoders import LocalSentenceTransformerEncoder, OpenAIEmbeddingEncoder
+from apps.search.encoders import (
+    LocalSentenceTransformerEncoder,
+    OpenAIEmbeddingEncoder,
+    SpladeSparseEncoder,
+)
 
 
 def test_local_sentence_transformer_encoder_initializes_model_in_slots(monkeypatch):
@@ -73,6 +77,116 @@ def test_local_sentence_transformer_encoder_rejects_incomplete_local_bundle(monk
 
     with pytest.raises(FileNotFoundError, match="1_Pooling"):
         LocalSentenceTransformerEncoder(model_name=str(model_dir), vector_size=3)
+
+
+def test_splade_sparse_encoder_uses_local_files_only_for_local_bundle(monkeypatch):
+    class FakeModel:
+        def __init__(self):
+            self.device = None
+            self.eval_called = False
+
+        def to(self, device):
+            self.device = device
+
+        def eval(self):
+            self.eval_called = True
+
+    calls = {}
+    model_dir = Path(__file__).resolve().parents[1] / "models" / "PIXIE-Splade-v1.0"
+
+    def fake_tokenizer_from_pretrained(model_name, **kwargs):
+        calls["tokenizer"] = (model_name, kwargs)
+        return object()
+
+    def fake_model_from_pretrained(model_name, **kwargs):
+        calls["model"] = (model_name, kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(
+        "apps.search.encoders.AutoTokenizer.from_pretrained",
+        fake_tokenizer_from_pretrained,
+    )
+    monkeypatch.setattr(
+        "apps.search.encoders.AutoModelForMaskedLM.from_pretrained",
+        fake_model_from_pretrained,
+    )
+    monkeypatch.setattr("apps.search.encoders.torch.cuda.is_available", lambda: False)
+
+    encoder = SpladeSparseEncoder(model_name=str(model_dir))
+
+    assert encoder.model_name == str(model_dir.resolve())
+    assert calls["tokenizer"] == (
+        str(model_dir.resolve()),
+        {"local_files_only": True},
+    )
+    assert calls["model"][0] == str(model_dir.resolve())
+    assert calls["model"][1] == {"local_files_only": True}
+    assert encoder._model.device == "cpu"
+    assert encoder._model.eval_called is True
+
+
+def test_splade_sparse_encoder_rejects_missing_local_path(monkeypatch):
+    missing_model_dir = Path(__file__).resolve().parent / "fixtures" / "missing_splade_bundle"
+
+    monkeypatch.setattr(
+        "apps.search.encoders.AutoTokenizer.from_pretrained",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("AutoTokenizer should not be called for a missing local path")
+        ),
+    )
+    monkeypatch.setattr(
+        "apps.search.encoders.AutoModelForMaskedLM.from_pretrained",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("AutoModel should not be called for a missing local path")
+        ),
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing_splade_bundle"):
+        SpladeSparseEncoder(model_name=str(missing_model_dir))
+
+
+def test_splade_sparse_encoder_passes_repo_id_with_local_files_only_override(monkeypatch):
+    class FakeModel:
+        def to(self, device):
+            self.device = device
+
+        def eval(self):
+            self.eval_called = True
+
+    calls = {}
+
+    def fake_tokenizer_from_pretrained(model_name, **kwargs):
+        calls["tokenizer"] = (model_name, kwargs)
+        return object()
+
+    def fake_model_from_pretrained(model_name, **kwargs):
+        calls["model"] = (model_name, kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(
+        "apps.search.encoders.AutoTokenizer.from_pretrained",
+        fake_tokenizer_from_pretrained,
+    )
+    monkeypatch.setattr(
+        "apps.search.encoders.AutoModelForMaskedLM.from_pretrained",
+        fake_model_from_pretrained,
+    )
+    monkeypatch.setattr("apps.search.encoders.torch.cuda.is_available", lambda: False)
+
+    encoder = SpladeSparseEncoder(
+        model_name="telepix/PIXIE-Splade-v1.0",
+        local_files_only=True,
+    )
+
+    assert encoder.model_name == "telepix/PIXIE-Splade-v1.0"
+    assert calls["tokenizer"] == (
+        "telepix/PIXIE-Splade-v1.0",
+        {"local_files_only": True},
+    )
+    assert calls["model"] == (
+        "telepix/PIXIE-Splade-v1.0",
+        {"local_files_only": True},
+    )
 
 
 def test_openai_embedding_encoder_initializes_client_in_slots(monkeypatch):

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import apps.api.main as main_module
+import pytest
 from fastapi.testclient import TestClient
+from pathlib import Path
 from types import SimpleNamespace
 
 from apps.api.main import create_app
 from apps.api.schemas import RecommendationResponse, ReadinessResponse
 from apps.core.config import Settings
 from apps.domain.models import RecommendationDecision
+from apps.search.sparse_runtime import ONLINE_PIXIE_SPLADE_MODEL, QDRANT_BM25_MODEL
 
 
 class FakeRecommendationService:
@@ -324,3 +327,225 @@ def test_startup_failure_is_reported_by_readiness_and_service_endpoints(monkeypa
 
     assert recommend_response.status_code == 503
     assert "Qdrant bootstrap failed" in recommend_response.json()["detail"]
+
+
+def _patch_runtime_build_dependencies(monkeypatch, *, sparse_encoder_factory):
+    dense_encoder = object()
+    registry = object()
+
+    class FakeQdrantClient:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.set_sparse_model_calls = []
+            FakeQdrantClient.last_instance = self
+
+        def set_sparse_model(self, **kwargs):
+            self.set_sparse_model_calls.append(kwargs)
+
+    class FakeFeedbackStore:
+        def __init__(self, db_path, table_name):
+            self.db_path = db_path
+            self.table_name = table_name
+            self.initialized = False
+
+        def initialize(self):
+            self.initialized = True
+
+    class FakeBootstrapper:
+        def __init__(self, client, settings, registry, sparse_runtime=None):
+            self.client = client
+            self.settings = settings
+            self.registry = registry
+            self.sparse_runtime = sparse_runtime
+            self.recreate = None
+
+        def ensure_collection(self, recreate=False):
+            self.recreate = recreate
+
+    monkeypatch.setattr(main_module, "validate_runtime_settings", lambda settings: None)
+    monkeypatch.setattr(
+        main_module.SearchSchemaRegistry,
+        "default",
+        staticmethod(lambda: registry),
+    )
+    monkeypatch.setattr(main_module, "QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr(main_module, "build_dense_encoder", lambda settings: dense_encoder)
+    monkeypatch.setattr(main_module, "SpladeSparseEncoder", sparse_encoder_factory)
+    monkeypatch.setattr(main_module, "PlanCache", lambda cache_dir: ("plan", cache_dir))
+    monkeypatch.setattr(
+        main_module, "RetrievalResultCache", lambda cache_dir: ("retrieval", cache_dir)
+    )
+    monkeypatch.setattr(main_module, "HeuristicPlanner", lambda: "planner")
+    monkeypatch.setattr(main_module, "PassThroughReasonGenerator", lambda: "reasoner")
+    monkeypatch.setattr(main_module, "FeedbackStore", FakeFeedbackStore)
+    monkeypatch.setattr(main_module, "QdrantBootstrapper", FakeBootstrapper)
+    monkeypatch.setattr(
+        main_module, "RecommendationService", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(
+        main_module, "LiveContractValidator", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+
+    return dense_encoder, registry, FakeQdrantClient
+
+
+@pytest.mark.anyio
+async def test_build_app_runtime_selects_local_pixie_custom_encoder(monkeypatch):
+    model_dir = Path(__file__).resolve().parents[1] / "models" / "PIXIE-Splade-v1.0"
+    test_workspace = Path(__file__).resolve().parents[1] / "runtime" / "test_build_app_runtime_local"
+    sparse_calls = []
+
+    def sparse_encoder_factory(model_name, local_files_only=False):
+        sparse_calls.append((model_name, local_files_only))
+        resolved_name = str(Path(model_name).resolve()) if Path(model_name).exists() else model_name
+        return SimpleNamespace(model_name=resolved_name)
+
+    dense_encoder, _, fake_qdrant_client = _patch_runtime_build_dependencies(
+        monkeypatch,
+        sparse_encoder_factory=sparse_encoder_factory,
+    )
+
+    settings = Settings(
+        app_env="test",
+        strict_runtime_validation=False,
+        llm_backend="heuristic",
+        sparse_model_name=str(model_dir),
+        sparse_cache_dir=str(test_workspace / "models-cache"),
+        runtime_dir=test_workspace / "runtime",
+    )
+
+    service, validator = await main_module.build_app_runtime(settings)
+
+    assert service.retriever.dense_encoder is dense_encoder
+    assert service.retriever.sparse_encoder.model_name == str(model_dir.resolve())
+    assert service.retriever.sparse_runtime.backend == "custom_splade"
+    assert service.retriever.sparse_runtime.active_model_name == str(model_dir.resolve())
+    assert service.retriever.sparse_runtime.used_fallback is False
+    assert validator.sparse_runtime.active_model_name == str(model_dir.resolve())
+    assert sparse_calls == [(str(model_dir), False)]
+    assert fake_qdrant_client.last_instance is not None
+    assert fake_qdrant_client.last_instance.set_sparse_model_calls == []
+
+
+@pytest.mark.anyio
+async def test_build_app_runtime_falls_back_to_online_pixie_before_bm25(monkeypatch):
+    model_dir = Path(__file__).resolve().parents[1] / "runtime" / "missing-local-pixie"
+    test_workspace = Path(__file__).resolve().parents[1] / "runtime" / "test_build_app_runtime_online"
+    sparse_calls = []
+
+    def sparse_encoder_factory(model_name, local_files_only=False):
+        sparse_calls.append((model_name, local_files_only))
+        if model_name == str(model_dir):
+            raise FileNotFoundError("configured local pixie is missing")
+        return SimpleNamespace(model_name=model_name)
+
+    _, _, fake_qdrant_client = _patch_runtime_build_dependencies(
+        monkeypatch,
+        sparse_encoder_factory=sparse_encoder_factory,
+    )
+
+    settings = Settings(
+        app_env="test",
+        strict_runtime_validation=False,
+        llm_backend="heuristic",
+        sparse_model_name=str(model_dir),
+        sparse_cache_dir=str(test_workspace / "models-cache"),
+        runtime_dir=test_workspace / "runtime",
+    )
+
+    service, validator = await main_module.build_app_runtime(settings)
+
+    assert service.retriever.sparse_encoder.model_name == ONLINE_PIXIE_SPLADE_MODEL
+    assert service.retriever.sparse_runtime.backend == "custom_splade"
+    assert service.retriever.sparse_runtime.active_model_name == ONLINE_PIXIE_SPLADE_MODEL
+    assert service.retriever.sparse_runtime.used_fallback is True
+    assert validator.sparse_runtime.active_model_name == ONLINE_PIXIE_SPLADE_MODEL
+    assert sparse_calls == [
+        (str(model_dir), False),
+        (ONLINE_PIXIE_SPLADE_MODEL, False),
+    ]
+    assert fake_qdrant_client.last_instance.set_sparse_model_calls == []
+
+
+@pytest.mark.anyio
+async def test_build_app_runtime_falls_back_to_bm25_when_pixie_attempts_fail(monkeypatch):
+    model_dir = Path(__file__).resolve().parents[1] / "runtime" / "missing-local-pixie"
+    test_workspace = Path(__file__).resolve().parents[1] / "runtime" / "test_build_app_runtime_bm25"
+    sparse_calls = []
+
+    def sparse_encoder_factory(model_name, local_files_only=False):
+        sparse_calls.append((model_name, local_files_only))
+        raise RuntimeError(f"cannot load sparse model: {model_name}")
+
+    _, _, fake_qdrant_client = _patch_runtime_build_dependencies(
+        monkeypatch,
+        sparse_encoder_factory=sparse_encoder_factory,
+    )
+
+    settings = Settings(
+        app_env="test",
+        strict_runtime_validation=False,
+        llm_backend="heuristic",
+        sparse_model_name=str(model_dir),
+        sparse_cache_dir=str(test_workspace / "models-cache"),
+        runtime_dir=test_workspace / "runtime",
+    )
+
+    service, validator = await main_module.build_app_runtime(settings)
+
+    assert service.retriever.sparse_encoder is None
+    assert service.retriever.sparse_runtime.backend == "fastembed_builtin"
+    assert service.retriever.sparse_runtime.active_model_name == QDRANT_BM25_MODEL
+    assert service.retriever.sparse_runtime.used_fallback is True
+    assert validator.sparse_runtime.active_model_name == QDRANT_BM25_MODEL
+    assert sparse_calls == [
+        (str(model_dir), False),
+        (ONLINE_PIXIE_SPLADE_MODEL, False),
+    ]
+    assert fake_qdrant_client.last_instance.set_sparse_model_calls == [
+        {
+            "embedding_model_name": QDRANT_BM25_MODEL,
+            "cache_dir": str(test_workspace / "models-cache"),
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_build_app_runtime_skips_online_pixie_when_offline_and_uses_bm25(monkeypatch):
+    model_dir = Path(__file__).resolve().parents[1] / "runtime" / "missing-local-pixie"
+    test_workspace = Path(__file__).resolve().parents[1] / "runtime" / "test_build_app_runtime_offline_bm25"
+    sparse_calls = []
+
+    def sparse_encoder_factory(model_name, local_files_only=False):
+        sparse_calls.append((model_name, local_files_only))
+        raise RuntimeError(f"cannot load sparse model: {model_name}")
+
+    _, _, fake_qdrant_client = _patch_runtime_build_dependencies(
+        monkeypatch,
+        sparse_encoder_factory=sparse_encoder_factory,
+    )
+
+    settings = Settings(
+        app_env="test",
+        strict_runtime_validation=False,
+        llm_backend="heuristic",
+        sparse_model_name=str(model_dir),
+        sparse_cache_dir=str(test_workspace / "models-cache"),
+        runtime_dir=test_workspace / "runtime",
+        hf_hub_offline=True,
+    )
+
+    service, _ = await main_module.build_app_runtime(settings)
+
+    assert service.retriever.sparse_encoder is None
+    assert service.retriever.sparse_runtime.active_model_name == QDRANT_BM25_MODEL
+    assert sparse_calls == [(str(model_dir), False)]
+    assert fake_qdrant_client.last_instance.set_sparse_model_calls == [
+        {
+            "embedding_model_name": QDRANT_BM25_MODEL,
+            "cache_dir": str(test_workspace / "models-cache"),
+            "local_files_only": True,
+        }
+    ]

@@ -15,6 +15,7 @@ from apps.search.schema_registry import (
     PAYLOAD_INDEX_FIELDS,
     SearchSchemaRegistry,
 )
+from apps.search.sparse_runtime import SparseRuntimeConfig, model_requires_idf_modifier
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,21 @@ class QdrantBootstrapper:
     """
 
     def __init__(
-        self, client: QdrantClient, settings: Settings, registry: SearchSchemaRegistry
+        self,
+        client: QdrantClient,
+        settings: Settings,
+        registry: SearchSchemaRegistry,
+        sparse_runtime: SparseRuntimeConfig | None = None,
     ) -> None:
         self.client = client
         self.settings = settings
         self.registry = registry
+        self.sparse_runtime = sparse_runtime
+
+    def _requires_idf_modifier(self) -> bool:
+        if self.sparse_runtime is not None:
+            return self.sparse_runtime.requires_idf_modifier
+        return model_requires_idf_modifier(self.settings.sparse_model_name)
 
     def ensure_collection(self, recreate: bool = False) -> None:
         """
@@ -55,6 +66,18 @@ class QdrantBootstrapper:
                 )
 
         if not self._collection_exists(collection_name):
+            # Sparse 모델 종류에 따라 적절한 Modifier 설정
+            # Splade 계열은 모델이 직접 가중치를 계산하므로 IDF 수정을 권장하지 않음
+            requires_idf_modifier = self._requires_idf_modifier()
+            sparse_modifier = models.Modifier.IDF if requires_idf_modifier else None
+            
+            logger.info(
+                "Creating collection %s with sparse_modifier=%s (requires_idf=%s)",
+                collection_name,
+                sparse_modifier,
+                requires_idf_modifier,
+            )
+
             # 컬렉션 생성 (다중 Dense 벡터 및 Sparse 벡터 설정 포함)
             self.client.create_collection(
                 collection_name=collection_name,
@@ -65,12 +88,11 @@ class QdrantBootstrapper:
                     )
                     for branch in BRANCHES
                 },
-                # BM25 기반 키워드 검색을 위한 Sparse 벡터 설정
                 sparse_vectors_config={
                     self.registry.sparse_vector_by_branch[
                         branch
                     ]: models.SparseVectorParams(
-                        modifier=models.Modifier.IDF,
+                        modifier=sparse_modifier,
                     )
                     for branch in BRANCHES
                 },
@@ -102,7 +124,7 @@ class QdrantBootstrapper:
 
     def ensure_sparse_vector_modifiers(self) -> None:
         """
-        기존 컬렉션의 스파스 벡터 수정자가 IDF로 설정되어 있는지 확인하고,
+        기존 컬렉션의 스파스 벡터 수정자가 설정과 일치하는지 확인하고,
         다를 경우 수정을 시도합니다.
         """
         try:
@@ -125,16 +147,23 @@ class QdrantBootstrapper:
             )
             return
 
+        target_modifier = (
+            models.Modifier.IDF if self._requires_idf_modifier() else None
+        )
+
         updates: dict[str, models.SparseVectorParams] = {}
         for branch in BRANCHES:
             vector_name = self.registry.sparse_vector_by_branch[branch]
             params = sparse_config.get(vector_name)
-            modifier = getattr(params, "modifier", None)
-            # IDF가 아니면 업데이트 목록에 추가
-            if not self._modifier_is_idf(modifier):
-                updates[vector_name] = models.SparseVectorParams(
-                    modifier=models.Modifier.IDF
-                )
+            current_modifier = getattr(params, "modifier", None)
+            
+            # 현재 설정이 목표와 다르면 업데이트 목록에 추가
+            if target_modifier == models.Modifier.IDF:
+                if not self._modifier_is_idf(current_modifier):
+                    updates[vector_name] = models.SparseVectorParams(modifier=target_modifier)
+            else:
+                if current_modifier is not None:
+                    updates[vector_name] = models.SparseVectorParams(modifier=None)
 
         if not updates:
             return
@@ -145,7 +174,8 @@ class QdrantBootstrapper:
                 sparse_vectors_config=updates,
             )
             logger.info(
-                "Updated sparse vector modifiers to IDF for collection %s: %s",
+                "Updated sparse vector modifiers to %s for collection %s: %s",
+                target_modifier,
                 self.settings.qdrant_collection_name,
                 sorted(updates.keys()),
             )
