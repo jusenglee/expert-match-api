@@ -137,10 +137,15 @@ class RecommendationService:
             "query_filter": query_filter,
             "retrieved_count": len(retrieval.hits),
             "candidates": cards,
+            "hits_with_support": display_hits, # Support 정보 포함된 원본 히트
+            "support_rule_applied": True,
+            "cache_hit": retrieval.cache_hit,
+            "filtered_out_candidates": retrieval.filtered_out_candidates,
             "query_payload": retrieval.query_payload,
             "branch_queries": retrieval.branch_queries,
             "retrieval_keywords": retrieval.retrieval_keywords,
             "retrieval_score_traces": retrieval.retrieval_score_traces,
+            "expanded_shadow_hits": self._serialize_shadow_hits(retrieval.expanded_shadow_hits),
             "raw_query": query,
             "retrieval_skipped_reason": None,
             "final_sort_policy": FINAL_SORT_POLICY,
@@ -659,12 +664,22 @@ class RecommendationService:
         return recommendations, selected_evidence_trace, server_fallback_reasons
 
     @staticmethod
+    def _serialize_shadow_hits(hits: list[SearchHit]) -> list[dict[str, str]]:
+        return [
+            {
+                "expert_id": hit.expert_id,
+                "name": hit.payload.basic_info.researcher_name or "",
+            }
+            for hit in hits
+        ]
+
+    @staticmethod
     def _build_recommendation_response(
         *,
         plan: PlannerOutput,
         candidate_cards: list[CandidateCard],
         query_payload: dict[str, Any],
-        branch_queries: dict[str, str],
+        branch_queries: dict[str, CompiledBranchQueries],
         raw_query: str,
         retrieval_keywords: list[str],
         retrieval_score_traces: list[dict[str, Any]],
@@ -678,6 +693,7 @@ class RecommendationService:
         final_sort_policy: str,
         top_k_used: int,
         timers: dict[str, Any] | None,
+        expanded_shadow_hits: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         merged_data_gaps = _merge_unique_strings(data_gaps)
         return {
@@ -693,10 +709,17 @@ class RecommendationService:
                 "planner_trace": planner_trace or {},
                 "reason_generation_trace": reason_generation_trace or {},
                 "raw_query": raw_query,
+                "cache": {
+                    "canonical_plan": (planner_trace or {}).get("cache", {}).get("canonical_plan", "miss"),
+                    "retrieval": "hit" if timers and timers.get("search_ms", 0) < 5 else "miss" 
+                },
                 "planner_keywords": (
                     (planner_trace or {}).get("planner_keywords") or []
                 ),
                 "retrieval_keywords": retrieval_keywords,
+                "bundle_ids": plan.bundle_ids,
+                "expanded_shadow_hits": expanded_shadow_hits or [],
+                "filtered_out_candidates": (planner_trace or {}).get("filtered_out_candidates") or [],
                 "planner_retry_count": (
                     (planner_trace or {}).get("planner_retry_count", 0)
                 ),

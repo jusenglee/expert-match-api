@@ -194,6 +194,11 @@ class PlannerOutput(BaseModel):
     exclude_orgs: list[str] = Field(default_factory=list)
     task_terms: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
+    retrieval_core: list[str] = Field(default_factory=list)
+    role_terms: list[str] = Field(default_factory=list)
+    action_terms: list[str] = Field(default_factory=list)
+    bundle_ids: list[str] = Field(default_factory=list)
+    intent_flags: dict[str, Any] = Field(default_factory=dict)
     semantic_query: str = ""
     top_k: int = 15
 
@@ -202,6 +207,10 @@ class PlannerOutput(BaseModel):
         "exclude_orgs",
         "task_terms",
         "core_keywords",
+        "retrieval_core",
+        "role_terms",
+        "action_terms",
+        "bundle_ids",
         mode="before",
     )
     @classmethod
@@ -215,6 +224,11 @@ class SearchHit(BaseModel):
     payload: ExpertPayload
     branch: BranchName | None = None
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
+    
+    # 아키텍처 Support Rule 추적 정보
+    stable_support_count: int = 0
+    expanded_support_count: int = 0
+    support_branches: list[BranchName] = Field(default_factory=list)
 
 
 class GroupedSearchHit(BaseModel):
