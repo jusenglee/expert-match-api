@@ -13,19 +13,33 @@ from apps.domain.models import (
     ResearchProjectEvidence,
 )
 from apps.recommendation.evidence_selector import RelevantEvidenceBundle, RelevantEvidenceItem
-from apps.recommendation.reasoner import OpenAICompatReasonGenerator
+from apps.recommendation.reasoner import FIT_HIGH, OpenAICompatReasonGenerator
 
 
 class FakeReasonModel:
-    def __init__(self, content):
+    def __init__(self, content="", *, tool_calls=None, responses=None):
         self.content = content
+        self.tool_calls = tool_calls or []
+        self.responses = list(responses or [])
         self.last_kwargs = None
         self.last_messages = None
+        self.call_count = 0
+        self.calls: list[dict[str, object]] = []
 
     async def ainvoke_non_stream(self, messages, **kwargs):
         self.last_kwargs = dict(kwargs)
         self.last_messages = messages
-        return AIMessage(content=self.content)
+        self.call_count += 1
+        self.calls.append(
+            {
+                "messages": messages,
+                "kwargs": dict(kwargs),
+            }
+        )
+        if self.responses:
+            return self.responses.pop(0)
+        additional_kwargs = {"tool_calls": self.tool_calls} if self.tool_calls else {}
+        return AIMessage(content=self.content, additional_kwargs=additional_kwargs)
 
 
 def _candidate(expert_id: str, name: str, score: float) -> CandidateCard:
@@ -89,9 +103,10 @@ def test_reason_generator_normalizes_output_to_input_order():
     assert [item.expert_id for item in output.items] == ["1", "2"]
     assert output.items[0].recommendation_reason == "Reason for first"
     assert output.items[1].recommendation_reason == "Reason for second"
-    assert generator.last_trace["mode"] == "openai_compat"
+    assert generator.last_trace["mode"] == "json_fallback"
     assert generator.last_trace["returned_ids"] == ["2", "1"]
     assert generator.last_trace["missing_candidate_ids"] == []
+    assert generator.last_trace["retry_count"] == 0
 
 
 def test_reason_generator_serializes_relevant_evidence_only():
@@ -150,6 +165,12 @@ def test_reason_generator_serializes_relevant_evidence_only():
     assert candidate_payload["relevant_papers"][0]["title"] == "Medical imaging segmentation"
     assert candidate_payload["relevant_papers"][0]["matched_keywords"] == ["medical imaging"]
     assert "match_score" not in candidate_payload["relevant_papers"][0]
+    assert fake_model.last_kwargs["tools"][0]["function"]["name"] == "submit_recommendation_batch"
+    assert fake_model.last_kwargs["tool_choice"]["function"]["name"] == "submit_recommendation_batch"
+    selected_evidence_schema = fake_model.last_kwargs["tools"][0]["function"]["parameters"][
+        "properties"
+    ]["items"]["items"]["properties"]["selected_evidence_ids"]
+    assert selected_evidence_schema["items"]["enum"] == ["paper:0"]
 
 
 def test_reason_generator_serializes_raw_candidate_context_and_retrieval_grounding():
@@ -266,3 +287,152 @@ def test_reason_generator_logs_missing_and_empty_reasons(caplog):
     assert generator.last_trace["returned_ids"] == ["1"]
     assert generator.last_trace["missing_candidate_ids"] == ["2"]
     assert generator.last_trace["empty_reason_candidate_ids"] == ["1", "2"]
+
+
+def test_reason_generator_prefers_tool_call_arguments_when_present():
+    generator = OpenAICompatReasonGenerator(
+        Settings(app_env="test", strict_runtime_validation=False)
+    )
+    tool_payload = {
+        "items": [
+            {
+                "expert_id": "1",
+                "fit": FIT_HIGH,
+                "recommendation_reason": "Structured tool output is available.",
+                "selected_evidence_ids": ["paper:0"],
+                "risks": [],
+            }
+        ],
+        "data_gaps": [],
+    }
+    generator.model = FakeReasonModel(
+        content='{"items":[],"data_gaps":[]}',
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "submit_recommendation_batch",
+                    "arguments": json.dumps(tool_payload, ensure_ascii=False),
+                },
+            }
+        ],
+    )
+
+    output = asyncio.run(
+        generator.generate(
+            query="Recommend reviewers",
+            plan=PlannerOutput(
+                intent_summary="Recommend reviewers",
+                core_keywords=["semiconductor"],
+            ),
+            candidates=[_candidate("1", "Alpha", 98.0)],
+        )
+    )
+
+    assert output.items[0].recommendation_reason == "Structured tool output is available."
+    assert output.items[0].selected_evidence_ids == ["paper:0"]
+    assert generator.last_trace["mode"] == "tool_call"
+
+
+def test_reason_generator_filters_invalid_selected_evidence_ids_and_records_trace(caplog):
+    generator = OpenAICompatReasonGenerator(
+        Settings(app_env="test", strict_runtime_validation=False)
+    )
+    tool_payload = {
+        "items": [
+            {
+                "expert_id": "1",
+                "fit": FIT_HIGH,
+                "recommendation_reason": "Structured tool output is available.",
+                "selected_evidence_ids": ["pat:2009-12-09", "paper:0"],
+                "risks": [],
+            }
+        ],
+        "data_gaps": [],
+    }
+    generator.model = FakeReasonModel(
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "submit_recommendation_batch",
+                    "arguments": json.dumps(tool_payload, ensure_ascii=False),
+                },
+            }
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="apps.recommendation.reasoner"):
+        output = asyncio.run(
+            generator.generate(
+                query="Recommend reviewers",
+                plan=PlannerOutput(
+                    intent_summary="Recommend reviewers",
+                    core_keywords=["semiconductor"],
+                ),
+                candidates=[_candidate("1", "Alpha", 98.0)],
+            )
+        )
+
+    assert output.items[0].selected_evidence_ids == ["paper:0"]
+    assert generator.last_trace["invalid_selected_evidence_candidate_ids"] == ["1"]
+    assert generator.last_trace["invalid_selected_evidence_ids_by_candidate"] == {
+        "1": ["pat:2009-12-09"]
+    }
+    assert "invalid selected evidence ids" in caplog.text
+
+
+def test_reason_generator_retries_with_compact_payload_when_first_attempt_returns_no_candidate_ids():
+    generator = OpenAICompatReasonGenerator(
+        Settings(app_env="test", strict_runtime_validation=False)
+    )
+    generator.model = FakeReasonModel(
+        responses=[
+            AIMessage(content='{"items":[],"data_gaps":[]}'),
+            AIMessage(
+                content="""{
+                  "items": [
+                    {
+                      "expert_id": "1",
+                      "fit": "보통",
+                      "recommendation_reason": "Retry payload succeeded.",
+                      "selected_evidence_ids": [],
+                      "risks": []
+                    }
+                  ],
+                  "data_gaps": []
+                }"""
+            ),
+        ]
+    )
+    candidate = _candidate("1", "Alpha", 98.0)
+    candidate.top_projects = [
+        ResearchProjectEvidence(
+            project_title_korean=f"프로젝트 {index}",
+            project_end_date="2025-12-31",
+            research_content_summary="summary",
+        )
+        for index in range(1, 7)
+    ]
+
+    output = asyncio.run(
+        generator.generate(
+            query="Recommend reviewers",
+            plan=PlannerOutput(
+                intent_summary="Recommend reviewers",
+                core_keywords=["semiconductor"],
+            ),
+            candidates=[candidate],
+        )
+    )
+
+    assert output.items[0].recommendation_reason == "Retry payload succeeded."
+    assert generator.model.call_count == 2
+    first_payload = json.loads(generator.model.calls[0]["messages"][1].content)
+    second_payload = json.loads(generator.model.calls[1]["messages"][1].content)
+    assert len(first_payload["candidates"][0]["all_projects"]) == 5
+    assert len(second_payload["candidates"][0]["all_projects"]) == 2
+    assert generator.last_trace["retry_count"] == 1
+    assert generator.last_trace["prompt_budget_mode"] == "retry_compact"

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import textwrap
 from typing import Any, Protocol
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, field_validator
 
 from apps.core.config import Settings
@@ -17,6 +18,50 @@ from apps.domain.models import CandidateCard, PlannerOutput
 from apps.recommendation.evidence_selector import RelevantEvidenceBundle
 
 logger = logging.getLogger(__name__)
+
+FIT_HIGH = "\ub192\uc74c"
+FIT_MEDIUM = "\uc911\uac04"
+FIT_NORMAL = "\ubcf4\ud1b5"
+FIT_VALUES = {FIT_HIGH, FIT_MEDIUM, FIT_NORMAL}
+
+MAX_SELECTED_EVIDENCE_IDS = 4
+REASON_TOOL_NAME = "submit_recommendation_batch"
+REASON_GENERATION_MAX_TOKENS = 1600
+VALID_EVIDENCE_ID_PATTERN = re.compile(r"^(paper|project|patent):\d+$")
+
+PRIMARY_PAYLOAD_PROFILE: dict[str, Any] = {
+    "name": "primary",
+    "trim_applied": False,
+    "relevant_limit": 10,
+    "all_papers_limit": 3,
+    "all_projects_limit": 5,
+    "all_patents_limit": 3,
+    "evaluation_limit": 3,
+    "technical_classifications_limit": 5,
+    "matched_filter_limit": 4,
+    "matched_keywords_limit": 5,
+    "snippet_char_limit": 1000,  # 600에서 1000으로 상향
+    "detail_char_limit": 200,
+    "abstract_char_limit": 600,
+    "project_summary_char_limit": 600,
+}
+
+RETRY_PAYLOAD_PROFILE: dict[str, Any] = {
+    "name": "retry_compact",
+    "trim_applied": True,
+    "relevant_limit": 4,
+    "all_papers_limit": 1,
+    "all_projects_limit": 2,
+    "all_patents_limit": 1,
+    "evaluation_limit": 1,
+    "technical_classifications_limit": 3,
+    "matched_filter_limit": 2,
+    "matched_keywords_limit": 3,
+    "snippet_char_limit": 280,
+    "detail_char_limit": 120,
+    "abstract_char_limit": 220,
+    "project_summary_char_limit": 220,
+}
 
 
 def _normalize_string_list(value: Any) -> list[str]:
@@ -35,9 +80,22 @@ def _normalize_string_list(value: Any) -> list[str]:
     return []
 
 
+def _truncate_text(value: Any, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split())
+    if not normalized:
+        return None
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    if max_chars <= 3:
+        return normalized[:max_chars]
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
 class ReasonedCandidate(BaseModel):
     expert_id: str
-    fit: str = "보통"
+    fit: str = FIT_NORMAL
     recommendation_reason: str = ""
     selected_evidence_ids: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
@@ -98,7 +156,7 @@ class PassThroughReasonGenerator:
             items=[
                 ReasonedCandidate(
                     expert_id=candidate.expert_id,
-                    fit="보통",
+                    fit=FIT_NORMAL,
                     recommendation_reason="",
                     selected_evidence_ids=[],
                     risks=list(candidate.risks),
@@ -116,6 +174,10 @@ class PassThroughReasonGenerator:
             "missing_candidate_ids": [],
             "empty_reason_candidate_ids": candidate_ids,
             "empty_selected_evidence_candidate_ids": candidate_ids,
+            "retry_count": 0,
+            "returned_ratio": 1.0 if candidates else 0.0,
+            "prompt_budget_mode": "fallback",
+            "trim_applied": True,
         }
         return output
 
@@ -132,111 +194,248 @@ class OpenAICompatReasonGenerator:
         self.last_trace: dict[str, Any] = {}
 
     @staticmethod
-    def _build_system_prompt() -> str:
-        prompt = """
-            당신은 국가 R&D 과제 평가위원 추천 시스템의 '기술 전문 분석관'입니다.
-            후보자들의 실적(논문, 특허, 과제)을 심도 있게 분석하여, 왜 이 전문가가 사용자의 질의에 가장 적합한지 기술적으로 설득력 있는 추천 사유를 작성하는 것이 당신의 임무입니다.
+    def _build_system_prompt(*, use_tools: bool) -> str:
+        output_instruction = (
+            f"반드시 `{REASON_TOOL_NAME}` 도구를 단 한 번만 호출해야 하며, 도구 호출 외의 다른 텍스트는 출력하지 마세요."
+            if use_tools
+            else (
+                '반드시 `{"items":[...],"data_gaps":[...]}` 형태의 JSON 객체 단 하나만 반환해야 하며, JSON 외의 다른 텍스트는 출력하지 마세요.'
+            )
+        )
+        prompt = f"""
+        당신은 R&D 전문가 추천 시스템의 추천 사유 생성기입니다.
 
-            [작성 원칙]
-            1. **종합적 분석**: 제공된 `relevant_papers/projects/patents`뿐만 아니라, `all_papers/projects/patents`, `evaluation_activities`(평가위원 활동), `technical_classifications`(기술 분류) 등 모든 컨텍스트를 종합적으로 고려하여 후보자의 전문성을 판단하세요.
-            2. **기술적 구체성**: 단순히 "경험이 많음"이라고 하지 마세요. 실적물(Snippet)에 나타난 구체적인 기술 명칭, 방법론, 연구 대상을 언급하며 사용자의 질의와 기술적으로 어떻게 연결되는지 설명하세요.
-            3. **증거 인용(Citation)**: 추천 사유 내에서 핵심적인 증거가 된 실적의 제목을 언급하고, 해당 실적이 `relevant_*` 리스트에 있다면 그 `evidence_id`를 `selected_evidence_ids`에 정확히 포함하세요. (최대 4개)
-            4. **적합도(Fit) 판단**: 
-               - '높음': 질의의 핵심 기술과 실적이 직접적으로 일치하며 최근 성과가 뚜렷함.
-               - '중간': 관련 분야의 경험은 풍부하나 질의의 특정 세부 기술과는 약간의 거리가 있음.
-               - '보통': 기초적인 관련성은 있으나 직접적인 핵심 증거가 부족함.
-            5. **데이터 공백(Data Gaps)**: 만약 핵심 기술에 대한 직접적인 실적이 부족하다면 `data_gaps`에 "OO 기술에 대한 직접적인 논문/과제 이력 확인 필요"와 같이 구체적으로 명시하세요.
+        당신의 임무는 이미 추천 랭킹이 확정된 후보자 배치를 받아, 각 후보자가 추천된 '그럴듯한 사유'를 생성하는 것입니다.
+        입력된 후보자의 전문가 ID(expert_id)를 단 하나도 누락하거나 중복하거나 임의로 생성하지 마세요.
 
-            [금기 사항]
-            - 제공되지 않은 실적을 지어내거나 과장하지 마세요.
-            - "추천합니다"와 같은 상투적인 문구보다는 "XX 기술에 대한 연구 실적을 보유하고 있어 YY 과제 평가에 적합함"과 같은 분석적 어조를 사용하세요.
-            - 한국어로 전문적이고 신뢰감 있는 어조를 유지하세요.
+        [배경 및 데이터 활용]
+        - 이 후보자들은 시스템에 의해 질의와 관련된 인물로 이미 판별된 상태입니다.
+        - `relevant_papers`, `relevant_projects`, `relevant_patents`와 같은 직접적인 증거와 함께, `technical_classifications`, `evaluation_activities` 등의 부가 컨텍스트를 최대한 활용하세요.
+        - **[중요]** 만약 제공된 증거만으로 사용자 질의와의 직접적인 연관성이 다소 부족해 보이더라도, 후보자의 전공, 소속, 과거 이력 등을 바탕으로 유추하여 어떻게든 합리적이고 긍정적인 추천 사유를 생성해야 합니다 (합리적인 수준의 유추/부분적 환각 허용).
+        - 증거를 인용할 때는 반드시 제공된 증거 ID(`relevant_*`에 있는 ID)만 사용하세요.
 
-            반드시 JSON 형식으로 응답하십시오.
+        [출력 규칙]
+        - `fit`은 다음 중 하나여야 합니다: {FIT_HIGH}, {FIT_MEDIUM}, {FIT_NORMAL}
+        - `recommendation_reason`은 1~2문장의 간결하고 구체적인 한국어 문장으로 작성하며, 320자를 넘지 마세요.
+        - `selected_evidence_ids`는 제공된 `evidence_id` 문자열을 그대로 복사해서 최대 {MAX_SELECTED_EVIDENCE_IDS}개까지 선택하세요.
+        - `selected_evidence_ids`에는 `paper:<number>`, `project:<number>`, `patent:<number>` 형식의 ID만 넣으세요.
+        - `selected_evidence_ids`에 날짜, 제목, 범위 표기, 또는 임의로 만든 ID를 넣지 마세요.
+        - 적절한 직접 증거 ID가 없으면 `selected_evidence_ids`는 빈 배열(`[]`)로 두세요.
+        - `risks`는 매우 짧고 사실적인 유의사항(예: 최근 실적 부족, 특정 분야 편중 등)만 적거나 비워두세요.
+
+        {output_instruction}
         """
         return textwrap.dedent(prompt).strip()
 
     @staticmethod
-    def _serialize_evidence_items(items: list[Any]) -> list[dict[str, Any]]:
+    def _build_reason_tools(
+        allowed_evidence_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        selected_evidence_item_schema: dict[str, Any] = {"type": "string"}
+        if allowed_evidence_ids:
+            selected_evidence_item_schema["enum"] = allowed_evidence_ids
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": REASON_TOOL_NAME,
+                    "description": "Submit structured recommendation results for the current candidate batch.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "expert_id": {"type": "string"},
+                                        "fit": {"type": "string"},
+                                        "recommendation_reason": {"type": "string"},
+                                        "selected_evidence_ids": {
+                                            "type": "array",
+                                            "items": selected_evidence_item_schema,
+                                            "maxItems": MAX_SELECTED_EVIDENCE_IDS,
+                                        },
+                                        "risks": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                    "required": [
+                                        "expert_id",
+                                        "fit",
+                                        "recommendation_reason",
+                                        "selected_evidence_ids",
+                                        "risks",
+                                    ],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "data_gaps": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["items", "data_gaps"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    @classmethod
+    def _serialize_evidence_items(
+        cls,
+        items: list[Any],
+        *,
+        limit: int,
+        profile: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "evidence_id": item.item_id,
                 "type": item.type,
-                "title": item.title,
+                "title": _truncate_text(item.title, profile["detail_char_limit"]),
                 "date": item.date,
-                "detail": item.detail,
-                "snippet": item.snippet,
-                "matched_keywords": list(item.matched_keywords),
+                "detail": _truncate_text(item.detail, profile["detail_char_limit"]),
+                "snippet": _truncate_text(item.snippet, profile["snippet_char_limit"]),
+                "matched_keywords": list(item.matched_keywords)[
+                    : profile["matched_keywords_limit"]
+                ],
             }
-            for item in items
+            for item in items[:limit]
         ]
 
-    @staticmethod
-    def _serialize_all_publications(items: list[Any]) -> list[dict[str, Any]]:
+    @classmethod
+    def _serialize_all_publications(
+        cls,
+        items: list[Any],
+        *,
+        limit: int,
+        profile: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         return [
             {
-                "title": item.publication_title,
-                "journal_name": item.journal_name,
+                "title": _truncate_text(item.publication_title, profile["detail_char_limit"]),
+                "journal_name": _truncate_text(item.journal_name, profile["detail_char_limit"]),
                 "date": item.publication_year_month,
-                "abstract": item.abstract,
-                "korean_keywords": list(item.korean_keywords),
-                "english_keywords": list(item.english_keywords),
+                "abstract": _truncate_text(item.abstract, profile["abstract_char_limit"]),
+                "korean_keywords": list(item.korean_keywords)[
+                    : profile["matched_keywords_limit"]
+                ],
+                "english_keywords": list(item.english_keywords)[
+                    : profile["matched_keywords_limit"]
+                ],
             }
-            for item in items
+            for item in items[:limit]
         ]
 
-    @staticmethod
-    def _serialize_all_projects(items: list[Any]) -> list[dict[str, Any]]:
+    @classmethod
+    def _serialize_all_projects(
+        cls,
+        items: list[Any],
+        *,
+        limit: int,
+        profile: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         return [
             {
-                "title": item.display_title,
-                "project_title_korean": item.project_title_korean,
-                "project_title_english": item.project_title_english,
+                "title": _truncate_text(item.display_title, profile["detail_char_limit"]),
                 "start_date": item.project_start_date,
                 "end_date": item.project_end_date,
                 "reference_year": item.reference_year,
-                "performing_organization": item.performing_organization,
-                "managing_agency": item.managing_agency,
-                "research_objective_summary": item.research_objective_summary,
-                "research_content_summary": item.research_content_summary,
+                "performing_organization": _truncate_text(
+                    item.performing_organization, profile["detail_char_limit"]
+                ),
+                "managing_agency": _truncate_text(
+                    item.managing_agency, profile["detail_char_limit"]
+                ),
+                "research_objective_summary": _truncate_text(
+                    item.research_objective_summary, profile["project_summary_char_limit"]
+                ),
+                "research_content_summary": _truncate_text(
+                    item.research_content_summary, profile["project_summary_char_limit"]
+                ),
             }
-            for item in items
+            for item in items[:limit]
         ]
 
-    @staticmethod
-    def _serialize_all_patents(items: list[Any]) -> list[dict[str, Any]]:
+    @classmethod
+    def _serialize_all_patents(
+        cls,
+        items: list[Any],
+        *,
+        limit: int,
+        profile: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         return [
             {
-                "title": item.intellectual_property_title,
-                "intellectual_property_type": item.intellectual_property_type,
-                "application_registration_type": item.application_registration_type,
-                "application_country": item.application_country,
-                "application_number": item.application_number,
+                "title": _truncate_text(
+                    item.intellectual_property_title, profile["detail_char_limit"]
+                ),
+                "intellectual_property_type": _truncate_text(
+                    item.intellectual_property_type, profile["detail_char_limit"]
+                ),
+                "application_registration_type": _truncate_text(
+                    item.application_registration_type, profile["detail_char_limit"]
+                ),
+                "application_country": _truncate_text(
+                    item.application_country, profile["detail_char_limit"]
+                ),
                 "application_date": item.application_date,
-                "registration_number": item.registration_number,
                 "registration_date": item.registration_date,
             }
-            for item in items
+            for item in items[:limit]
         ]
 
     @staticmethod
-    def _serialize_evaluation_activities(items: list[Any]) -> list[dict[str, Any]]:
+    def _serialize_evaluation_activities(
+        items: list[Any],
+        *,
+        limit: int,
+        profile: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         return [
             {
-                "appoint_org_nm": item.appoint_org_nm,
-                "committee_nm": item.committee_nm,
+                "appoint_org_nm": _truncate_text(
+                    item.appoint_org_nm, profile["detail_char_limit"]
+                ),
+                "committee_nm": _truncate_text(
+                    item.committee_nm, profile["detail_char_limit"]
+                ),
                 "appoint_period": item.appoint_period,
                 "appoint_dt": item.appoint_dt,
             }
-            for item in items
+            for item in items[:limit]
         ]
+
+    @staticmethod
+    def _compact_retrieval_grounding(trace: dict[str, Any]) -> dict[str, Any]:
+        if not trace:
+            return {}
+        branch_matches = trace.get("branch_matches") or []
+        compact_matches = [
+            {
+                "branch": match.get("branch"),
+                "rank": match.get("rank"),
+                "score": match.get("score"),
+            }
+            for match in branch_matches[:2]
+        ]
+        return {
+            "primary_branch": trace.get("primary_branch"),
+            "final_score": trace.get("final_score"),
+            "branch_matches": compact_matches,
+        }
 
     @classmethod
     def _serialize_candidates(
         cls,
         candidates: list[CandidateCard],
-        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
-        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]] | None = None,
+        *,
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None,
+        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]] | None,
+        profile: dict[str, Any],
     ) -> list[dict[str, Any]]:
         serialized: list[dict[str, Any]] = []
         relevant_evidence_by_expert_id = relevant_evidence_by_expert_id or {}
@@ -249,39 +448,65 @@ class OpenAICompatReasonGenerator:
             serialized.append(
                 {
                     "expert_id": candidate.expert_id,
-                    "name": candidate.name,
-                    "organization": candidate.organization,
-                    "position": candidate.position,
-                    "degree": candidate.degree,
-                    "major": candidate.major,
+                    "name": _truncate_text(candidate.name, profile["detail_char_limit"]),
+                    "organization": _truncate_text(
+                        candidate.organization, profile["detail_char_limit"]
+                    ),
+                    "position": _truncate_text(
+                        candidate.position, profile["detail_char_limit"]
+                    ),
+                    "degree": _truncate_text(candidate.degree, profile["detail_char_limit"]),
+                    "major": _truncate_text(candidate.major, profile["detail_char_limit"]),
                     "rank_score": candidate.rank_score,
                     "shortlist_score": candidate.shortlist_score,
                     "branch_presence_flags": dict(candidate.branch_presence_flags),
                     "counts": dict(candidate.counts),
                     "technical_classifications": list(
                         candidate.technical_classifications
-                    ),
+                    )[: profile["technical_classifications_limit"]],
                     "evaluation_activity_cnt": candidate.evaluation_activity_cnt,
                     "evaluation_activities": cls._serialize_evaluation_activities(
-                        candidate.evaluation_activities
+                        candidate.evaluation_activities,
+                        limit=profile["evaluation_limit"],
+                        profile=profile,
                     ),
-                    "matched_filter_summary": list(candidate.matched_filter_summary),
+                    "matched_filter_summary": list(candidate.matched_filter_summary)[
+                        : profile["matched_filter_limit"]
+                    ],
                     "data_gaps": list(candidate.data_gaps),
-                    "retrieval_grounding": retrieval_score_traces_by_expert_id.get(
-                        candidate.expert_id, {}
+                    "retrieval_grounding": cls._compact_retrieval_grounding(
+                        retrieval_score_traces_by_expert_id.get(candidate.expert_id, {})
                     ),
                     "relevant_papers": cls._serialize_evidence_items(
-                        relevant_bundle.papers[:10]
+                        relevant_bundle.papers,
+                        limit=profile["relevant_limit"],
+                        profile=profile,
                     ),
                     "relevant_patents": cls._serialize_evidence_items(
-                        relevant_bundle.patents[:10]
+                        relevant_bundle.patents,
+                        limit=profile["relevant_limit"],
+                        profile=profile,
                     ),
                     "relevant_projects": cls._serialize_evidence_items(
-                        relevant_bundle.projects[:10]
+                        relevant_bundle.projects,
+                        limit=profile["relevant_limit"],
+                        profile=profile,
                     ),
-                    "all_papers": cls._serialize_all_publications(candidate.top_papers[:10]),
-                    "all_patents": cls._serialize_all_patents(candidate.top_patents[:10]),
-                    "all_projects": cls._serialize_all_projects(candidate.top_projects[:10]),
+                    "all_papers": cls._serialize_all_publications(
+                        candidate.top_papers,
+                        limit=profile["all_papers_limit"],
+                        profile=profile,
+                    ),
+                    "all_patents": cls._serialize_all_patents(
+                        candidate.top_patents,
+                        limit=profile["all_patents_limit"],
+                        profile=profile,
+                    ),
+                    "all_projects": cls._serialize_all_projects(
+                        candidate.top_projects,
+                        limit=profile["all_projects_limit"],
+                        profile=profile,
+                    ),
                 }
             )
         return serialized
@@ -297,6 +522,9 @@ class OpenAICompatReasonGenerator:
         missing_candidate_ids: list[str] = []
         empty_reason_candidate_ids: list[str] = []
         empty_selected_evidence_candidate_ids: list[str] = []
+        invalid_selected_evidence_candidate_ids: list[str] = []
+        invalid_selected_evidence_ids_by_candidate: dict[str, list[str]] = {}
+
         for candidate in candidates:
             item = by_expert_id.get(candidate.expert_id)
             if item is None:
@@ -306,28 +534,58 @@ class OpenAICompatReasonGenerator:
                 normalized_items.append(
                     ReasonedCandidate(
                         expert_id=candidate.expert_id,
-                        fit="보통",
+                        fit=FIT_NORMAL,
                         recommendation_reason="",
                         selected_evidence_ids=[],
                         risks=list(candidate.risks),
                     )
                 )
                 continue
+
             normalized_reason = " ".join(item.recommendation_reason.split())
-            normalized_selected_evidence_ids = list(item.selected_evidence_ids)[:4]
+            raw_selected_evidence_ids = [
+                " ".join(str(evidence_id).split())
+                for evidence_id in list(item.selected_evidence_ids)[
+                    :MAX_SELECTED_EVIDENCE_IDS
+                ]
+            ]
+            invalid_selected_evidence_ids = [
+                evidence_id
+                for evidence_id in raw_selected_evidence_ids
+                if evidence_id
+                and not VALID_EVIDENCE_ID_PATTERN.fullmatch(evidence_id)
+            ]
+            normalized_selected_evidence_ids: list[str] = []
+            for evidence_id in raw_selected_evidence_ids:
+                if (
+                    not evidence_id
+                    or evidence_id in normalized_selected_evidence_ids
+                    or not VALID_EVIDENCE_ID_PATTERN.fullmatch(evidence_id)
+                ):
+                    continue
+                normalized_selected_evidence_ids.append(evidence_id)
+            normalized_fit = item.fit if item.fit in FIT_VALUES else FIT_NORMAL
+
             if not normalized_reason:
                 empty_reason_candidate_ids.append(candidate.expert_id)
             if not normalized_selected_evidence_ids:
                 empty_selected_evidence_candidate_ids.append(candidate.expert_id)
+            if invalid_selected_evidence_ids:
+                invalid_selected_evidence_candidate_ids.append(candidate.expert_id)
+                invalid_selected_evidence_ids_by_candidate[candidate.expert_id] = (
+                    invalid_selected_evidence_ids
+                )
+
             normalized_items.append(
                 ReasonedCandidate(
                     expert_id=candidate.expert_id,
-                    fit=item.fit if item.fit in {"높음", "중간", "보통"} else "보통",
+                    fit=normalized_fit,
                     recommendation_reason=normalized_reason,
                     selected_evidence_ids=normalized_selected_evidence_ids,
                     risks=list(item.risks),
                 )
             )
+
         if missing_candidate_ids:
             logger.warning(
                 "Reason generator omitted candidates from output: missing_candidate_ids=%s",
@@ -343,18 +601,143 @@ class OpenAICompatReasonGenerator:
                 "Reason generator returned no selected evidence ids: candidate_ids=%s",
                 empty_selected_evidence_candidate_ids,
             )
+        if invalid_selected_evidence_candidate_ids:
+            logger.warning(
+                "Reason generator returned invalid selected evidence ids: candidate_ids=%s invalid_ids_by_candidate=%s",
+                invalid_selected_evidence_candidate_ids,
+                invalid_selected_evidence_ids_by_candidate,
+            )
+
         return (
-            ReasonGenerationOutput(
-                items=normalized_items,
-                data_gaps=list(output.data_gaps),
-            ),
+            ReasonGenerationOutput(items=normalized_items, data_gaps=output.data_gaps),
             {
                 "returned_ids": returned_ids,
                 "missing_candidate_ids": missing_candidate_ids,
                 "empty_reason_candidate_ids": empty_reason_candidate_ids,
                 "empty_selected_evidence_candidate_ids": empty_selected_evidence_candidate_ids,
+                "invalid_selected_evidence_candidate_ids": invalid_selected_evidence_candidate_ids,
+                "invalid_selected_evidence_ids_by_candidate": invalid_selected_evidence_ids_by_candidate,
             },
         )
+
+    @staticmethod
+    def _extract_tool_arguments(message: AIMessage) -> Any:
+        tool_calls = []
+        if isinstance(message.additional_kwargs, dict):
+            tool_calls = message.additional_kwargs.get("tool_calls") or []
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            if function.get("name") != REASON_TOOL_NAME:
+                continue
+            arguments = function.get("arguments")
+            if arguments is None:
+                continue
+            if isinstance(arguments, str):
+                return json.loads(arguments)
+            return arguments
+        raise ValueError("No matching tool call arguments found in model response")
+
+    @classmethod
+    def _parse_reason_output(
+        cls,
+        message: AIMessage,
+        *,
+        use_tools: bool,
+    ) -> tuple[ReasonGenerationOutput, str]:
+        if use_tools:
+            try:
+                tool_payload = cls._extract_tool_arguments(message)
+                return (
+                    ReasonGenerationOutput.model_validate(tool_payload),
+                    "tool_call",
+                )
+            except Exception:
+                pass
+
+        json_text = _extract_json_object_text(message.content)
+        return (
+            ReasonGenerationOutput.model_validate_json(json_text),
+            "json_fallback" if use_tools else "json_fallback_retry",
+        )
+
+    async def _invoke_attempt(
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        candidates: list[CandidateCard],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None,
+        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]] | None,
+        seed: int,
+        use_tools: bool,
+        profile: dict[str, Any],
+    ) -> tuple[ReasonGenerationOutput, dict[str, Any]]:
+        serialized_candidates = self._serialize_candidates(
+            candidates,
+            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+            profile=profile,
+        )
+        payload = {
+            "query": query,
+            "intent_summary": plan.intent_summary,
+            "core_keywords": list(plan.core_keywords),
+            "task_terms": list(plan.task_terms),
+            "candidates": serialized_candidates,
+        }
+        allowed_evidence_ids = sorted(
+            {
+                item["evidence_id"]
+                for candidate in serialized_candidates
+                for key in ("relevant_papers", "relevant_projects", "relevant_patents")
+                for item in candidate.get(key, [])
+                if item.get("evidence_id")
+            }
+        )
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        invoke_kwargs = build_consistency_invoke_kwargs(
+            max_tokens_hint=REASON_GENERATION_MAX_TOKENS,
+            seed=seed,
+        )
+        if use_tools:
+            invoke_kwargs["tools"] = self._build_reason_tools(allowed_evidence_ids)
+            invoke_kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": REASON_TOOL_NAME},
+            }
+            invoke_kwargs["parallel_tool_calls"] = False
+
+        result = await self.model.ainvoke_non_stream(
+            [
+                SystemMessage(content=self._build_system_prompt(use_tools=use_tools)),
+                HumanMessage(content=payload_text),
+            ],
+            **invoke_kwargs,
+        )
+
+        parsed, parse_mode = self._parse_reason_output(result, use_tools=use_tools)
+        normalized, normalization_trace = self._normalize_output(parsed, candidates)
+        returned_ids = list(normalization_trace.get("returned_ids", []))
+        if not returned_ids:
+            raise ValueError("Reason generator returned no matching candidate ids")
+
+        candidate_count = len(candidates)
+        returned_ratio = round(len(returned_ids) / candidate_count, 3) if candidate_count else 0.0
+        trace = {
+            "mode": parse_mode,
+            "candidate_count": candidate_count,
+            "output_count": len(normalized.items),
+            "raw_output_count": len(parsed.items),
+            "seed": seed,
+            "returned_ratio": returned_ratio,
+            "payload_char_count": len(payload_text),
+            "payload_token_estimate": max(1, round(len(payload_text) / 4)),
+            "prompt_budget_mode": profile["name"],
+            "trim_applied": bool(profile["trim_applied"]),
+            "allowed_evidence_id_count": len(allowed_evidence_ids),
+            **normalization_trace,
+        }
+        return normalized, trace
 
     async def generate(
         self,
@@ -367,80 +750,98 @@ class OpenAICompatReasonGenerator:
     ) -> ReasonGenerationOutput:
         if not candidates:
             self.last_trace = {
-                "mode": "openai_compat",
+                "mode": "tool_call",
                 "candidate_count": 0,
                 "output_count": 0,
             }
             return ReasonGenerationOutput()
 
-        serialized_candidates = self._serialize_candidates(
-            candidates,
-            relevant_evidence_by_expert_id,
-            retrieval_score_traces_by_expert_id,
-        )
         seed = build_deterministic_seed(
             "reason_generation",
             query,
             plan.model_dump(mode="json"),
-            [candidate["expert_id"] for candidate in serialized_candidates],
+            [candidate.expert_id for candidate in candidates],
         )
-        invoke_kwargs = build_consistency_invoke_kwargs(seed=seed)
-        payload = {
-            "query": query,
-            "intent_summary": plan.intent_summary,
-            "core_keywords": list(plan.core_keywords),
-            "task_terms": list(plan.task_terms),
-            "candidates": serialized_candidates,
-        }
 
-        try:
-            result = await self.model.ainvoke_non_stream(
-                [
-                    SystemMessage(content=self._build_system_prompt()),
-                    HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-                ],
-                **invoke_kwargs,
-            )
-            json_text = _extract_json_object_text(result.content)
-            parsed = ReasonGenerationOutput.model_validate_json(json_text)
-            normalized, normalization_trace = self._normalize_output(parsed, candidates)
-            self.last_trace = {
-                "mode": "openai_compat",
-                "candidate_count": len(candidates),
-                "output_count": len(normalized.items),
-                "raw_output_count": len(parsed.items),
-                "seed": seed,
-                **normalization_trace,
-            }
-            return normalized
-        except Exception as exc:
-            logger.warning("Reason generator fallback activated: reason=%s", exc)
-            fallback_output = await self.fallback.generate(
-                query=query,
-                plan=plan,
-                candidates=candidates,
-                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
-                retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
-            )
-            fallback_trace = dict(self.fallback.last_trace)
-            self.last_trace = {
-                "mode": "fallback",
-                "candidate_count": len(candidates),
-                "output_count": len(fallback_output.items),
-                "seed": seed,
-                "reason": str(exc),
-                "raw_output_count": fallback_trace.get(
-                    "raw_output_count", len(fallback_output.items)
-                ),
-                "returned_ids": list(fallback_trace.get("returned_ids", [])),
-                "missing_candidate_ids": list(
-                    fallback_trace.get("missing_candidate_ids", [])
-                ),
-                "empty_reason_candidate_ids": list(
-                    fallback_trace.get("empty_reason_candidate_ids", [])
-                ),
-                "empty_selected_evidence_candidate_ids": list(
-                    fallback_trace.get("empty_selected_evidence_candidate_ids", [])
-                ),
-            }
-            return fallback_output
+        attempt_specs = [
+            {"use_tools": True, "profile": PRIMARY_PAYLOAD_PROFILE},
+            {"use_tools": False, "profile": RETRY_PAYLOAD_PROFILE},
+        ]
+        attempt_history: list[dict[str, Any]] = []
+
+        for retry_index, attempt_spec in enumerate(attempt_specs):
+            try:
+                output, trace = await self._invoke_attempt(
+                    query=query,
+                    plan=plan,
+                    candidates=candidates,
+                    relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+                    retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+                    seed=seed,
+                    use_tools=attempt_spec["use_tools"],
+                    profile=attempt_spec["profile"],
+                )
+                trace["retry_count"] = retry_index
+                trace["attempts"] = [*attempt_history, dict(trace)]
+                self.last_trace = trace
+                return output
+            except Exception as exc:
+                failed_mode = (
+                    "tool_call" if attempt_spec["use_tools"] else "json_fallback_retry"
+                )
+                logger.warning(
+                    "Reason generator %s attempt failed: retry=%d reason=%s",
+                    failed_mode,
+                    retry_index,
+                    exc,
+                )
+                attempt_history.append(
+                    {
+                        "mode": failed_mode,
+                        "retry_index": retry_index,
+                        "prompt_budget_mode": attempt_spec["profile"]["name"],
+                        "trim_applied": bool(attempt_spec["profile"]["trim_applied"]),
+                        "reason": str(exc),
+                    }
+                )
+
+        logger.warning(
+            "Reason generator fallback activated after retries: attempts=%s",
+            attempt_history,
+        )
+        fallback_output = await self.fallback.generate(
+            query=query,
+            plan=plan,
+            candidates=candidates,
+            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+        )
+        fallback_trace = dict(self.fallback.last_trace)
+        self.last_trace = {
+            "mode": "fallback",
+            "candidate_count": len(candidates),
+            "output_count": len(fallback_output.items),
+            "raw_output_count": fallback_trace.get(
+                "raw_output_count", len(fallback_output.items)
+            ),
+            "seed": seed,
+            "retry_count": len(attempt_specs),
+            "returned_ratio": fallback_trace.get("returned_ratio", 1.0),
+            "prompt_budget_mode": "fallback",
+            "trim_applied": True,
+            "reason": "; ".join(
+                attempt.get("reason", "") for attempt in attempt_history if attempt.get("reason")
+            ),
+            "returned_ids": list(fallback_trace.get("returned_ids", [])),
+            "missing_candidate_ids": list(
+                fallback_trace.get("missing_candidate_ids", [])
+            ),
+            "empty_reason_candidate_ids": list(
+                fallback_trace.get("empty_reason_candidate_ids", [])
+            ),
+            "empty_selected_evidence_candidate_ids": list(
+                fallback_trace.get("empty_selected_evidence_candidate_ids", [])
+            ),
+            "attempts": attempt_history,
+        }
+        return fallback_output

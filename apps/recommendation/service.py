@@ -14,7 +14,11 @@ from apps.recommendation.evidence_selector import (
     RelevantEvidenceItem,
 )
 from apps.recommendation.planner import Planner
-from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonGenerator
+from apps.recommendation.reasoner import (
+    ReasonGenerationOutput,
+    ReasonGenerator,
+    VALID_EVIDENCE_ID_PATTERN,
+)
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
@@ -374,8 +378,28 @@ class RecommendationService:
                 "empty_selected_evidence_candidate_ids": list(
                     raw_trace.get("empty_selected_evidence_candidate_ids", [])
                 ),
+                "invalid_selected_evidence_candidate_ids": list(
+                    raw_trace.get("invalid_selected_evidence_candidate_ids", [])
+                ),
+                "invalid_selected_evidence_ids_by_candidate": dict(
+                    raw_trace.get("invalid_selected_evidence_ids_by_candidate", {})
+                ),
                 "mode": raw_trace.get("mode", "unknown"),
                 "seed": raw_trace.get("seed"),
+                "retry_count": raw_trace.get("retry_count", 0),
+                "returned_ratio": raw_trace.get(
+                    "returned_ratio",
+                    round(
+                        len(list(raw_trace.get("returned_ids", []))) / len(candidate_batch),
+                        3,
+                    )
+                    if candidate_batch
+                    else 0.0,
+                ),
+                "prompt_budget_mode": raw_trace.get("prompt_budget_mode"),
+                "trim_applied": raw_trace.get("trim_applied", False),
+                "payload_token_estimate": raw_trace.get("payload_token_estimate"),
+                "attempts": list(raw_trace.get("attempts", [])),
                 "raw_output_count": raw_trace.get(
                     "raw_output_count", len(batch_output.items)
                 ),
@@ -423,6 +447,9 @@ class RecommendationService:
             "output_count": len(reason_output.items),
             "batch_count": len(batch_traces),
             "batch_size": REASON_GENERATION_BATCH_SIZE,
+            "reason_generation_failed": any(
+                float(trace.get("returned_ratio", 0.0)) == 0.0 for trace in batch_traces
+            ),
             "batches": batch_traces,
         }
 
@@ -516,6 +543,16 @@ class RecommendationService:
             item.item_id for item in cls._sort_relevant_items(relevant_bundle)
         ]
         requested_ids = list(getattr(generated, "selected_evidence_ids", []) or [])[:4]
+        invalid_selected_evidence_ids = [
+            item_id
+            for item_id in requested_ids
+            if not VALID_EVIDENCE_ID_PATTERN.fullmatch(item_id)
+        ]
+        unresolved_selected_evidence_ids = [
+            item_id
+            for item_id in requested_ids
+            if item_id not in invalid_selected_evidence_ids and item_id not in evidence_lookup
+        ]
 
         resolved_items: list[RelevantEvidenceItem] = []
         seen_ids: set[str] = set()
@@ -530,9 +567,11 @@ class RecommendationService:
         if not resolved_items:
             if requested_ids:
                 logger.warning(
-                    "Selected evidence ids could not be resolved; using fallback: expert_id=%s requested_ids=%s available_ids=%s",
+                    "Selected evidence ids could not be resolved; using fallback: expert_id=%s requested_ids=%s invalid_ids=%s unresolved_ids=%s available_ids=%s",
                     card.expert_id,
                     requested_ids,
+                    invalid_selected_evidence_ids,
+                    unresolved_selected_evidence_ids,
                     provided_evidence_ids,
                 )
             ranked_items = cls._sort_relevant_items(relevant_bundle)
@@ -546,14 +585,26 @@ class RecommendationService:
                         "expert_id": card.expert_id,
                         "provided_evidence_ids": provided_evidence_ids,
                         "selected_evidence_ids": requested_ids,
+                        "llm_selected_evidence_ids": requested_ids,
+                        "resolver_available_evidence_ids": provided_evidence_ids,
+                        "invalid_selected_evidence_ids": invalid_selected_evidence_ids,
+                        "unresolved_selected_evidence_ids": unresolved_selected_evidence_ids,
                         "resolved_evidence_ids": ["profile"],
+                        "relevant_evidence_count": len(provided_evidence_ids),
+                        "relevant_bundle_empty": not provided_evidence_ids,
                         "fallback": "profile",
                     }
                 return [], {
                     "expert_id": card.expert_id,
                     "provided_evidence_ids": provided_evidence_ids,
                     "selected_evidence_ids": requested_ids,
+                    "llm_selected_evidence_ids": requested_ids,
+                    "resolver_available_evidence_ids": provided_evidence_ids,
+                    "invalid_selected_evidence_ids": invalid_selected_evidence_ids,
+                    "unresolved_selected_evidence_ids": unresolved_selected_evidence_ids,
                     "resolved_evidence_ids": [],
+                    "relevant_evidence_count": len(provided_evidence_ids),
+                    "relevant_bundle_empty": not provided_evidence_ids,
                     "fallback": "empty",
                 }
 
@@ -563,7 +614,13 @@ class RecommendationService:
                 "expert_id": card.expert_id,
                 "provided_evidence_ids": provided_evidence_ids,
                 "selected_evidence_ids": requested_ids,
+                "llm_selected_evidence_ids": requested_ids,
+                "resolver_available_evidence_ids": provided_evidence_ids,
+                "invalid_selected_evidence_ids": invalid_selected_evidence_ids,
+                "unresolved_selected_evidence_ids": unresolved_selected_evidence_ids,
                 "resolved_evidence_ids": [item.item_id for item in resolved_items],
+                "relevant_evidence_count": len(provided_evidence_ids),
+                "relevant_bundle_empty": not provided_evidence_ids,
                 "fallback": fallback,
             },
         )

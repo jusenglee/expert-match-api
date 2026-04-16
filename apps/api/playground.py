@@ -639,7 +639,7 @@ PLAYGROUND_HTML = dedent(
                     <details>
                       <summary>수행 증거 및 실적</summary>
                       <ul style="font-size: 0.85rem; margin-top: 0.5rem">
-                        ${r.evidence.map(ev => `<li>[${ev.type}] ${escapeHtml(ev.title)} (${ev.date})</li>`).join('')}
+                        ${r.evidence.map(ev => `<li>[${ev.type}] ${escapeHtml(ev.title)}${ev.date ? ` (${escapeHtml(ev.date)})` : ''}</li>`).join('')}
                       </ul>
                     </details>
                   </div>

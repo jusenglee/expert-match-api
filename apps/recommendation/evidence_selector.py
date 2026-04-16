@@ -13,11 +13,11 @@ from apps.domain.models import (
     ResearchProjectEvidence,
 )
 
-RECENT_YEARS_WINDOW = 5
-MAX_RELEVANT_PAPERS = 4
-MAX_RELEVANT_PROJECTS = 4
-MAX_RELEVANT_PATENTS = 4
-SNIPPET_MAX_LENGTH = 10000
+RECENT_YEARS_WINDOW = 20
+MAX_RELEVANT_PAPERS = 10
+MAX_RELEVANT_PROJECTS = 10
+MAX_RELEVANT_PATENTS = 10
+SNIPPET_MAX_LENGTH = 1000
 
 
 class RelevantEvidenceItem(BaseModel):
@@ -107,9 +107,9 @@ def _build_rich_snippet(
             if end < len(normalized_text): snippet = snippet + "..."
             parts.append(snippet)
         else:
-            parts.append(normalized_text[:800] + "...")
+            parts.append(normalized_text[:SNIPPET_MAX_LENGTH] + "...")
     else:
-        parts.append(normalized_text[:1000])
+        parts.append(normalized_text[:SNIPPET_MAX_LENGTH])
         
     return "\n".join(parts)
 
@@ -187,6 +187,8 @@ class KeywordEvidenceSelector:
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(publications):
+            # Qdrant가 이미 순서대로 줬으므로, 기본 점수를 인덱스 역순으로 부여하여 기본 순서 유지
+            base_score = 1.0 + (len(publications) - index) * 0.1
             score, matched_keywords = self._score_evidence(
                 title=item.publication_title,
                 body_parts=[
@@ -198,8 +200,9 @@ class KeywordEvidenceSelector:
                 date_value=item.publication_year_month,
                 keywords=keywords,
             )
-            if score <= 0:
-                continue
+            # 키워드 매칭이 없어도 base_score 덕분에 살아남음
+            final_score = base_score + score
+
             ranked.append(
                 RelevantEvidenceItem(
                     item_id=f"paper:{index}",
@@ -207,16 +210,10 @@ class KeywordEvidenceSelector:
                     title=item.publication_title,
                     date=item.publication_year_month,
                     detail=item.journal_name,
-                    snippet=_build_rich_snippet(
-                        main_text=item.abstract,
-                        secondary_text=" ".join(
-                            (item.korean_keywords or []) + (item.english_keywords or [])
-                        ),
-                        metadata={"학술지": item.journal_name},
-                        matched_keywords=matched_keywords,
-                    ),
+                    # 스니펫 대신 가급적 초록 전체를 전달 (스니펫 제거 정책)
+                    snippet=item.abstract or " ".join(item.korean_keywords + item.english_keywords),
                     matched_keywords=matched_keywords,
-                    match_score=score,
+                    match_score=final_score,
                 )
             )
         return self._finalize_ranked_items(ranked, MAX_RELEVANT_PAPERS)
@@ -228,6 +225,7 @@ class KeywordEvidenceSelector:
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(projects):
+            base_score = 1.0 + (len(projects) - index) * 0.1
             score, matched_keywords = self._score_evidence(
                 title=item.display_title,
                 body_parts=[
@@ -239,8 +237,8 @@ class KeywordEvidenceSelector:
                 date_value=item.project_end_date or item.project_start_date,
                 keywords=keywords,
             )
-            if score <= 0:
-                continue
+            final_score = base_score + score
+
             ranked.append(
                 RelevantEvidenceItem(
                     item_id=f"project:{index}",
@@ -248,17 +246,10 @@ class KeywordEvidenceSelector:
                     title=item.display_title,
                     date=item.project_end_date or item.project_start_date,
                     detail=item.managing_agency or item.performing_organization,
-                    snippet=_build_rich_snippet(
-                        main_text=item.research_objective_summary,
-                        secondary_text=item.research_content_summary,
-                        metadata={
-                            "주관기관": item.performing_organization,
-                            "관리기관": item.managing_agency,
-                        },
-                        matched_keywords=matched_keywords,
-                    ),
+                    # 스니펫 대신 연구 요약 전체 전달
+                    snippet=f"연구목표: {item.research_objective_summary or ''}\n연구내용: {item.research_content_summary or ''}",
                     matched_keywords=matched_keywords,
-                    match_score=score,
+                    match_score=final_score,
                 )
             )
         return self._finalize_ranked_items(ranked, MAX_RELEVANT_PROJECTS)
@@ -270,6 +261,7 @@ class KeywordEvidenceSelector:
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(patents):
+            base_score = 1.0 + (len(patents) - index) * 0.1
             score, matched_keywords = self._score_evidence(
                 title=item.intellectual_property_title,
                 body_parts=[
@@ -279,8 +271,8 @@ class KeywordEvidenceSelector:
                 date_value=item.registration_date or item.application_date,
                 keywords=keywords,
             )
-            if score <= 0:
-                continue
+            final_score = base_score + score
+
             ranked.append(
                 RelevantEvidenceItem(
                     item_id=f"patent:{index}",
@@ -289,16 +281,10 @@ class KeywordEvidenceSelector:
                     date=item.registration_date or item.application_date,
                     detail=item.application_registration_type
                     or item.application_country,
-                    snippet=_build_rich_snippet(
-                        main_text=None,
-                        metadata={
-                            "유형": item.application_registration_type,
-                            "국가": item.application_country,
-                        },
-                        matched_keywords=matched_keywords,
-                    ),
+                    # 특허는 요약 정보가 적으므로 제목과 유형 전달
+                    snippet=f"유형: {item.application_registration_type or ''}, 국가: {item.application_country or ''}",
                     matched_keywords=matched_keywords,
-                    match_score=score,
+                    match_score=final_score,
                 )
             )
         return self._finalize_ranked_items(ranked, MAX_RELEVANT_PATENTS)

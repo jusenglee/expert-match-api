@@ -145,6 +145,38 @@ class OpenAICompatChatModel(BaseChatModel):
         return getattr(delta, key, None)
 
     @staticmethod
+    def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+        """Normalize provider tool call objects into plain dicts."""
+        normalized_calls: list[dict[str, Any]] = []
+        for tool_call in tool_calls or []:
+            if isinstance(tool_call, dict):
+                function = tool_call.get("function") or {}
+                normalized_calls.append(
+                    {
+                        "id": tool_call.get("id"),
+                        "type": tool_call.get("type"),
+                        "function": {
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments"),
+                        },
+                    }
+                )
+                continue
+
+            function = getattr(tool_call, "function", None)
+            normalized_calls.append(
+                {
+                    "id": getattr(tool_call, "id", None),
+                    "type": getattr(tool_call, "type", None),
+                    "function": {
+                        "name": getattr(function, "name", None),
+                        "arguments": getattr(function, "arguments", None),
+                    },
+                }
+            )
+        return normalized_calls
+
+    @staticmethod
     def _resolve_trace_ids(
         kwargs: dict[str, Any],
     ) -> tuple[Optional[str], Optional[str]]:
@@ -208,6 +240,9 @@ class OpenAICompatChatModel(BaseChatModel):
             request_kwargs["max_completion_tokens"] = max_tokens_hint
         if stop:
             request_kwargs["stop"] = stop
+        for key in ("tools", "tool_choice", "response_format", "parallel_tool_calls"):
+            if kwargs.get(key) is not None:
+                request_kwargs[key] = kwargs[key]
         if request_id:
             request_kwargs["extra_headers"] = {"x-request-id": request_id}
         return request_kwargs
@@ -303,6 +338,9 @@ class OpenAICompatChatModel(BaseChatModel):
 
         msg = response.choices[0].message if response.choices else None
         content = (getattr(msg, "content", None) if msg is not None else None) or ""
+        tool_calls = self._serialize_tool_calls(
+            getattr(msg, "tool_calls", None) if msg is not None else None
+        )
         # reasoning은 섞지 않고 참고용으로만 (필요시 로그/메트릭으로 사용)
         reasoning = (
             (getattr(msg, "reasoning", None) if msg is not None else None)
@@ -316,7 +354,7 @@ class OpenAICompatChatModel(BaseChatModel):
         )
 
         logger.info(
-            "[openai_compat_llm] non-stream summary: request_id=%s conversation_id=%s model=%s dt_ms=%.1f message_n=%d content_char_n=%d reasoning_char_n=%d request_max_tokens=%s request_top_k=%s usage=%s base_url=%s",
+            "[openai_compat_llm] non-stream summary: request_id=%s conversation_id=%s model=%s dt_ms=%.1f message_n=%d content_char_n=%d reasoning_char_n=%d tool_call_n=%d request_max_tokens=%s request_top_k=%s usage=%s base_url=%s",
             request_id,
             conversation_id,
             self.model_name,
@@ -324,13 +362,28 @@ class OpenAICompatChatModel(BaseChatModel):
             len(messages),
             len(content),
             len(reasoning),
+            len(tool_calls),
             request_kwargs.get("max_tokens"),
             extra_body.get("top_k") if isinstance(extra_body, dict) else None,
             usage,
             self.base_url,
         )
+        additional_kwargs: dict[str, Any] = {}
+        if tool_calls:
+            additional_kwargs["tool_calls"] = tool_calls
+        if reasoning:
+            additional_kwargs[STREAM_REASONING_KEY] = reasoning
+        if usage is not None:
+            additional_kwargs["usage"] = usage
         return ChatResult(
-            generations=[ChatGeneration(message=AIMessage(content=content))]
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content=content,
+                        additional_kwargs=additional_kwargs,
+                    )
+                )
+            ]
         )
 
     async def ainvoke_non_stream(

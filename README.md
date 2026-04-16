@@ -1,65 +1,78 @@
-# 전문가 추천 시스템 프로토타입
+# NTIS 전문가 추천 시스템 프로토타입
 
 ![Python Version](https://img.shields.io/badge/python-3.12%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-green)
 ![Qdrant](https://img.shields.io/badge/Qdrant-1.10%2B-red)
 ![OpenAI](https://img.shields.io/badge/OpenAI-1.40%2B-lightgray)
 
-이 프로젝트는 다차원 인물 정보(기본 정보, 논문, 특허, 사업/과제 이력 등)를 바탕으로 요구 조건에 부합하는 전문가를 검색하고 추천하는 API 프로토타입입니다. Qdrant 기반의 하이브리드 탐색(Dense + Sparse)과 대형 언어 모델(LLM)의 제어 및 비교 판단 능력을 함께 결합하여 시스템을 구축했습니다.
+본 프로젝트는 다차원 인물 정보(기본 정보, 논문, 특허, 과제 이력 등)를 분석하여 요구 조건에 가장 부합하는 전문가를 추천하는 지능형 API 시스템입니다. Qdrant를 이용한 하이브리드 검색과 LLM의 판단 능력을 결합하여 신뢰도 높은 추천 결과를 제공합니다.
 
 ## 주요 특징
 
-- 다차원 기반 동시 검색 (Multi-branch Hybrid Search)
-  - 인물 정보를 기본 정보(basic), 논문(publications), 특허(intellectual_properties), 과제(research_projects) 4개의 관점으로 분리하여 취급합니다.
-  - 각 단위마다 의미론적 탐색(Dense)과 기호/키워드 매칭(Sparse)을 병행하며, RRF(Reciprocal Rank Fusion) 알고리즘을 통해 탐색 결과를 통합합니다.
-- LLM 기반 제어 파이프라인
-  - Planner: 사용자 질의를 시스템이 처리가능한 검색 엔진 필터(hard_filters) 및 검색 쿼리로 변환합니다.
-  - Judge: 1차적으로 도출된 인물 후보군(Candidate Cards)의 관련 요소를 LLM이 대조하여 최종 순위와 선정 사유를 산출합니다.
-- **실시간 추적 및 가시성 기반 디버깅 (Observability)**
-  - 모든 요청에 고유한 **Trace ID(Request ID)**를 부여하여 Planner, Retriever, Judge를 거치는 전 과정을 추적합니다.
-  - 모든 주요 로그는 정교한 한글 메시지로 출력되어 장애 발생 시 신속한 원인 파악이 가능합니다.
-
-## 시각적 도구: Playground & 로그 콘솔
-
-본 시스템은 개발 및 테스트 편의를 위해 강력한 웹 기반 도구를 제공합니다.
-
-- **Interactive Playground**: `/playground` 주소에서 자연어 질의를 직접 입력하고 추천 결과를 즉시 확인할 수 있습니다.
-- **실시간 서버 로그 콘솔**: Playground UI 하단에 통합된 콘솔을 통해 서버 내부에서 발생하는 상세 한글 로그를 실시간으로 모니터링할 수 있습니다.
+- **다차원 하이브리드 검색 (Multi-branch Hybrid Search)**
+  - 인물 정보를 기본 정보, 논문, 특허, 과제 4개 관점으로 분리하여 탐색합니다.
+  - 의미론적 검색(Dense)과 키워드 검색(Sparse)을 결합하고 RRF 알고리즘으로 통합 랭킹을 산출합니다.
+- **LLM 기반 지능형 파이프라인**
+  - **Planner**: 자연어 질의를 분석하여 검색 쿼리와 필터로 변환합니다.
+  - **Judge**: 검색된 후보자들의 실적 증빙 자료를 대조하여 최종 추천 사유와 적합도를 생성합니다.
+- **실시간 추적 및 가시성 (Observability)**
+  - 모든 요청에 Trace ID를 부여하여 플래닝부터 최종 판단까지 전 과정을 모니터링할 수 있습니다.
+  - Playground UI를 통해 실시간 서버 로그와 추천 과정을 한눈에 확인할 수 있습니다.
 
 ## 시작 가이드
 
 ### 1. 환경 준비 및 패키지 설치
-본 시스템은 Python 3.12 이상의 환경이 필요합니다.
 ```bash
 python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .[dev]
 ```
 
 ### 2. 환경 변수 설정
-루트 디렉토리에 `.env` 파일을 생성하고 다음 필수 환경 변수를 지정합니다.
+루트 디렉토리에 `.env` 파일을 생성하고 필수 정보를 입력합니다. 상세 설정은 [환경 변수 가이드](apps/docs/operation/ENVIRONMENT.md)를 참고하세요.
 ```env
-APP_ENV=local
-QDRANT_URL=http://localhost:6333
-OPENAI_API_KEY=sk-your-api-key-here
+NTIS_APP_ENV=local
+NTIS_QDRANT_URL=http://localhost:6333
+NTIS_LLM_BASE_URL=https://api.openai.com/v1
+NTIS_LLM_API_KEY=your-api-key
 ```
 
 ### 3. 서버 실행
-개발용 서버 구동 명령어는 다음과 같습니다.
 ```bash
 uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 ```
 
-## 문서 안내
+## 문서 안내 (Documentation)
 
-세부 동작 방식 및 관련 설정은 `docs/` 디렉토리 하위 문서에 작성되어 있습니다.
-- [서비스 동작 원리 (SERVICE_FLOW.md)](docs/SERVICE_FLOW.md) : 검색 전처리 로직 및 추천 시스템 흐름
-- [운영 관리 (RUNBOOK.md)](docs/RUNBOOK.md) : 데이터 반입 및 시스템 무결성 점검 시나리오
-- [환경 변수 (ENVIRONMENT.md)](docs/ENVIRONMENT.md) : 프로젝트 실행 모드 및 부가 설정 항목
-- [데이터 명세 (CONTRACT.md)](docs/CONTRACT.md) : 기준 모델 스키마 및 입출력 API 구조
+모든 상세 문서는 `apps/docs/` 디렉토리에 체계적으로 정리되어 있습니다. [**전체 문서 인덱스**](apps/docs/INDEX.md)를 먼저 확인해 보세요.
+
+### 📁 [API 및 데이터 규약](apps/docs/api/)
+- [API 명세서](apps/docs/api/API_SPECIFICATION.md): 엔드포인트 및 입출력 규격
+- [데이터 규약](apps/docs/api/DATA_CONTRACT.md): 내부 컴포넌트 간 데이터 교환 형식
+
+### 📁 [시스템 설계](apps/docs/architecture/)
+- [서비스 동작 흐름](apps/docs/architecture/SERVICE_FLOW.md): 추천 시스템의 전체 실행 단계
+- [설계 지침서](apps/docs/architecture/DESIGN_GUIDELINES.md): 핵심 원칙 및 제약 사항
+
+### 📁 [운영 및 설정](apps/docs/operation/)
+- [환경 변수 설정](apps/docs/operation/ENVIRONMENT.md): 시스템 구동을 위한 설정값 목록
+- [운영 가이드 (Runbook)](apps/docs/operation/RUNBOOK.md): 배포 및 상태 점검 절차
+- [검증 시나리오](apps/docs/operation/GOLDEN_TESTS.md): 품질 확인을 위한 테스트 케이스
+
+---
 
 ## 기술 스택
+- **Backend**: FastAPI
+- **Vector DB**: Qdrant
+- **LLM**: OpenAI 호환 API (Llama 3 등)
+- **Data**: Pydantic v2
+- **Data**: Pydantic v2
 
-- Web Framework: FastAPI
-- Vector DB: Qdrant
-- LLM Pipeline: OpenAI API, LangChain Core
-- Data Validation: Pydantic, Pytest
+## Recommendation Runtime Notes (2026-04-15)
+
+- Reason generation now runs in sequential batches of up to `5` candidates.
+- Candidate-internal relevant evidence is expanded to up to `10` papers, `10` projects, and `10` patents before LLM selection.
+- The reasoner now prefers `tool calling` for structured batch output, retries once with a smaller JSON payload, and then falls back to deterministic server-side reasons if the LLM output is unusable.
+- Prompt payloads are budget-trimmed. `relevant_*` remains the direct grounding set, while `all_*`, retrieval grounding, and evaluation activities are sent only as compact supporting context.
+- No new environment variables or operator runbook steps were introduced by this change set.
+- Detailed runtime contract: [apps/docs/api/REASONER_RUNTIME_POLICY.md](apps/docs/api/REASONER_RUNTIME_POLICY.md)

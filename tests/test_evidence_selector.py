@@ -112,9 +112,9 @@ def test_selector_enforces_branch_limits():
 
     bundles = selector.select(candidates=[card], plan=_plan("medical imaging", "의료영상"))
 
-    assert len(bundles["1"].papers) == 4
-    assert len(bundles["1"].projects) == 4
-    assert len(bundles["1"].patents) == 4
+    assert len(bundles["1"].papers) == 5
+    assert len(bundles["1"].projects) == 5
+    assert len(bundles["1"].patents) == 5
 
 
 def test_selector_returns_empty_relevant_evidence_when_keywords_are_empty():

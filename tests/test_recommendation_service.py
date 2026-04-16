@@ -431,8 +431,24 @@ def test_recommend_ignores_invalid_selected_evidence_ids_and_uses_fallback():
         == ["project:99", "paper:999"]
     )
     assert (
+        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["resolver_available_evidence_ids"]
+        == ["paper:0"]
+    )
+    assert (
+        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["invalid_selected_evidence_ids"]
+        == []
+    )
+    assert (
+        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["unresolved_selected_evidence_ids"]
+        == ["project:99", "paper:999"]
+    )
+    assert (
         result["trace"]["reason_generation_trace"]["selected_evidence"][0]["resolved_evidence_ids"]
         == ["paper:0"]
+    )
+    assert (
+        result["trace"]["reason_generation_trace"]["selected_evidence"][0]["relevant_bundle_empty"]
+        is False
     )
     assert recommendation.fit == "보통"
 
@@ -463,6 +479,41 @@ def test_recommend_logs_empty_reason_and_invalid_evidence_selection(caplog):
     assert "Selected evidence ids could not be resolved" in caplog.text
     assert "Recommendation reason is empty after reason generation" in caplog.text
     assert "Recommendation reason fallback generated" in caplog.text
+
+
+def test_recommend_profile_fallback_trace_exposes_empty_relevant_bundle():
+    service, _, evidence_selector = _build_service(
+        ReasonGenerationOutput(
+            items=[
+                ReasonedCandidate(
+                    expert_id="1",
+                    fit="보통",
+                    recommendation_reason="Profile-based reason",
+                    selected_evidence_ids=["pat:2009-12-09"],
+                )
+            ]
+        )
+    )
+    evidence_selector.select = MethodType(
+        lambda self, *, candidates, plan: {
+            candidate.expert_id: RelevantEvidenceBundle(expert_id=candidate.expert_id)
+            for candidate in candidates
+        },
+        evidence_selector,
+    )
+    cards = [_candidate_card("1", "Alpha", 98.0)]
+    _bind_search_result(service, cards=cards, retrieved_count=1)
+
+    result = asyncio.run(service.recommend(query="Recommend reviewers"))
+
+    selected_trace = result["trace"]["reason_generation_trace"]["selected_evidence"][0]
+    recommendation: RecommendationDecision = result["recommendations"][0]
+    assert selected_trace["resolver_available_evidence_ids"] == []
+    assert selected_trace["invalid_selected_evidence_ids"] == ["pat:2009-12-09"]
+    assert selected_trace["unresolved_selected_evidence_ids"] == []
+    assert selected_trace["relevant_bundle_empty"] is True
+    assert selected_trace["fallback"] == "profile"
+    assert recommendation.evidence[0].type == "profile"
 
 
 def test_recommend_generates_fallback_reason_for_omitted_candidate():
