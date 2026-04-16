@@ -22,10 +22,10 @@ DENSE_VECTOR_BY_BRANCH = {
 
 # 각 브랜치별 Sparse(키워드) 벡터 이름 매핑
 SPARSE_VECTOR_BY_BRANCH = {
-    "basic": "basic_vector_bm25",
-    "art": "art_vector_bm25",
-    "pat": "pat_vector_bm25",
-    "pjt": "pjt_vector_bm25",
+    "basic": "basic_vector_splade",
+    "art": "art_vector_splade",
+    "pat": "pat_vector_splade",
+    "pjt": "pjt_vector_splade",
 }
 
 # 레시피 데이터 등에서 날짜 필드 이름 보정이 필요한 경우 사용
