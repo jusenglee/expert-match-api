@@ -59,9 +59,6 @@ def _normalize_optional_int(value: Any) -> Any:
 
 
 class BasicInfo(BaseModel):
-    """
-    전문가의 기본 인적사항과 소속 정보(부서, 직위 등)를 담는 데이터 모델입니다.
-    """
     researcher_id: str
     researcher_name: str
     gender: str | None = None
@@ -72,9 +69,6 @@ class BasicInfo(BaseModel):
 
 
 class ResearcherProfile(BaseModel):
-    """
-    전문가의 학위, 전공 및 주요 실적(논문, 특허, 과제)의 전체 통계 수치를 담는 데이터 모델입니다.
-    """
     highest_degree: str | None = None
     major_field: str | None = None
     publication_count: int = 0
@@ -95,10 +89,6 @@ class ResearcherProfile(BaseModel):
 
 
 class PublicationEvidence(BaseModel):
-    """
-    전문가의 개별 논문 실적 정보를 나타내는 데이터 모델입니다.
-    초록(abstract) 및 키워드 정보는 검색과 추천 사유 생성에 핵심적으로 사용됩니다.
-    """
     journal_index_type: str | None = None
     publication_title: str
     journal_name: str | None = None
@@ -114,9 +104,6 @@ class PublicationEvidence(BaseModel):
 
 
 class IntellectualPropertyEvidence(BaseModel):
-    """
-    전문가의 특허(지식재산권) 실적 정보를 나타내는 데이터 모델입니다.
-    """
     intellectual_property_type: str | None = None
     intellectual_property_title: str
     application_registration_type: str | None = None
@@ -128,9 +115,6 @@ class IntellectualPropertyEvidence(BaseModel):
 
 
 class ResearchProjectEvidence(BaseModel):
-    """
-    전문가의 연구 과제 수행 실적 정보를 나타내는 데이터 모델입니다.
-    """
     project_start_date: str | None = None
     project_end_date: str | None = None
     reference_year: int | None = None
@@ -160,10 +144,6 @@ class EvaluationActivity(BaseModel):
 
 
 class ExpertPayload(BaseModel):
-    """
-    벡터 데이터베이스(Qdrant)에 저장되고 검색 결과로 반환되는 단일 전문가의 원본(Payload) 데이터 모델입니다.
-    기본 정보와 프로필, 그리고 모든 주요 실적 리스트를 포괄합니다.
-    """
     basic_info: BasicInfo
     researcher_profile: ResearcherProfile
     publications: list[PublicationEvidence] = Field(default_factory=list)
@@ -207,46 +187,13 @@ class SeedEvidencePoint(BaseModel):
     payload: ExpertPayload
 
 
-class TermGroup(BaseModel):
-    name: str = ""
-    mode: str = "at_least_one"
-    terms: list[str] = Field(default_factory=list)
-
-    @field_validator("terms", mode="before")
-    @classmethod
-    def _normalize_terms(cls, value: Any) -> Any:
-        return _normalize_string_list(value)
-
-
 class PlannerOutput(BaseModel):
-    """
-    LLM 기반 플래너가 사용자 검색 쿼리를 분석하여 추출한 검색 의도(Intent) 및 각종 키워드/필터 조건들을 담는 데이터 모델입니다.
-    이후 검색(Retriever)과 추천 사유 생성(Reasoner) 단계의 핵심 가이드라인으로 사용됩니다.
-    """
-    reasoning: str = Field(default="", description="LLM의 CoT(Chain-of-Thought) 중간 사고 과정을 담는 필드입니다.")
     intent_summary: str
     hard_filters: dict[str, Any] = Field(default_factory=dict)
     include_orgs: list[str] = Field(default_factory=list)
     exclude_orgs: list[str] = Field(default_factory=list)
-    
-    # New fields for ADR-001
-    domain_term_groups: list[TermGroup] = Field(default_factory=list)
-    soft_preference_groups: list[TermGroup] = Field(default_factory=list)
-    noise_terms: list[str] = Field(default_factory=list)
-    bounded_hyde_document: str = ""
-    relaxation_policy: dict[str, Any] = Field(default_factory=dict)
-
-    # Legacy fields
     task_terms: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
-    retrieval_core: list[str] = Field(default_factory=list)
-    must_aspects: list[str] = Field(default_factory=list)
-    evidence_aspects: list[str] = Field(default_factory=list)
-    generic_terms: list[str] = Field(default_factory=list)
-    role_terms: list[str] = Field(default_factory=list)
-    action_terms: list[str] = Field(default_factory=list)
-    bundle_ids: list[str] = Field(default_factory=list)
-    intent_flags: dict[str, Any] = Field(default_factory=dict)
     semantic_query: str = ""
     top_k: int = 15
 
@@ -255,14 +202,6 @@ class PlannerOutput(BaseModel):
         "exclude_orgs",
         "task_terms",
         "core_keywords",
-        "retrieval_core",
-        "must_aspects",
-        "evidence_aspects",
-        "generic_terms",
-        "role_terms",
-        "action_terms",
-        "noise_terms",
-        "bundle_ids",
         mode="before",
     )
     @classmethod
@@ -271,20 +210,11 @@ class PlannerOutput(BaseModel):
 
 
 class SearchHit(BaseModel):
-    """
-    벡터 데이터베이스(Qdrant) 등에서 반환된 개별 검색 결과(Hit)를 나타내는 데이터 모델입니다.
-    전문가 원본 데이터(payload)와 함께 검색 점수(score), 데이터 존재 여부 플래그를 포함합니다.
-    """
     expert_id: str
     score: float
     payload: ExpertPayload
     branch: BranchName | None = None
     data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
-    
-    # 아키텍처 Support Rule 추적 정보
-    stable_support_count: int = 0
-    expanded_support_count: int = 0
-    support_branches: list[BranchName] = Field(default_factory=list)
 
 
 class GroupedSearchHit(BaseModel):
@@ -302,10 +232,6 @@ class EvidenceItem(BaseModel):
 
 
 class CandidateCard(BaseModel):
-    """
-    검색 시스템에서 반환된 전문가 데이터를 바탕으로 만들어진 후보자 정보 카드 모델입니다.
-    추천 파이프라인 전반을 거치며 필터링 상태(risks, data_gaps)와 최종 점수(rank_score)가 채워집니다.
-    """
     expert_id: str
     name: str
     organization: str | None = None
@@ -328,10 +254,6 @@ class CandidateCard(BaseModel):
 
 
 class RecommendationDecision(BaseModel):
-    """
-    최종적으로 사용자에게 반환되는 개별 전문가의 추천 결과(명세서) 데이터 모델입니다.
-    최종 순위(rank), 적합도(fit), LLM이 작성한 추천 사유(recommendation_reason) 및 이를 뒷받침하는 증거(evidence) 목록을 포함합니다.
-    """
     rank: int
     expert_id: str
     name: str
