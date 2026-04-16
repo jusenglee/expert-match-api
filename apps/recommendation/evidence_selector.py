@@ -140,17 +140,27 @@ class KeywordEvidenceSelector:
         empty_candidate_ids: list[str] = []
 
         for candidate in candidates:
+            # 개별 브랜치에서 후보군 랭킹 (내부 limit는 넉넉히 유지)
+            papers = self._rank_publications(candidate.top_papers, keywords)
+            projects = self._rank_projects(candidate.top_projects, keywords)
+            patents = self._rank_patents(candidate.top_patents, keywords)
+            
+            # 모든 증거를 합쳐서 매칭 점수순으로 최상위 3개만 엄선
+            # 이는 LLM(Reasoner)에게 노이즈 없는 핵심 데이터만 전달하기 위함임
+            top_evidence = sorted(
+                [*papers, *projects, *patents],
+                key=lambda item: -item.match_score
+            )[:3]
+
             bundle = RelevantEvidenceBundle(
                 expert_id=candidate.expert_id,
-                papers=self._rank_publications(candidate.top_papers, keywords),
-                projects=self._rank_projects(candidate.top_projects, keywords),
-                patents=self._rank_patents(candidate.top_patents, keywords),
+                papers=[e for e in top_evidence if e.type == "paper"],
+                projects=[e for e in top_evidence if e.type == "project"],
+                patents=[e for e in top_evidence if e.type == "patent"],
             )
             bundles[candidate.expert_id] = bundle
 
-            candidate_count = (
-                len(bundle.papers) + len(bundle.projects) + len(bundle.patents)
-            )
+            candidate_count = len(top_evidence)
             if candidate_count == 0:
                 empty_candidate_ids.append(candidate.expert_id)
             candidate_evidence_counts.append(
@@ -164,7 +174,7 @@ class KeywordEvidenceSelector:
             )
 
         self.last_trace = {
-            "mode": "keyword_lexical",
+            "mode": "keyword_lexical_top3",
             "core_keywords": keywords,
             "candidate_evidence_counts": candidate_evidence_counts,
             "empty_candidate_ids": empty_candidate_ids,
@@ -187,7 +197,6 @@ class KeywordEvidenceSelector:
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(publications):
-            # Qdrant가 이미 순서대로 줬으므로, 기본 점수를 인덱스 역순으로 부여하여 기본 순서 유지
             base_score = 1.0 + (len(publications) - index) * 0.1
             score, matched_keywords = self._score_evidence(
                 title=item.publication_title,
@@ -200,7 +209,6 @@ class KeywordEvidenceSelector:
                 date_value=item.publication_year_month,
                 keywords=keywords,
             )
-            # 키워드 매칭이 없어도 base_score 덕분에 살아남음
             final_score = base_score + score
 
             ranked.append(
@@ -210,8 +218,12 @@ class KeywordEvidenceSelector:
                     title=item.publication_title,
                     date=item.publication_year_month,
                     detail=item.journal_name,
-                    # 스니펫 대신 가급적 초록 전체를 전달 (스니펫 제거 정책)
-                    snippet=item.abstract or " ".join(item.korean_keywords + item.english_keywords),
+                    snippet=_build_rich_snippet(
+                        main_text=item.abstract,
+                        secondary_text=" ".join(item.korean_keywords + item.english_keywords),
+                        metadata={"학술지": item.journal_name},
+                        matched_keywords=matched_keywords,
+                    ),
                     matched_keywords=matched_keywords,
                     match_score=final_score,
                 )
@@ -246,8 +258,12 @@ class KeywordEvidenceSelector:
                     title=item.display_title,
                     date=item.project_end_date or item.project_start_date,
                     detail=item.managing_agency or item.performing_organization,
-                    # 스니펫 대신 연구 요약 전체 전달
-                    snippet=f"연구목표: {item.research_objective_summary or ''}\n연구내용: {item.research_content_summary or ''}",
+                    snippet=_build_rich_snippet(
+                        main_text=item.research_objective_summary,
+                        secondary_text=item.research_content_summary,
+                        metadata={"기관": item.performing_organization or item.managing_agency},
+                        matched_keywords=matched_keywords,
+                    ),
                     matched_keywords=matched_keywords,
                     match_score=final_score,
                 )
@@ -281,8 +297,11 @@ class KeywordEvidenceSelector:
                     date=item.registration_date or item.application_date,
                     detail=item.application_registration_type
                     or item.application_country,
-                    # 특허는 요약 정보가 적으므로 제목과 유형 전달
-                    snippet=f"유형: {item.application_registration_type or ''}, 국가: {item.application_country or ''}",
+                    snippet=_build_rich_snippet(
+                        main_text=item.intellectual_property_title,
+                        secondary_text=f"유형: {item.application_registration_type}, 국가: {item.application_country}",
+                        matched_keywords=matched_keywords,
+                    ),
                     matched_keywords=matched_keywords,
                     match_score=final_score,
                 )
