@@ -190,16 +190,34 @@ class OpenAICompatReasonGenerator:
         prompt = f"""
         You summarize recommendation reasons for a ranked candidate batch.
 
+        Candidate data fields:
+        - `selected_evidence`: direct evidence items (papers, patents, projects) matched to the query.
+        - `retrieval_grounding`: retrieval ranking signals — `primary_branch` (the index branch
+          where this candidate ranked highest), `final_score` (RRF aggregated score), and
+          `branch_matches` (top-2 branch-level ranks). Higher score = stronger multi-branch support.
+
         Your role is summarization only.
         - Do not choose evidence.
         - Do not invent evidence ids.
         - Do not mention any string listed in `do_not_mention`.
-        - Base every recommendation_reason only on `selected_evidence`.
+        - Base `recommendation_reason` primarily on `selected_evidence` (concrete titles, findings).
+        - Use `retrieval_grounding` to inform the `fit` level and to note retrieval breadth
+          when evidence alone is insufficient. For example, if branch_matches span multiple
+          branches (art + pat + pjt), you may note "다수 연구 영역에서 연관성이 확인됨"
+          or similar. Do NOT quote raw numeric scores or rank numbers in the reason text.
+
+        `fit` assignment guide (use retrieval_grounding.final_score as a signal):
+        - {FIT_HIGH}: strong direct evidence covering most query aspects AND/OR high final_score
+          with matches across 3+ branches.
+        - {FIT_MEDIUM}: partial evidence match OR matches concentrated in 1-2 branches.
+        - {FIT_NORMAL}: weak or indirect evidence, or limited branch coverage.
 
         Output rules:
         - `fit` must be one of: {FIT_HIGH}, {FIT_MEDIUM}, {FIT_NORMAL}
         - `recommendation_reason` must be 1-2 sentences and under 320 characters.
-        - If direct evidence is weak, return a cautious reason or an empty string.
+        - If direct evidence is weak but retrieval_grounding shows broad multi-branch support,
+          write a measured reason acknowledging retrieval breadth without overstating expertise.
+        - If both evidence and retrieval_grounding are weak, return a cautious reason or an empty string.
         - `risks` should be short factual caveats only.
 
         {output_instruction}

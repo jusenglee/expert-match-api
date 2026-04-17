@@ -196,6 +196,10 @@ class PlannerOutput(BaseModel):
     core_keywords: list[str] = Field(default_factory=list)
     retrieval_core: list[str] = Field(default_factory=list)
     must_aspects: list[str] = Field(default_factory=list)
+    # evidence_aspects: 한국어/영어 혼합, evidence text(논문 제목·초록·키워드, 과제명 등)와의
+    # 실제 매칭에 사용된다. retrieval_core(한국어 BM25용)와 역할이 분리됨.
+    # 비어있으면 evidence_selector가 must_aspects로 폴백한다.
+    evidence_aspects: list[str] = Field(default_factory=list)
     generic_terms: list[str] = Field(default_factory=list)
     role_terms: list[str] = Field(default_factory=list)
     action_terms: list[str] = Field(default_factory=list)
@@ -211,6 +215,7 @@ class PlannerOutput(BaseModel):
         "core_keywords",
         "retrieval_core",
         "must_aspects",
+        "evidence_aspects",
         "generic_terms",
         "role_terms",
         "action_terms",

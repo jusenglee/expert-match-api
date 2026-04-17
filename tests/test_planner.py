@@ -50,6 +50,7 @@ def test_openai_compat_planner_strips_meta_terms_and_derives_must_aspects():
     assert "recommend" in result.action_terms
     assert "experience" in result.generic_terms
     assert "expert" in planner.last_trace["removed_meta_terms"]
+    assert planner.last_trace["pruned_must_aspects"] == ["AI semiconductor"]
 
 
 def test_openai_compat_planner_retries_when_meta_stripping_leaves_no_keywords():
@@ -155,7 +156,7 @@ def test_openai_compat_planner_selects_only_valid_expansion_bundles():
     assert result.bundle_ids == ["uav", "fire_response"]
 
 
-def test_openai_compat_planner_keeps_contextual_evaluation_phrases_in_must_aspects():
+def test_openai_compat_planner_moves_contextual_evaluation_to_intent_flags():
     planner = OpenAICompatPlanner(
         Settings(app_env="test", strict_runtime_validation=False)
     )
@@ -163,7 +164,7 @@ def test_openai_compat_planner_keeps_contextual_evaluation_phrases_in_must_aspec
         """{
           "intent_summary": "AI 기반 의료영상 과제 평가 전문가 추천",
           "retrieval_core": ["AI 기반 의료영상", "과제 평가", "전문가 추천"],
-          "must_aspects": ["과제 평가"],
+          "must_aspects": ["과제 평가", "AI 기반", "의료영상 분석"],
           "generic_terms": ["평가"],
           "semantic_query": "AI 기반 의료영상 과제 평가 전문가 추천",
           "role_terms": ["전문가"],
@@ -179,7 +180,41 @@ def test_openai_compat_planner_keeps_contextual_evaluation_phrases_in_must_aspec
         planner.plan(query="AI 기반 의료영상 과제를 평가할 수 있는 전문가를 추천해 주세요")
     )
 
-    assert "과제 평가" in result.retrieval_core
-    assert "과제 평가" in result.must_aspects
-    assert "평가" not in result.generic_terms
-    assert "과제 평가" in planner.last_trace["retained_contextual_terms"]
+    assert result.retrieval_core == ["AI 기반 의료영상"]
+    assert result.must_aspects == ["의료영상 분석"]
+    assert result.intent_flags["review_context"] is True
+    assert result.intent_flags["review_targets"] == ["과제 평가"]
+    assert planner.last_trace["retained_contextual_terms"] == ["과제 평가"]
+    assert planner.last_trace["pruned_must_aspects"] == ["의료영상 분석"]
+
+
+def test_openai_compat_planner_prunes_generic_phrases_from_must_aspects():
+    planner = OpenAICompatPlanner(
+        Settings(app_env="test", strict_runtime_validation=False)
+    )
+    planner.model = FakePlannerModel(
+        """{
+          "intent_summary": "AI 기반 의료영상 분석 기술 개발",
+          "retrieval_core": ["의료영상 분석", "AI 기반", "기술"],
+          "must_aspects": ["의료영상 분석", "AI 기반", "기술 개발"],
+          "generic_terms": [],
+          "semantic_query": "AI 기반 의료영상 분석 기술 개발",
+          "role_terms": [],
+          "action_terms": [],
+          "hard_filters": {},
+          "include_orgs": [],
+          "exclude_orgs": [],
+          "top_k": 5
+        }"""
+    )
+
+    result = asyncio.run(planner.plan(query="AI 기반 의료영상 분석 기술 개발"))
+
+    assert result.retrieval_core == ["의료영상 분석", "AI 기반", "기술"]
+    assert result.must_aspects == ["의료영상 분석"]
+    assert planner.last_trace["raw_must_aspects"] == ["의료영상 분석", "AI 기반", "기술 개발"]
+    assert planner.last_trace["normalized_must_aspects"] == [
+        "의료영상 분석",
+        "AI 기반",
+        "기술 개발",
+    ]

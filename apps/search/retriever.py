@@ -41,6 +41,30 @@ class RetrievalResult:
 
 # 가중치 설정 (아키텍처 가이드라인 준수)
 RRF_K = 60.0
+RETRIEVAL_QUERY_SCHEMA_VERSION = "v3_branch_instruct_prefix"
+
+# multilingual-e5-large-instruct 브랜치별 asymmetric instruct prefix
+# - query side: "Instruct: <task>\nQuery: <text>"
+# - document side: 접두어 없음 (인덱싱 시 raw text 그대로)
+# - branch hint를 instruct task 문장에 통합하여 임베딩 방향을 브랜치 특화
+BRANCH_INSTRUCT_PREFIXES: dict[str, str] = {
+    "basic": (
+        "Instruct: Find Korean research experts whose academic background, "
+        "institutional affiliation, and technical expertise match the given query.\nQuery: "
+    ),
+    "art": (
+        "Instruct: Find Korean research experts whose academic publications, "
+        "papers, or research articles are about the given topic.\nQuery: "
+    ),
+    "pat": (
+        "Instruct: Find Korean research experts whose patents or inventions "
+        "are related to the given technology.\nQuery: "
+    ),
+    "pjt": (
+        "Instruct: Find Korean research experts who have conducted government-funded "
+        "research projects related to the given topic.\nQuery: "
+    ),
+}
 
 
 class QdrantHybridRetriever:
@@ -111,7 +135,7 @@ class QdrantHybridRetriever:
 
     @staticmethod
     def _has_distinct_expanded_query(compiled: CompiledBranchQueries) -> bool:
-        return " ".join(compiled.stable.split()) != " ".join(compiled.expanded.split())
+        return compiled.expanded_differs()
 
     @staticmethod
     def _infer_point_branch(point_id: str) -> str | None:
@@ -194,7 +218,25 @@ class QdrantHybridRetriever:
         retrieval_keywords = self.query_builder.normalize_keywords(plan.retrieval_core)
 
         # L3 캐시 키 준비
-        compiled_json = json.dumps({b: {"s": q.stable, "e": q.expanded} for b, q in branch_compiled_queries.items()}, sort_keys=True)
+        compiled_json = json.dumps(
+            {
+                "schema_version": RETRIEVAL_QUERY_SCHEMA_VERSION,
+                "branches": {
+                    branch: {
+                        "stable": compiled.stable,
+                        "expanded": compiled.expanded,
+                        "stable_dense": compiled.stable_dense,
+                        "stable_sparse": compiled.stable_sparse,
+                        "expanded_dense": compiled.expanded_dense,
+                        "expanded_sparse": compiled.expanded_sparse,
+                        "dense_base_source": compiled.dense_base_source,
+                        "sparse_base_source": compiled.sparse_base_source,
+                    }
+                    for branch, compiled in branch_compiled_queries.items()
+                },
+            },
+            sort_keys=True,
+        )
         filter_json = str(query_filter)
         snapshot_id = self.settings.qdrant_collection_release_id
 
@@ -214,17 +256,37 @@ class QdrantHybridRetriever:
                 )
 
         # 3. 실행할 브랜치/경로 조합 정의
-        tasks_meta = []
+        tasks_meta: list[tuple[str, str, str, str]] = []
         for branch in BRANCHES:
             compiled = branch_compiled_queries[branch]
-            tasks_meta.append((branch, "stable", compiled.stable))
+            tasks_meta.append(
+                (
+                    branch,
+                    "stable",
+                    compiled.stable_dense,
+                    compiled.stable_sparse,
+                )
+            )
             if self._has_distinct_expanded_query(compiled):
-                tasks_meta.append((branch, "expanded", compiled.expanded))
+                tasks_meta.append(
+                    (
+                        branch,
+                        "expanded",
+                        compiled.expanded_dense,
+                        compiled.expanded_sparse,
+                    )
+                )
 
         # 4. 병렬 검색 실행
         search_tasks = [
-            self._execute_single_path_query_with_path(branch, path, q_text, query_filter)
-            for branch, path, q_text in tasks_meta
+            self._execute_single_path_query_with_path(
+                branch,
+                path,
+                dense_text,
+                sparse_text,
+                query_filter,
+            )
+            for branch, path, dense_text, sparse_text in tasks_meta
         ]
             
         with Timer() as timer:
@@ -339,7 +401,15 @@ class QdrantHybridRetriever:
             query_payload={
                 "rrf_mode": "equal_weight",
                 "expanded_path_policy": "distinct_expanded_all_branches",
+                "query_schema_version": RETRIEVAL_QUERY_SCHEMA_VERSION,
                 "support_rules": {"s_min": s_min, "e_min": e_min},
+                "branch_query_sources": {
+                    branch: {
+                        "dense_base_source": compiled.dense_base_source,
+                        "sparse_base_source": compiled.sparse_base_source,
+                    }
+                    for branch, compiled in branch_compiled_queries.items()
+                },
             },
             branch_queries=branch_compiled_queries,
             retrieval_keywords=retrieval_keywords,
@@ -349,25 +419,27 @@ class QdrantHybridRetriever:
         )
 
     async def _execute_single_path_query(
-        self, 
-        branch: str, 
-        query_text: str, 
+        self,
+        branch: str,
+        dense_text: str,
+        sparse_text: str,
         query_filter: models.Filter | None
     ) -> tuple[str, str, Any]:
         """단일 브랜치/경로에 대해 Qdrant 하이브리드 검색을 수행합니다."""
-        processed_query = query_text
+        # multilingual-e5-large-instruct 계열: 브랜치별 task-specific instruct prefix 적용.
+        # 브랜치 컨텍스트를 Instruct 문장에 통합하여 쿼리 임베딩 방향을 특화.
+        processed_query = dense_text
         if "instruct" in getattr(self.dense_encoder, "model_name", "").lower():
-            instruct_prefix = (
-                "Instruct: Find experts whose profile, papers, patents, or projects "
-                "match the given query.\nQuery: "
-            )
-            processed_query = f"{instruct_prefix}{query_text}"
-        
+            prefix = BRANCH_INSTRUCT_PREFIXES.get(branch, (
+                "Instruct: Find Korean research experts whose profile matches the given query.\nQuery: "
+            ))
+            processed_query = f"{prefix}{dense_text}"
+
         dense_query = self.dense_encoder.embed(processed_query)
 
         # Sparse 임베딩 생성 (커스텀 인코더 우선 활용)
         if self.sparse_encoder:
-            sparse_map = self.sparse_encoder.embed(query_text)
+            sparse_map = self.sparse_encoder.embed(sparse_text)
             sparse_query = models.SparseVector(
                 indices=list(sparse_map.keys()),
                 values=list(sparse_map.values())
@@ -379,7 +451,7 @@ class QdrantHybridRetriever:
                 else self.settings.sparse_model_name
             )
             sparse_query = models.Document(
-                text=query_text,
+                text=sparse_text,
                 model=sparse_model_name,
             )
         
@@ -399,8 +471,14 @@ class QdrantHybridRetriever:
         self, 
         branch: str, 
         path: str,
-        query_text: str, 
+        dense_text: str,
+        sparse_text: str,
         query_filter: models.Filter | None
     ) -> tuple[str, str, Any]:
-        _, _, points = await self._execute_single_path_query(branch, query_text, query_filter)
+        _, _, points = await self._execute_single_path_query(
+            branch,
+            dense_text,
+            sparse_text,
+            query_filter,
+        )
         return branch, path, points

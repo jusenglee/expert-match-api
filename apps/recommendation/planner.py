@@ -23,7 +23,7 @@ from apps.search.expansion_lexicon import EXPANSION_LEXICON, get_lexicon_summary
 logger = logging.getLogger(__name__)
 
 MAX_PLANNER_ATTEMPTS = 2
-PLANNER_VERSION = "v0.5.0"
+PLANNER_VERSION = "v0.7.0"
 
 ROLE_QUERY_TERMS = (
     "expert recommendation",
@@ -88,6 +88,34 @@ CONTEXTUAL_EVALUATION_PHRASES: tuple[tuple[str, str], ...] = (
     ("technology evaluation", r"\btechnology\s+evaluation\b|\bevaluate\s+technolog(?:y|ies)\b"),
     ("paper evaluation", r"\bpapers?\s+evaluation\b|\bevaluate\s+papers?\b"),
 )
+
+GENERIC_SINGLETON_MUST_ASPECTS = {
+    "기술",
+    "개발",
+    "연구",
+    "과제",
+    "분석",
+    "시스템",
+    "플랫폼",
+    "technology",
+    "development",
+    "research",
+    "project",
+    "analysis",
+    "system",
+    "platform",
+}
+
+GENERIC_PHRASE_MUST_ASPECTS = {
+    "ai 기반",
+    "데이터 기반",
+    "시스템 개발",
+    "기술 개발",
+    "ai based",
+    "data driven",
+    "system development",
+    "technology development",
+}
 
 
 class Planner(Protocol):
@@ -172,6 +200,91 @@ def _extract_contextual_evaluation_terms(query: str) -> list[str]:
     return _normalize_string_list(contextual_terms)
 
 
+def _is_generic_must_aspect(term: str) -> bool:
+    normalized = _normalize_text(term).lower()
+    if not normalized:
+        return True
+    if normalized in GENERIC_PHRASE_MUST_ASPECTS:
+        return True
+    parts = normalized.split()
+    if len(parts) == 1:
+        return normalized in GENERIC_SINGLETON_MUST_ASPECTS
+    return all(part in GENERIC_SINGLETON_MUST_ASPECTS for part in parts)
+
+
+def _most_specific_terms(values: list[str]) -> list[str]:
+    sorted_values = sorted(
+        _normalize_string_list(values),
+        key=lambda value: (
+            -len(value.replace(" ", "")),
+            value.count(" "),
+            value,
+        ),
+    )
+    return sorted_values
+
+
+def _prune_must_aspects(
+    raw_values: list[str],
+    *,
+    contextual_terms: list[str],
+) -> tuple[list[str], list[dict[str, str]]]:
+    contextual_lookup = {value.lower() for value in _normalize_string_list(contextual_terms)}
+    normalized_values = _normalize_string_list(raw_values)
+    pruned: list[str] = []
+    prune_reasons: list[dict[str, str]] = []
+
+    for value in normalized_values:
+        lowered = value.lower()
+        if lowered in contextual_lookup:
+            prune_reasons.append({"term": value, "reason": "review_context"})
+            continue
+        if _is_generic_must_aspect(value):
+            prune_reasons.append({"term": value, "reason": "generic_phrase"})
+            continue
+        if value not in pruned:
+            pruned.append(value)
+
+    if pruned:
+        return pruned, prune_reasons
+
+    fallback_candidates = [
+        value
+        for value in _most_specific_terms(normalized_values)
+        if value.lower() not in contextual_lookup
+    ]
+    if fallback_candidates:
+        fallback_term = fallback_candidates[0]
+        prune_reasons.append({"term": fallback_term, "reason": "specificity_fallback"})
+        return [fallback_term], prune_reasons
+    return [], prune_reasons
+
+
+def _planner_contract_debug(
+    *,
+    raw_must_aspects: list[str],
+    contextual_terms: list[str],
+    forbidden_terms: list[str],
+    fallback_terms: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized_must_aspects = _filter_domain_terms(
+        raw_must_aspects,
+        forbidden_terms=forbidden_terms,
+    )
+    if not normalized_must_aspects and fallback_terms:
+        normalized_must_aspects = _normalize_string_list(fallback_terms)
+    pruned_must_aspects, prune_reasons = _prune_must_aspects(
+        normalized_must_aspects,
+        contextual_terms=contextual_terms,
+    )
+    return {
+        "raw_must_aspects": _normalize_string_list(raw_must_aspects),
+        "normalized_must_aspects": normalized_must_aspects,
+        "pruned_must_aspects": pruned_must_aspects,
+        "must_aspect_prune_reasons": prune_reasons,
+    }
+
+
 class HeuristicPlanner:
     """Deterministic fallback planner used when LLM planning is unavailable."""
 
@@ -244,8 +357,14 @@ class OpenAICompatPlanner:
         - expose must-have aspects for downstream evidence gating
 
         Field guide:
-        - `retrieval_core`: domain terms that are safe to send to retrieval.
-        - `must_aspects`: optional domain aspects. If unsure, leave empty.
+        - `retrieval_core`: Korean-only domain terms for sparse BM25 retrieval. No English.
+        - `must_aspects`: Korean-only core aspects for semantic quality description. Leave empty if unsure.
+        - `evidence_aspects`: BILINGUAL list of specific terms likely to appear literally in paper
+          titles, abstracts, keywords, or project/patent names in this domain. Include both Korean
+          and English forms that researchers actually write. These are used for direct evidence
+          matching against Korean/English mixed research databases. Aim for 4-8 specific terms.
+          Example for "의료영상 분석 AI": ["의료영상 분석", "medical image analysis",
+          "딥러닝", "deep learning", "영상 진단", "image segmentation", "CT 영상", "MRI"]
         - `generic_terms`: generic request words such as broad capability or experience words.
         - `role_terms`: meta nouns such as expert, reviewer, evaluation committee.
         - `action_terms`: request verbs such as recommend, find, search.
@@ -255,10 +374,12 @@ class OpenAICompatPlanner:
 
         Rules:
         1. Preserve the user's language.
-        2. Put only domain terms in `retrieval_core`.
+        2. Put only Korean domain terms in `retrieval_core`.
         3. Put meta request words in `role_terms`, `action_terms`, or `generic_terms`, not in `retrieval_core`.
         4. Do not invent filters, bundle ids, or aspects.
         5. Return empty arrays instead of fabricated terms.
+        6. `evidence_aspects` must contain only specific domain terms — no meta words, no generic
+           words like "기술", "개발", "연구". Include English equivalents of key Korean terms.
 
         Expansion bundles:
         {lexicon_summary}
@@ -268,6 +389,7 @@ class OpenAICompatPlanner:
           "intent_summary": "string",
           "retrieval_core": ["string"],
           "must_aspects": ["string"],
+          "evidence_aspects": ["string"],
           "generic_terms": ["string"],
           "bundle_ids": ["string"],
           "semantic_query": "string",
@@ -331,15 +453,40 @@ class OpenAICompatPlanner:
         )
 
         raw_retrieval_terms = _normalize_string_list(
-            list(output.retrieval_core or output.core_keywords) + effective_contextual_terms
+            output.retrieval_core or output.core_keywords
         )
         output.retrieval_core = _filter_domain_terms(
             raw_retrieval_terms,
             forbidden_terms=forbidden_terms,
         )
-        output.must_aspects = list(output.retrieval_core)
+        contextual_lookup = {
+            value.lower() for value in _normalize_string_list(effective_contextual_terms)
+        }
+        if contextual_lookup:
+            output.retrieval_core = [
+                term
+                for term in output.retrieval_core
+                if term.lower() not in contextual_lookup
+            ]
         output.core_keywords = list(output.retrieval_core)
+        raw_must_aspects = _filter_domain_terms(
+            output.must_aspects or output.retrieval_core or output.core_keywords,
+            forbidden_terms=forbidden_terms,
+        )
+        if not raw_must_aspects:
+            raw_must_aspects = list(output.retrieval_core)
+        output.must_aspects, _ = _prune_must_aspects(
+            raw_must_aspects,
+            contextual_terms=effective_contextual_terms,
+        )
         output.task_terms = _normalize_string_list(output.role_terms + output.action_terms)
+        output.intent_flags = dict(output.intent_flags or {})
+        if effective_contextual_terms:
+            output.intent_flags["review_context"] = True
+            output.intent_flags["review_targets"] = effective_contextual_terms
+        else:
+            output.intent_flags.pop("review_context", None)
+            output.intent_flags.pop("review_targets", None)
 
         output.bundle_ids = [
             bundle_id
@@ -350,6 +497,25 @@ class OpenAICompatPlanner:
             output.semantic_query = (
                 " ".join(output.retrieval_core) if output.retrieval_core else output.intent_summary
             )
+
+        # evidence_aspects 정제: meta/generic 용어 제거 후 must_aspects 기반 폴백 생성.
+        # evidence_aspects는 한국어+영어 혼합으로 실제 evidence text에 등장할 용어만 포함.
+        raw_evidence_aspects = _normalize_string_list(output.evidence_aspects)
+        cleaned_evidence_aspects = _filter_domain_terms(
+            raw_evidence_aspects,
+            forbidden_terms=forbidden_terms,
+        )
+        # generic singleton/phrase 필터 적용 (단순 "기술", "AI 기반" 등 제거)
+        cleaned_evidence_aspects = [
+            term for term in cleaned_evidence_aspects
+            if not _is_generic_must_aspect(term)
+        ]
+        if cleaned_evidence_aspects:
+            output.evidence_aspects = cleaned_evidence_aspects
+        else:
+            # LLM이 evidence_aspects를 생성하지 않은 경우: must_aspects에서 자동 생성.
+            # must_aspects는 한국어 구이므로 그대로 사용(bilingual 확장은 LLM 재시도 시 이루어짐).
+            output.evidence_aspects = list(output.must_aspects)
 
         if filters_override:
             merged_filters = dict(output.hard_filters)
@@ -424,6 +590,14 @@ class OpenAICompatPlanner:
                     top_k=top_k,
                     contextual_terms=retained_contextual_terms,
                 )
+                contract_debug = _planner_contract_debug(
+                    raw_must_aspects=list(output.must_aspects or output.retrieval_core),
+                    contextual_terms=retained_contextual_terms,
+                    forbidden_terms=_normalize_string_list(
+                        output.role_terms + output.action_terms + output.generic_terms
+                    ),
+                    fallback_terms=list(output.retrieval_core),
+                )
                 self.last_trace = {
                     "mode": "cache_hit",
                     "cache": {"canonical_plan": "hit"},
@@ -435,14 +609,17 @@ class OpenAICompatPlanner:
                     "generic_terms": list(output.generic_terms),
                     "removed_meta_terms": removed_meta_terms,
                     "retained_contextual_terms": retained_contextual_terms,
+                    "intent_flags": dict(output.intent_flags),
+                    **contract_debug,
                 }
                 logger.info(
-                    "Planner cache applied: query=%r removed_meta_terms=%s retained_contextual_terms=%s retrieval_core=%s must_aspects=%s",
+                    "Planner cache applied: query=%r removed_meta_terms=%s retained_contextual_terms=%s retrieval_core=%s must_aspects=%s intent_flags=%s",
                     normalized_query,
                     removed_meta_terms,
                     retained_contextual_terms,
                     output.retrieval_core,
                     output.must_aspects,
+                    output.intent_flags,
                 )
                 return output
 
@@ -489,6 +666,18 @@ class OpenAICompatPlanner:
                 attempts.append(attempt_trace)
 
                 if output.retrieval_core:
+                    contract_debug = _planner_contract_debug(
+                        raw_must_aspects=_normalize_string_list(
+                            parsed_payload.get("must_aspects")
+                            or parsed_payload.get("retrieval_core")
+                            or []
+                        ),
+                        contextual_terms=retained_contextual_terms,
+                        forbidden_terms=_normalize_string_list(
+                            output.role_terms + output.action_terms + output.generic_terms
+                        ),
+                        fallback_terms=list(output.retrieval_core),
+                    )
                     self.last_trace = {
                         "mode": "openai_compat",
                         "cache": {"canonical_plan": "miss"},
@@ -501,18 +690,21 @@ class OpenAICompatPlanner:
                         "generic_terms": list(output.generic_terms),
                         "removed_meta_terms": removed_meta_terms,
                         "retained_contextual_terms": retained_contextual_terms,
+                        "intent_flags": dict(output.intent_flags),
+                        **contract_debug,
                         "attempts": attempts,
                     }
                     if self.cache:
                         self.cache.set(normalized_query, filters, PLANNER_VERSION, output)
                     logger.info(
-                        "LLM planning success: query=%r removed_meta_terms=%s retained_contextual_terms=%s retrieval_core=%s must_aspects=%s generic_terms=%s",
+                        "LLM planning success: query=%r removed_meta_terms=%s retained_contextual_terms=%s retrieval_core=%s must_aspects=%s generic_terms=%s intent_flags=%s",
                         normalized_query,
                         removed_meta_terms,
                         retained_contextual_terms,
                         output.retrieval_core,
                         output.must_aspects,
                         output.generic_terms,
+                        output.intent_flags,
                     )
                     return output
 
@@ -564,6 +756,16 @@ class OpenAICompatPlanner:
             top_k=top_k,
             contextual_terms=retained_contextual_terms,
         )
+        contract_debug = _planner_contract_debug(
+            raw_must_aspects=fallback_keywords,
+            contextual_terms=retained_contextual_terms,
+            forbidden_terms=_normalize_string_list(
+                fallback_output.role_terms
+                + fallback_output.action_terms
+                + fallback_output.generic_terms
+            ),
+            fallback_terms=list(fallback_output.retrieval_core),
+        )
         self.last_trace = {
             "mode": "fallback_broad_search",
             "cache": {"canonical_plan": "miss"},
@@ -576,15 +778,18 @@ class OpenAICompatPlanner:
             "generic_terms": list(fallback_output.generic_terms),
             "removed_meta_terms": removed_meta_terms,
             "retained_contextual_terms": retained_contextual_terms,
+            "intent_flags": dict(fallback_output.intent_flags),
+            **contract_debug,
             "fallback_terms": list(fallback_output.retrieval_core),
             "reason": "planner_retry_exhausted_or_empty",
             "attempts": attempts,
         }
         logger.warning(
-            "Planner fallback activated: query=%r removed_meta_terms=%s retained_contextual_terms=%s fallback_terms=%s",
+            "Planner fallback activated: query=%r removed_meta_terms=%s retained_contextual_terms=%s fallback_terms=%s intent_flags=%s",
             normalized_query,
             removed_meta_terms,
             retained_contextual_terms,
             fallback_output.retrieval_core,
+            fallback_output.intent_flags,
         )
         return fallback_output

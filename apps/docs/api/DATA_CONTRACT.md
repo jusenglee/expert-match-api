@@ -1,161 +1,204 @@
-# 데이터 계약 (Data Contract)
+# Data Contract
 
 ## Planner Output
 
-`PlannerOutput`은 검색과 추천 파이프라인의 공용 입력 계약이다.
+`PlannerOutput` is the shared contract between planning, retrieval, evidence selection, and recommendation assembly.
 
 ```json
 {
-  "intent_summary": "AI 반도체 설계 경험이 있는 후보 추천",
+  "intent_summary": "AI 기반 의료영상 분석 기술 개발 과제 추천",
   "hard_filters": {},
   "include_orgs": [],
   "exclude_orgs": [],
   "task_terms": [],
-  "core_keywords": ["AI 반도체", "설계 경험"],
-  "retrieval_core": ["AI 반도체", "설계 경험"],
-  "must_aspects": ["AI 반도체", "설계 경험"],
-  "generic_terms": [],
+  "core_keywords": ["의료영상 분석", "AI 기반", "기술"],
+  "retrieval_core": ["의료영상 분석", "AI 기반", "기술"],
+  "must_aspects": ["의료영상 분석"],
+  "generic_terms": ["경험"],
   "role_terms": ["전문가"],
   "action_terms": ["추천"],
   "bundle_ids": [],
-  "semantic_query": "",
+  "intent_flags": {
+    "review_context": true,
+    "review_targets": ["과제 평가"]
+  },
+  "semantic_query": "AI 기반 의료영상 분석 기술 개발 과제",
   "top_k": 5
 }
 ```
 
-현재 계약 규칙은 다음과 같다.
+## Active Meanings
 
-- `retrieval_core`가 실제 검색 기준이다.
-- `must_aspects`는 shortlist gate와 evidence selector가 쓰는 질의 충족 기준이다.
-- `generic_terms`는 범용 요청어 추적용이며 직접 검색어로 쓰지 않는다.
-- `core_keywords`는 하위 호환 alias다.
-- `평가위원`, `전문가`, `추천` 같은 메타어는 `retrieval_core`, `must_aspects`, `core_keywords`에 남기지 않는다.
+- `retrieval_core` is the sparse / lexical retrieval basis (Korean-only).
+- `core_keywords` remains a compatibility alias of `retrieval_core`.
+- `semantic_query` is a dense-only natural-language query.
+- `must_aspects` is the Korean-only semantic quality description and evidence gate fallback. No longer the primary gate basis when `evidence_aspects` is present.
+- `evidence_aspects` is the bilingual (Korean + English) evidence matching basis. Takes priority over `must_aspects` in the evidence selector and shortlist gate. See the Evidence Aspects Contract section below.
+- `intent_flags.review_context` and `intent_flags.review_targets` capture review/evaluation context such as `과제 평가`, `기술 평가`, `논문 평가`.
+- Meta request terms such as `평가위원`, `전문가`, `추천` do not remain in `retrieval_core`, `must_aspects`, or `evidence_aspects`.
+
+## Evidence Aspects Contract
+
+`evidence_aspects` is a new bilingual field in `PlannerOutput` (planner v0.7.0+).
+
+```json
+{
+  "retrieval_core":    ["의료영상 분석", "AI 기반 의료영상"],
+  "must_aspects":      ["의료영상 분석"],
+  "evidence_aspects":  ["의료영상 분석", "medical image analysis",
+                        "딥러닝", "deep learning",
+                        "영상 진단", "image segmentation"]
+}
+```
+
+Field responsibilities:
+
+- `retrieval_core`: Korean-only, for sparse BM25 retrieval query.
+- `must_aspects`: Korean-only, for semantic quality description and fallback.
+- `evidence_aspects`: **Bilingual** (Korean + English), for direct evidence text matching.
+
+The evidence selector prefers `evidence_aspects` over `must_aspects`. If empty, it falls back to `must_aspects → retrieval_core → core_keywords`.
+
+The shortlist gate's `_required_aspect_coverage` computes the threshold from the same priority chain the selector uses: `evidence_aspects → must_aspects → retrieval_core → core_keywords`. Threshold = `min(2, len(target_aspects))`.
+
+### Evidence selector search scope by item type
+
+| Item type | Title field searched | Body fields searched |
+|---|---|---|
+| paper | `publication_title` | `abstract`, `journal_name`, `korean_keywords`, `english_keywords` |
+| project | `display_title` (Korean-first) | `project_title_english` (supplement), `research_objective_summary`, `research_content_summary`, `managing_agency` |
+| patent | `intellectual_property_title` | `application_registration_type`, `application_country` |
+
+`project_title_english` is added to body_parts so that English evidence_aspects can match English project titles even when the Korean title takes precedence in display_title.
 
 ## Query Builder Contract
 
-`QueryTextBuilder`는 planner 출력에서 branch query를 만든다.
+`QueryTextBuilder` compiles two modalities per branch:
 
-- 우선순위: `retrieval_core -> core_keywords -> raw query`
-- planner가 정제한 검색어가 있으면 raw query를 다시 검색어로 쓰지 않는다.
-- 모든 branch는 같은 stable base를 공유하고, branch hint만 뒤에 붙는다.
+- `stable_dense`
+- `stable_sparse`
+- `expanded_dense`
+- `expanded_sparse`
+
+The public `stable` / `expanded` strings remain sparse-oriented summaries for trace compatibility.
+
+Priority rules:
+
+- Sparse base: `retrieval_core -> core_keywords -> raw query`
+- Dense base: `semantic_query -> retrieval_core -> core_keywords -> raw query`
+
+Path model:
+
+- Stable path: `stable_dense + stable_sparse`
+- Expanded path: only the modality that actually changed is expanded; the other modality reuses the stable value
+
+Branch context model:
+
+- Branch hints are **not** appended to query text inside QueryTextBuilder.
+- Branch context is carried exclusively by the branch-specific instruct prefix in `QdrantHybridRetriever`.
+- This keeps query text clean for embedding (no awkward `keyword_list\nbranch_hints` suffix).
+
+Expansion policy for dense when `semantic_query` is active:
+
+- Expanded keywords are **not** appended to `semantic_query`-based dense text.
+- Appending technical keyword suffixes to a natural-language sentence degrades embedding quality.
+- Expansion applies only to the sparse modality when `dense_base_source == "semantic_query"`.
 
 ## Evidence Selector Contract
 
-`KeywordEvidenceSelector`는 `CandidateCard` 미리보기에서 후보별 relevant evidence를 고른다.
+`KeywordEvidenceSelector` selects only direct-match evidence.
 
-### 입력
+Selection rules:
 
-- `candidates: list[CandidateCard]`
-- `plan: PlannerOutput`
+- direct lexical match only
+- dedup key: `normalized title + year`
+- max `2` items per aspect
+- max `4` total items per candidate
+- future-dated projects are allowed
 
-### 출력
+Output bundle fields:
 
-```json
-{
-  "expert_id": "12345678",
-  "papers": [],
-  "projects": [],
-  "patents": [],
-  "matched_aspects": ["AI 반도체", "설계 경험"],
-  "matched_generic_terms": [],
-  "direct_match_count": 2,
-  "aspect_coverage": 2,
-  "generic_only": false,
-  "dedup_dropped_count": 1
-}
-```
+- `matched_aspects`
+- `matched_generic_terms`
+- `direct_match_count`
+- `aspect_coverage`
+- `generic_only`
+- `dedup_dropped_count`
+- `future_selected_evidence_ids`
 
-선택 규칙은 다음과 같다.
+`aspect_coverage` is phrase-based, not token-count based.
 
-- 직접 매치 evidence만 relevant pool에 포함
-- dedup 기준은 `normalized title + year`
-- aspect별 최대 2건
-- 후보당 전체 최대 4건
+## Recommendation Contract
 
-## Reason Generator Contract
+`RecommendationDecision` is assembled by the server.
 
-공개 응답 스키마는 유지되지만, 내부 LLM 계약은 바뀌었다.
+- `evidence` comes from server-selected evidence only
+- `recommendation_reason` may come from the LLM or a server fallback
+- `fit` remains the LLM summary label, but quality control is enforced by retrieval and deterministic gates
 
-### LLM 입력
-
-- `must_aspects`
-- `generic_terms`
-- 후보별 `candidate_name`
-- 후보별 `selected_evidence`
-- 후보별 `selected_evidence_summary`
-- 후보별 `retrieval_grounding`
-- 후보별 `do_not_mention`
-
-### LLM 출력
+LLM input per candidate includes both `selected_evidence` and `retrieval_grounding`:
 
 ```json
 {
-  "items": [
-    {
-      "expert_id": "12345678",
-      "fit": "높음",
-      "recommendation_reason": "직접 evidence를 요약한 추천 사유",
-      "risks": []
-    }
-  ],
-  "data_gaps": []
+  "retrieval_grounding": {
+    "primary_branch": "art",
+    "final_score": 0.0312,
+    "branch_matches": [
+      {"branch": "art", "rank": 2, "score": 0.021},
+      {"branch": "pjt", "rank": 5, "score": 0.018}
+    ]
+  }
 }
 ```
 
-중요한 변경점은 다음과 같다.
+The LLM uses `retrieval_grounding` to:
+- Assign `fit` level (높음 if final_score is high and 3+ branches match)
+- Note multi-branch retrieval breadth in natural language when direct evidence is limited
+- Must NOT quote raw score numbers or rank numbers in the reason text
 
-- `selected_evidence_ids`는 더 이상 LLM 출력 필수 필드가 아니다.
-- evidence 선택 책임은 서버가 가진다.
-- LLM은 요약만 한다.
+## Validator Contract
 
-## Recommendation Assembly Contract
+The reason sync validator checks:
 
-`RecommendationService`는 최종 `RecommendationDecision`을 서버에서 조립한다.
+- other candidate names leaking into the reason
+- internal evidence ids leaking into the reason
+- `must_aspects` touching the same evidence scope the selector used (Korean-only; the validator checks Korean reason text against Korean aspects)
+- strong claims without direct evidence
 
-- `evidence`는 항상 selector가 확정한 evidence에서 나온다.
-- LLM reason이 비면 `selected_evidence` 기반 fallback 사유를 만든다.
-- LLM reason이 validator를 통과하지 못하면 `reason_sync_validator` fallback 사유로 치환한다.
+Note: the validator intentionally uses `must_aspects` (Korean-only) for the aspect scope check, not `evidence_aspects`. The reason text is generated in Korean, so bilingual English terms from `evidence_aspects` would produce false positives in the scope check.
 
-공개 응답 예시는 기존과 동일하다.
+Evidence scope for aspect checks is:
 
-```json
-{
-  "rank": 1,
-  "expert_id": "12345678",
-  "name": "홍길동",
-  "fit": "높음",
-  "recommendation_reason": "직접 evidence 기반 추천 사유",
-  "evidence": [
-    {
-      "type": "project",
-      "title": "AI 반도체 설계 플랫폼",
-      "date": "2025-01-01",
-      "detail": "주관기관: NTIS"
-    }
-  ],
-  "risks": [],
-  "rank_score": 95.8
-}
-```
+- `title`
+- `detail`
+- `snippet`
+
+This avoids selector/validator disagreement caused by title-only checks.
 
 ## Trace Contract
 
-추천 응답의 trace에서 이번 변경으로 중요해진 필드는 다음과 같다.
+Important trace fields:
 
 - `planner_trace.removed_meta_terms`
-- `planner_trace.must_aspects`
-- `planner_trace.generic_terms`
-- `planner_trace.fallback_terms`
+- `planner_trace.retained_contextual_terms`
+- `planner_trace.raw_must_aspects`
+- `planner_trace.normalized_must_aspects`
+- `planner_trace.pruned_must_aspects`
+- `planner_trace.must_aspect_prune_reasons`
+- `planner_trace.intent_flags`
 - `reason_generation_trace.evidence_selection`
 - `reason_generation_trace.shortlist_gate`
-- `reason_generation_trace.selected_evidence`
-- `reason_generation_trace.server_fallback_reasons`
 - `reason_generation_trace.reason_sync_validator`
+- `reason_generation_trace.server_fallback_reasons`
 
-`selected_evidence_ids`를 기준으로 evidence를 해석하는 구형 계약은 활성 계약이 아니다.
-## 2026-04-17 contract deltas
+## 2026-04-17 Contract Notes
 
-- Retrieval score fusion is equal-weight RRF. Branch/path weight tables are not part of the active contract.
-- `평가` is contextual: `평가위원`, `전문가 추천`, `추천` stay out of retrieval keywords, while phrases such as `과제 평가`, `기술 평가`, `논문 평가` may remain in `retrieval_core` and `must_aspects`.
-- `RelevantEvidenceBundle` may expose `future_selected_evidence_ids` for observability. Future-dated project evidence is still allowed.
-- Reasoner batch trace now records `retry_triggered`, `retry_trigger`, and `retry_reason` when compact retry is scheduled for partial output.
+- Retrieval score fusion is equal-weight RRF (schema version: `v3_branch_instruct_prefix`).
+- `semantic_query` is active for the dense retrieval base (priority over `retrieval_core`).
+- When `dense_base_source == "semantic_query"`, expansion keywords are NOT appended to the dense query.
+- Branch query hints removed from query text; branch context moved to retriever-side instruct prefix.
+- Each branch (`basic`, `art`, `pat`, `pjt`) now has a dedicated e5-instruct prefix in the retriever.
+- `must_aspects` is no longer a direct copy of `retrieval_core`.
+- Contextual evaluation phrases are tracked in `intent_flags`, not `must_aspects`.
+- Phrase normalization is shared between selector, gate, and validator.
+- LLM reasoner can reference `retrieval_grounding` for `fit` assignment and breadth notes.

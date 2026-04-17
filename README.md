@@ -63,8 +63,8 @@ uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 
 ## 현재 추천 런타임 정책
 
-- Planner는 `retrieval_core`, `must_aspects`, `generic_terms`를 만든다.
-- Query builder는 `retrieval_core -> core_keywords -> raw query` 순서로 검색어를 만든다.
+- Planner는 `retrieval_core`, `must_aspects`, `generic_terms`, `semantic_query`, `intent_flags.review_context`를 만든다.
+- Query builder는 sparse 검색어는 `retrieval_core -> core_keywords -> raw query`, dense 검색어는 `semantic_query -> retrieval_core -> raw query` 순서로 만든다.
 - Evidence selector는 직접 매치 evidence만 후보별 최대 4건까지 고른다.
 - Shortlist gate는 점수 가중합 없이 순차 규칙으로만 적용된다.
 - Reason generator는 최대 5명씩 batch로 돌고, tool calling 1회 + compact retry 1회를 시도한다.
@@ -82,6 +82,8 @@ uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 
 - Retrieval now uses equal-weight RRF. Branch/path weights are not applied.
 - Expanded queries follow one rule across all branches and run only when expanded text differs from stable text.
-- Meta terms such as `평가위원`, `전문가`, `추천` stay out of retrieval keywords, but contextual phrases such as `과제 평가`, `기술 평가`, `논문 평가` stay in `must_aspects`.
+- Meta terms such as `평가위원`, `전문가`, `추천` stay out of retrieval keywords. Contextual phrases such as `과제 평가`, `기술 평가`, `논문 평가` are tracked via `intent_flags.review_context` and `intent_flags.review_targets`, not `must_aspects`.
+- `semantic_query` is now used for dense retrieval only. Sparse retrieval continues to use `retrieval_core`.
+- `must_aspects` is no longer a direct copy of `retrieval_core`; it is deterministically pruned so broad phrases such as `AI 기반` or `기술 개발` do not become hard lexical gates.
 - Reason generation performs one compact retry when a batch returns missing candidates, empty reasons, or any partial output.
 - Future-dated project evidence is still allowed and is now surfaced in selector trace/logs via `future_selected_evidence_ids`.

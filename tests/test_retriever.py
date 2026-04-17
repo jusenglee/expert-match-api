@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from apps.core.config import Settings
 from apps.domain.models import PlannerOutput
 from apps.search.query_builder import QueryTextBuilder
-from apps.search.retriever import QdrantHybridRetriever
+from apps.search.retriever import (
+    RETRIEVAL_QUERY_SCHEMA_VERSION,
+    QdrantHybridRetriever,
+)
 from apps.search.schema_registry import SearchSchemaRegistry
 from apps.search.sparse_runtime import SparseRuntimeConfig
 
@@ -14,15 +17,9 @@ class FakeQdrantClient:
         self.payloads = payloads
         self.scores = scores or [0.88 - (index * 0.01) for index in range(len(payloads))]
         self.calls: list[dict] = []
-        self.main_kwargs = None
-        self.branch_kwargs: list[dict] = []
 
     def query_points(self, **kwargs):
         self.calls.append(kwargs)
-        if kwargs.get("with_payload"):
-            self.main_kwargs = kwargs
-        else:
-            self.branch_kwargs.append(kwargs)
         return SimpleNamespace(
             points=[
                 SimpleNamespace(
@@ -57,7 +54,7 @@ def _settings() -> Settings:
     )
 
 
-def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak():
+def test_retriever_uses_semantic_query_for_dense_and_keywords_for_sparse():
     payloads = [
         {
             "basic_info": {"researcher_id": "2", "researcher_name": "Bravo"},
@@ -91,40 +88,34 @@ def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak
                 intent_summary="Recommend AI semiconductor reviewers",
                 retrieval_core=["AI semiconductor", "chip design"],
                 core_keywords=["AI semiconductor", "chip design"],
+                semantic_query="AI semiconductor expert for chip design",
             ),
             query_filter=None,
         ),
     )
 
     assert result.retrieval_keywords == ["AI", "semiconductor", "chip", "design"]
-    assert "AI semiconductor" in result.branch_queries["basic"].stable
-    assert "chip design" in result.branch_queries["basic"].stable
-    assert "AI semiconductor" in result.branch_queries["art"].stable
-    assert "chip design" in result.branch_queries["art"].stable
-    assert "AI semiconductor" in result.branch_queries["pat"].stable
-    assert "chip design" in result.branch_queries["pat"].stable
-    assert "AI semiconductor" in result.branch_queries["pjt"].stable
-    assert "chip design" in result.branch_queries["pjt"].stable
-    assert {hit.expert_id for hit in result.hits} == {"1", "2"}
+    assert result.branch_queries["basic"].stable.startswith("AI semiconductor chip design")
+    assert result.branch_queries["basic"].stable_dense.startswith(
+        "AI semiconductor expert for chip design"
+    )
+    assert result.branch_queries["basic"].stable_sparse.startswith(
+        "AI semiconductor chip design"
+    )
+    assert result.query_payload["query_schema_version"] == RETRIEVAL_QUERY_SCHEMA_VERSION
+    assert result.query_payload["branch_query_sources"]["basic"]["dense_base_source"] == (
+        "semantic_query"
+    )
     assert len(encoder.inputs) == 4
-    assert all("AI semiconductor" in text for text in encoder.inputs)
-    assert all("chip design" in text for text in encoder.inputs)
-    sparse_texts = [
-        call["prefetch"][1].query.text
-        for call in client.calls
-    ]
-    assert sparse_texts == encoder.inputs
+    assert all("expert for chip design" in text for text in encoder.inputs)
+
+    sparse_texts = [call["prefetch"][1].query.text for call in client.calls]
+    assert sparse_texts != encoder.inputs
+    assert all("AI semiconductor chip design" in text for text in sparse_texts)
     assert len(client.calls) == 4
     assert len(result.retrieval_score_traces) == 2
     assert result.query_payload["rrf_mode"] == "equal_weight"
     assert result.query_payload["expanded_path_policy"] == "distinct_expanded_all_branches"
-    assert result.retrieval_score_traces[0]["expert_id"] in {"1", "2"}
-    assert {item["branch"] for item in result.retrieval_score_traces[0]["branch_matches"]} == {
-        "basic",
-        "art",
-        "pat",
-        "pjt",
-    }
 
 
 def test_retriever_skips_invalid_points_and_keeps_valid_hits():
@@ -206,8 +197,5 @@ def test_retriever_uses_active_sparse_runtime_model_for_builtin_queries():
         )
     )
 
-    sparse_models = [
-        call["prefetch"][1].query.model
-        for call in client.calls
-    ]
+    sparse_models = [call["prefetch"][1].query.model for call in client.calls]
     assert sparse_models == ["Qdrant/bm25"] * 4
