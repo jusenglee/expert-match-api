@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from apps.core.feedback_store import FeedbackStore
 from apps.core.timer import Timer
 from apps.core.utils import merge_unique_strings as _merge_unique_strings
-from apps.domain.models import CandidateCard, EvidenceItem, PlannerOutput, RecommendationDecision
+from apps.domain.models import (
+    CandidateCard,
+    EvidenceItem,
+    PlannerOutput,
+    RecommendationDecision,
+    SearchHit,
+)
 from apps.recommendation.cards import CandidateCardBuilder
 from apps.recommendation.evidence_selector import (
     EvidenceSelector,
@@ -14,24 +21,34 @@ from apps.recommendation.evidence_selector import (
     RelevantEvidenceItem,
 )
 from apps.recommendation.planner import Planner
-from apps.recommendation.reasoner import (
-    ReasonGenerationOutput,
-    ReasonGenerator,
-    VALID_EVIDENCE_ID_PATTERN,
-)
+from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonGenerator
 from apps.search.filters import QdrantFilterCompiler
-from apps.search.query_builder import QueryTextBuilder
+from apps.search.query_builder import CompiledBranchQueries, QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import BRANCHES
 
 logger = logging.getLogger(__name__)
 
 NO_MATCHING_CANDIDATE_REASON = "No matching candidates were found."
+NO_GATE_PASSED_CANDIDATE_REASON = "No candidates satisfied deterministic evidence gates."
 EMPTY_RETRIEVAL_KEYWORDS_REASON = (
     "Retrieval skipped because planner core_keywords were empty after retry."
 )
 FINAL_SORT_POLICY = "rrf_score_desc_name_asc"
 REASON_GENERATION_BATCH_SIZE = 5
+INTERNAL_EVIDENCE_ID_PATTERN = re.compile(r"\b(?:paper|project|patent):\d+\b")
+STRONG_REASON_MARKERS = (
+    "추천",
+    "적합",
+    "전문",
+    "권장",
+    "우수",
+    "높음",
+    "recommend",
+    "recommended",
+    "strong fit",
+    "well suited",
+)
 
 
 class RecommendationService:
@@ -62,6 +79,7 @@ class RecommendationService:
         include_orgs: list[str] | None = None,
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
+        limit_candidates: bool = True,
     ) -> dict[str, Any]:
         with Timer() as plan_timer:
             plan = await self.planner.plan(
@@ -75,11 +93,13 @@ class RecommendationService:
         planner_trace = self._extract_component_trace(self.planner)
         retrieval_keywords = QueryTextBuilder.normalize_keywords(plan.core_keywords)
         logger.info(
-            "Planner completed: elapsed_ms=%.2f intent=%r filters=%r keywords=%d",
+            "Planner completed: elapsed_ms=%.2f intent=%r filters=%r retrieval_core=%s must_aspects=%s removed_meta_terms=%s",
             plan_timer.elapsed_ms,
             plan.intent_summary,
             plan.hard_filters,
-            len(retrieval_keywords),
+            plan.retrieval_core,
+            getattr(plan, "must_aspects", []),
+            (planner_trace or {}).get("removed_meta_terms", []),
         )
 
         query_filter = self.filter_compiler.compile(
@@ -90,9 +110,10 @@ class RecommendationService:
 
         if not retrieval_keywords:
             logger.warning(
-                "Retriever skipped: query=%r reason=%s",
+                "Retriever skipped: query=%r reason=%s removed_meta_terms=%s",
                 query,
                 EMPTY_RETRIEVAL_KEYWORDS_REASON,
+                (planner_trace or {}).get("removed_meta_terms", []),
             )
             return {
                 "planner": plan,
@@ -107,6 +128,7 @@ class RecommendationService:
                 "branch_queries": {},
                 "retrieval_keywords": retrieval_keywords,
                 "retrieval_score_traces": [],
+                "expanded_shadow_hits": [],
                 "raw_query": query,
                 "retrieval_skipped_reason": EMPTY_RETRIEVAL_KEYWORDS_REASON,
                 "final_sort_policy": FINAL_SORT_POLICY,
@@ -129,7 +151,11 @@ class RecommendationService:
             len(retrieval.hits),
         )
 
-        display_hits = retrieval.hits[:top_k] if top_k is not None else retrieval.hits
+        display_hits = (
+            retrieval.hits[:top_k]
+            if limit_candidates and top_k is not None
+            else retrieval.hits
+        )
         cards = self.card_builder.build_small_cards(display_hits, plan)
         return {
             "planner": plan,
@@ -137,7 +163,7 @@ class RecommendationService:
             "query_filter": query_filter,
             "retrieved_count": len(retrieval.hits),
             "candidates": cards,
-            "hits_with_support": display_hits, # Support 정보 포함된 원본 히트
+            "hits_with_support": display_hits,
             "support_rule_applied": True,
             "cache_hit": retrieval.cache_hit,
             "filtered_out_candidates": retrieval.filtered_out_candidates,
@@ -174,27 +200,22 @@ class RecommendationService:
             include_orgs=include_orgs,
             exclude_orgs=exclude_orgs,
             top_k=top_k,
+            limit_candidates=False,
         )
 
         plan: PlannerOutput = search_result["planner"]
         candidate_cards: list[CandidateCard] = search_result["candidates"]
         top_k_used = top_k if top_k is not None else max(plan.top_k, 1)
-        shortlist = candidate_cards[:top_k_used]
 
-        logger.info(
-            "Top-k selected for reason generation: candidates=%d top_k=%d selected=%d",
-            len(candidate_cards),
-            top_k_used,
-            len(shortlist),
-        )
-
-        if search_result["retrieved_count"] == 0 or not shortlist:
+        if search_result["retrieved_count"] == 0 or not candidate_cards:
             logger.info(
-                "Recommendation finished with no shortlist: query=%r retrieved=%d shortlist=%d",
+                "Recommendation finished with no candidates: query=%r retrieved=%d",
                 query,
                 search_result["retrieved_count"],
-                len(shortlist),
             )
+            total_timer.stop()
+            timers = dict(search_result.get("timers", {}))
+            timers["total_ms"] = total_timer.elapsed_ms
             return self._build_recommendation_response(
                 plan=plan,
                 candidate_cards=candidate_cards,
@@ -216,14 +237,80 @@ class RecommendationService:
                 reason_generation_trace=None,
                 final_sort_policy=search_result["final_sort_policy"],
                 top_k_used=top_k_used,
-                timers=search_result.get("timers"),
+                timers=timers,
+                expanded_shadow_hits=search_result.get("expanded_shadow_hits"),
             )
 
         with Timer() as evidence_selection_timer:
             relevant_evidence_by_expert_id = self.evidence_selector.select(
-                candidates=shortlist,
+                candidates=candidate_cards,
                 plan=plan,
             )
+        evidence_selection_trace = self._extract_component_trace(self.evidence_selector) or {}
+        shortlist, shortlist_gate_trace = self._apply_shortlist_gates(
+            cards=candidate_cards,
+            plan=plan,
+            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+        )
+        shortlist = shortlist[:top_k_used]
+        logger.info(
+            "Shortlist gate completed: kept=%d low_coverage=%d generic_only=%d dropped=%d shortlist=%s",
+            len(shortlist_gate_trace["kept_candidate_ids"]),
+            len(shortlist_gate_trace["low_coverage_candidate_ids"]),
+            len(shortlist_gate_trace["generic_only_candidate_ids"]),
+            len(shortlist_gate_trace["dropped_candidate_ids"]),
+            [card.expert_id for card in shortlist],
+        )
+
+        if not shortlist:
+            total_timer.stop()
+            timers = dict(search_result.get("timers", {}))
+            timers["evidence_selection_ms"] = evidence_selection_timer.elapsed_ms
+            timers["total_ms"] = total_timer.elapsed_ms
+            reason_generation_trace = {
+                "mode": "gated_empty",
+                "candidate_count": len(candidate_cards),
+                "output_count": 0,
+                "batch_count": 0,
+                "batch_size": REASON_GENERATION_BATCH_SIZE,
+                "reason_generation_failed": False,
+                "batches": [],
+                "evidence_selection": evidence_selection_trace,
+                "shortlist_gate": shortlist_gate_trace,
+                "selected_evidence": [],
+                "server_fallback_reasons": [],
+                "reason_sync_validator": {
+                    "checked_candidate_ids": [],
+                    "fallback_count": 0,
+                    "fallback_ratio": 0.0,
+                    "violations": [],
+                },
+            }
+            logger.warning(
+                "Recommendation ended after gates removed every candidate: query=%r",
+                query,
+            )
+            return self._build_recommendation_response(
+                plan=plan,
+                candidate_cards=candidate_cards,
+                query_payload=search_result["query_payload"],
+                branch_queries=search_result["branch_queries"],
+                raw_query=search_result["raw_query"],
+                retrieval_keywords=search_result.get("retrieval_keywords") or [],
+                retrieval_score_traces=search_result.get("retrieval_score_traces") or [],
+                retrieval_skipped_reason=search_result.get("retrieval_skipped_reason"),
+                retrieved_count=search_result["retrieved_count"],
+                recommendations=[],
+                data_gaps=[],
+                not_selected_reasons=[NO_GATE_PASSED_CANDIDATE_REASON],
+                planner_trace=search_result.get("planner_trace"),
+                reason_generation_trace=reason_generation_trace,
+                final_sort_policy=search_result["final_sort_policy"],
+                top_k_used=top_k_used,
+                timers=timers,
+                expanded_shadow_hits=search_result.get("expanded_shadow_hits"),
+            )
+
         retrieval_score_traces_by_expert_id = {
             trace["expert_id"]: trace
             for trace in (search_result.get("retrieval_score_traces") or [])
@@ -244,34 +331,36 @@ class RecommendationService:
             reason_output=reason_output,
             batch_traces=reason_batch_traces,
         )
-        evidence_selection_trace = self._extract_component_trace(self.evidence_selector)
-        if evidence_selection_trace is not None:
-            reason_generation_trace = dict(reason_generation_trace)
-            reason_generation_trace["evidence_selection"] = evidence_selection_trace
+        reason_generation_trace = dict(reason_generation_trace)
+        reason_generation_trace["evidence_selection"] = evidence_selection_trace
+        reason_generation_trace["shortlist_gate"] = shortlist_gate_trace
         (
             recommendations,
             selected_evidence_trace,
             server_fallback_reasons,
+            reason_sync_validator_trace,
         ) = self._build_recommendations(
             shortlist,
             reason_output,
+            plan=plan,
             relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
         )
-        reason_generation_trace = dict(reason_generation_trace)
         reason_generation_trace["selected_evidence"] = selected_evidence_trace
         reason_generation_trace["server_fallback_reasons"] = server_fallback_reasons
+        reason_generation_trace["reason_sync_validator"] = reason_sync_validator_trace
+
         timers = dict(search_result.get("timers", {}))
         timers["evidence_selection_ms"] = evidence_selection_timer.elapsed_ms
         timers["reason_generation_ms"] = reason_timer.elapsed_ms
-
         total_timer.stop()
         timers["total_ms"] = total_timer.elapsed_ms
 
         logger.info(
-            "Recommendation finished: query=%r recommended=%d total_ms=%.2f",
+            "Recommendation finished: query=%r recommended=%d total_ms=%.2f validator_fallbacks=%d",
             query,
             len(recommendations),
             total_timer.elapsed_ms,
+            reason_sync_validator_trace["fallback_count"],
         )
 
         return self._build_recommendation_response(
@@ -292,6 +381,7 @@ class RecommendationService:
             final_sort_policy=search_result["final_sort_policy"],
             top_k_used=top_k_used,
             timers=timers,
+            expanded_shadow_hits=search_result.get("expanded_shadow_hits"),
         )
 
     def save_feedback(
@@ -404,6 +494,10 @@ class RecommendationService:
                 "prompt_budget_mode": raw_trace.get("prompt_budget_mode"),
                 "trim_applied": raw_trace.get("trim_applied", False),
                 "payload_token_estimate": raw_trace.get("payload_token_estimate"),
+                "selected_evidence_count": raw_trace.get("selected_evidence_count", 0),
+                "retry_triggered": raw_trace.get("retry_triggered", False),
+                "retry_trigger": raw_trace.get("retry_trigger"),
+                "retry_reason": raw_trace.get("retry_reason"),
                 "attempts": list(raw_trace.get("attempts", [])),
                 "raw_output_count": raw_trace.get(
                     "raw_output_count", len(batch_output.items)
@@ -412,13 +506,15 @@ class RecommendationService:
             }
             batch_traces.append(batch_trace)
             logger.info(
-                "Reason generation batch completed: batch=%d/%d size=%d returned=%d missing=%d empty_reasons=%d",
+                "Reason generation batch completed: batch=%d/%d size=%d returned=%d missing=%d empty_reasons=%d retry_triggered=%s retry_reason=%s",
                 batch_index,
                 len(candidate_batches),
                 len(candidate_batch),
                 len(batch_trace["returned_ids"]),
                 len(batch_trace["missing_candidate_ids"]),
                 len(batch_trace["empty_reason_candidate_ids"]),
+                batch_trace["retry_triggered"],
+                batch_trace["retry_reason"],
             )
 
         merged_data_gaps: list[str] = []
@@ -459,6 +555,76 @@ class RecommendationService:
         }
 
     @staticmethod
+    def _normalize_text(value: str | None) -> str:
+        return " ".join((value or "").lower().split())
+
+    @classmethod
+    def _required_aspect_coverage(cls, plan: PlannerOutput) -> int:
+        target_aspects = QueryTextBuilder.normalize_keywords(
+            getattr(plan, "must_aspects", None) or plan.retrieval_core or plan.core_keywords
+        )
+        if not target_aspects:
+            return 0
+        return min(2, len(target_aspects))
+
+    @classmethod
+    def _apply_shortlist_gates(
+        cls,
+        *,
+        cards: list[CandidateCard],
+        plan: PlannerOutput,
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+    ) -> tuple[list[CandidateCard], dict[str, Any]]:
+        coverage_threshold = cls._required_aspect_coverage(plan)
+        keep_cards: list[CandidateCard] = []
+        low_coverage_cards: list[CandidateCard] = []
+        generic_only_cards: list[CandidateCard] = []
+        dropped_cards: list[CandidateCard] = []
+        candidate_diagnostics: list[dict[str, Any]] = []
+
+        for card in cards:
+            bundle = relevant_evidence_by_expert_id.get(
+                card.expert_id,
+                RelevantEvidenceBundle(expert_id=card.expert_id),
+            )
+            gate_status = "keep"
+            if bundle.direct_match_count < 1:
+                gate_status = "drop_no_direct_evidence"
+                dropped_cards.append(card)
+            elif coverage_threshold and bundle.aspect_coverage < coverage_threshold:
+                gate_status = "demote_low_aspect_coverage"
+                low_coverage_cards.append(card)
+            elif bundle.generic_only:
+                gate_status = "demote_generic_only"
+                generic_only_cards.append(card)
+            else:
+                keep_cards.append(card)
+
+            candidate_diagnostics.append(
+                {
+                    "expert_id": card.expert_id,
+                    "gate_status": gate_status,
+                    "direct_match_count": bundle.direct_match_count,
+                    "aspect_coverage": bundle.aspect_coverage,
+                    "generic_only": bundle.generic_only,
+                    "matched_aspects": list(bundle.matched_aspects),
+                    "matched_generic_terms": list(bundle.matched_generic_terms),
+                    "future_selected_evidence_ids": list(
+                        bundle.future_selected_evidence_ids
+                    ),
+                }
+            )
+
+        return [*keep_cards, *low_coverage_cards, *generic_only_cards], {
+            "coverage_threshold": coverage_threshold,
+            "kept_candidate_ids": [card.expert_id for card in keep_cards],
+            "low_coverage_candidate_ids": [card.expert_id for card in low_coverage_cards],
+            "generic_only_candidate_ids": [card.expert_id for card in generic_only_cards],
+            "dropped_candidate_ids": [card.expert_id for card in dropped_cards],
+            "candidate_diagnostics": candidate_diagnostics,
+        }
+
+    @staticmethod
     def _build_profile_evidence(card: CandidateCard) -> EvidenceItem | None:
         if not (card.organization or card.degree or card.major):
             return None
@@ -481,15 +647,6 @@ class RecommendationService:
             title=item.title,
             date=item.date,
             detail=item.detail,
-        )
-
-    @staticmethod
-    def _sort_relevant_items(
-        bundle: RelevantEvidenceBundle,
-    ) -> list[RelevantEvidenceItem]:
-        return sorted(
-            bundle.all_items(),
-            key=lambda item: (-item.match_score, item.type, item.title),
         )
 
     @staticmethod
@@ -519,20 +676,19 @@ class RecommendationService:
             if key in seen_titles:
                 continue
             seen_titles.add(key)
-            referenced_items.append(f"'{item.title}' {type_labels.get(item.type, item.type)}")
+            referenced_items.append(
+                f"'{item.title}' {type_labels.get(item.type, item.type)}"
+            )
             if len(referenced_items) == 2:
                 break
 
         if not referenced_items:
             return "직접적인 질의 일치 근거는 제한적이지만 프로필 기반 후보로 검토되었습니다."
-
         if len(referenced_items) == 1:
-            return (
-                f"{referenced_items[0]}이 확인되어 질의와 관련된 전문성 근거로 참고할 수 있습니다."
-            )
+            return f"{referenced_items[0]}을 통해 질의와 관련된 직접 근거를 확인했습니다."
         return (
-            f"{referenced_items[0]}와 {referenced_items[1]}이 확인되어 "
-            "질의와 관련된 전문성 근거로 참고할 수 있습니다."
+            f"{referenced_items[0]}과 {referenced_items[1]}을 통해 "
+            "질의와 관련된 직접 근거를 확인했습니다."
         )
 
     @classmethod
@@ -540,17 +696,10 @@ class RecommendationService:
         cls,
         *,
         card: CandidateCard,
-        generated: Any | None,
         relevant_bundle: RelevantEvidenceBundle,
     ) -> tuple[list[EvidenceItem], dict[str, Any]]:
-        # 구조 리팩토링: EvidenceSelector가 이미 최상위 3개를 엄선했으므로
-        # LLM의 선택 결과와 상관없이 relevant_bundle의 모든 항목을 최종 증거로 확정함.
-        # 이를 통해 추천 사유와 증거 간의 100% 싱크를 보장함.
         resolved_items = relevant_bundle.all_items()
         provided_evidence_ids = [item.item_id for item in resolved_items]
-        
-        # LLM이 선택한 ID (트래킹용)
-        requested_ids = list(getattr(generated, "selected_evidence_ids", []) or [])
 
         if not resolved_items:
             profile_item = cls._build_profile_evidence(card)
@@ -558,42 +707,116 @@ class RecommendationService:
                 return [profile_item], {
                     "expert_id": card.expert_id,
                     "provided_evidence_ids": [],
-                    "selected_evidence_ids": requested_ids,
+                    "selected_evidence_ids": [],
                     "resolved_evidence_ids": ["profile"],
+                    "direct_match_count": relevant_bundle.direct_match_count,
+                    "aspect_coverage": relevant_bundle.aspect_coverage,
+                    "matched_aspects": list(relevant_bundle.matched_aspects),
+                    "future_selected_evidence_ids": list(
+                        relevant_bundle.future_selected_evidence_ids
+                    ),
                     "fallback": "profile",
                 }
             return [], {
                 "expert_id": card.expert_id,
                 "provided_evidence_ids": [],
-                "selected_evidence_ids": requested_ids,
+                "selected_evidence_ids": [],
                 "resolved_evidence_ids": [],
-                "fallback": "empty",
-            }
+                "direct_match_count": relevant_bundle.direct_match_count,
+                "aspect_coverage": relevant_bundle.aspect_coverage,
+                    "matched_aspects": list(relevant_bundle.matched_aspects),
+                    "future_selected_evidence_ids": [],
+                    "fallback": "empty",
+                }
 
         return (
             [cls._build_evidence_item(item) for item in resolved_items],
             {
                 "expert_id": card.expert_id,
                 "provided_evidence_ids": provided_evidence_ids,
-                "selected_evidence_ids": requested_ids,
+                "selected_evidence_ids": [],
                 "resolved_evidence_ids": provided_evidence_ids,
+                "direct_match_count": relevant_bundle.direct_match_count,
+                "aspect_coverage": relevant_bundle.aspect_coverage,
+                "matched_aspects": list(relevant_bundle.matched_aspects),
+                "future_selected_evidence_ids": list(
+                    relevant_bundle.future_selected_evidence_ids
+                ),
                 "fallback": "none",
             },
         )
+
+    @classmethod
+    def _validate_reason_sync(
+        cls,
+        *,
+        plan: PlannerOutput,
+        card: CandidateCard,
+        recommendation_reason: str,
+        evidence: list[EvidenceItem],
+        candidate_names: list[str],
+    ) -> list[str]:
+        normalized_reason = cls._normalize_text(recommendation_reason)
+        if not normalized_reason:
+            return []
+
+        violations: list[str] = []
+        for candidate_name in candidate_names:
+            normalized_name = cls._normalize_text(candidate_name)
+            if (
+                candidate_name != card.name
+                and len(normalized_name) >= 2
+                and normalized_name in normalized_reason
+            ):
+                violations.append("other_candidate_name")
+                break
+
+        if INTERNAL_EVIDENCE_ID_PATTERN.search(recommendation_reason):
+            violations.append("internal_evidence_id")
+
+        target_aspects = QueryTextBuilder.normalize_keywords(
+            getattr(plan, "must_aspects", None) or plan.retrieval_core or plan.core_keywords
+        )
+        non_profile_titles = [
+            cls._normalize_text(item.title) for item in evidence if item.type != "profile"
+        ]
+        if target_aspects and non_profile_titles:
+            if not any(
+                cls._normalize_text(aspect) in title
+                for aspect in target_aspects
+                for title in non_profile_titles
+            ):
+                violations.append("aspect_title_miss")
+
+        non_profile_evidence = [item for item in evidence if item.type != "profile"]
+        if not non_profile_evidence and any(
+            marker in normalized_reason for marker in STRONG_REASON_MARKERS
+        ):
+            violations.append("strong_claim_without_direct_evidence")
+
+        return violations
 
     def _build_recommendations(
         self,
         cards: list[CandidateCard],
         reason_output: ReasonGenerationOutput,
         *,
+        plan: PlannerOutput,
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
-    ) -> tuple[list[RecommendationDecision], list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        list[RecommendationDecision],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
         generated_by_expert_id = {
             item.expert_id: item for item in reason_output.items
         }
         recommendations: list[RecommendationDecision] = []
         selected_evidence_trace: list[dict[str, Any]] = []
         server_fallback_reasons: list[dict[str, Any]] = []
+        validator_violations: list[dict[str, Any]] = []
+        candidate_names = [card.name for card in cards]
 
         for rank, card in enumerate(cards, start=1):
             generated = generated_by_expert_id.get(card.expert_id)
@@ -605,23 +828,21 @@ class RecommendationService:
             recommendation_reason = ""
             risks = list(card.risks)
             if generated is not None:
-                fit = generated.fit if generated.fit in {"높음", "중간", "보통"} else "보통"
+                fit = (
+                    generated.fit
+                    if generated.fit in {"높음", "중간", "보통"}
+                    else "보통"
+                )
                 recommendation_reason = generated.recommendation_reason
                 risks = list(generated.risks) or list(card.risks)
+
             evidence, evidence_trace = self._build_candidate_evidence(
                 card=card,
-                generated=generated,
                 relevant_bundle=relevant_bundle,
             )
             selected_evidence_trace.append(evidence_trace)
+
             if not recommendation_reason:
-                logger.warning(
-                    "Recommendation reason is empty after reason generation: expert_id=%s fit=%s resolved_evidence_ids=%s fallback=%s",
-                    card.expert_id,
-                    fit,
-                    evidence_trace.get("resolved_evidence_ids", []),
-                    evidence_trace.get("fallback"),
-                )
                 fallback_source = (
                     evidence_trace.get("fallback")
                     if evidence_trace.get("fallback") not in {None, "none"}
@@ -646,6 +867,43 @@ class RecommendationService:
                     fallback_source,
                     evidence_trace.get("resolved_evidence_ids", []),
                 )
+            else:
+                violations = self._validate_reason_sync(
+                    plan=plan,
+                    card=card,
+                    recommendation_reason=recommendation_reason,
+                    evidence=evidence,
+                    candidate_names=candidate_names,
+                )
+                if violations:
+                    recommendation_reason = self._build_server_fallback_reason(
+                        evidence=evidence,
+                        fallback="reason_sync_validator",
+                    )
+                    violation_entry = {
+                        "expert_id": card.expert_id,
+                        "violations": violations,
+                        "resolved_evidence_ids": list(
+                            evidence_trace.get("resolved_evidence_ids", [])
+                        ),
+                    }
+                    validator_violations.append(violation_entry)
+                    server_fallback_reasons.append(
+                        {
+                            "expert_id": card.expert_id,
+                            "source": "reason_sync_validator",
+                            "resolved_evidence_ids": list(
+                                evidence_trace.get("resolved_evidence_ids", [])
+                            ),
+                            "violations": violations,
+                        }
+                    )
+                    logger.warning(
+                        "Recommendation reason validator fallback generated: expert_id=%s violations=%s resolved_evidence_ids=%s",
+                        card.expert_id,
+                        violations,
+                        evidence_trace.get("resolved_evidence_ids", []),
+                    )
 
             recommendations.append(
                 RecommendationDecision(
@@ -661,7 +919,20 @@ class RecommendationService:
                 )
             )
 
-        return recommendations, selected_evidence_trace, server_fallback_reasons
+        validator_trace = {
+            "checked_candidate_ids": [card.expert_id for card in cards],
+            "fallback_count": len(validator_violations),
+            "fallback_ratio": round(len(validator_violations) / len(cards), 3)
+            if cards
+            else 0.0,
+            "violations": validator_violations,
+        }
+        return (
+            recommendations,
+            selected_evidence_trace,
+            server_fallback_reasons,
+            validator_trace,
+        )
 
     @staticmethod
     def _serialize_shadow_hits(hits: list[SearchHit]) -> list[dict[str, str]]:
@@ -711,7 +982,7 @@ class RecommendationService:
                 "raw_query": raw_query,
                 "cache": {
                     "canonical_plan": (planner_trace or {}).get("cache", {}).get("canonical_plan", "miss"),
-                    "retrieval": "hit" if timers and timers.get("search_ms", 0) < 5 else "miss" 
+                    "retrieval": "hit" if timers and timers.get("search_ms", 0) < 5 else "miss",
                 },
                 "planner_keywords": (
                     (planner_trace or {}).get("planner_keywords") or []

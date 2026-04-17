@@ -40,17 +40,7 @@ class RetrievalResult:
 
 
 # 가중치 설정 (아키텍처 가이드라인 준수)
-BRANCH_WEIGHTS = {
-    "basic": 0.6,
-    "art": 1.0,
-    "pat": 0.8,
-    "pjt": 1.0,
-}
-
-PATH_WEIGHTS = {
-    "stable": 1.0,
-    "expanded": 0.25,
-}
+RRF_K = 60.0
 
 
 class QdrantHybridRetriever:
@@ -118,6 +108,10 @@ class QdrantHybridRetriever:
     @staticmethod
     def _point_key(point_id: Any) -> str:
         return str(point_id)
+
+    @staticmethod
+    def _has_distinct_expanded_query(compiled: CompiledBranchQueries) -> bool:
+        return " ".join(compiled.stable.split()) != " ".join(compiled.expanded.split())
 
     @staticmethod
     def _infer_point_branch(point_id: str) -> str | None:
@@ -222,9 +216,10 @@ class QdrantHybridRetriever:
         # 3. 실행할 브랜치/경로 조합 정의
         tasks_meta = []
         for branch in BRANCHES:
-            tasks_meta.append((branch, "stable", branch_compiled_queries[branch].stable))
-            if branch in ["art", "pjt"]:
-                tasks_meta.append((branch, "expanded", branch_compiled_queries[branch].expanded))
+            compiled = branch_compiled_queries[branch]
+            tasks_meta.append((branch, "stable", compiled.stable))
+            if self._has_distinct_expanded_query(compiled):
+                tasks_meta.append((branch, "expanded", compiled.expanded))
 
         # 4. 병렬 검색 실행
         search_tasks = [
@@ -245,7 +240,6 @@ class QdrantHybridRetriever:
                 continue
             
             branch, path, points = result
-            weight = BRANCH_WEIGHTS[branch] * PATH_WEIGHTS[path]
             
             for rank, pt in enumerate(points, start=1):
                 pt_id = getattr(pt, "id", None) or (pt.get("id") if isinstance(pt, dict) else None)
@@ -255,7 +249,7 @@ class QdrantHybridRetriever:
                 except ValidationError: continue
                 
                 eid = payload.basic_info.researcher_id
-                rrf_contribution = weight * (1.0 / (rank + 60))
+                rrf_contribution = 1.0 / (rank + RRF_K)
                 
                 if eid not in aggregator:
                     aggregator[eid] = {
@@ -342,7 +336,11 @@ class QdrantHybridRetriever:
 
         return RetrievalResult(
             hits=final_hits,
-            query_payload={"weighted_rrf": True, "support_rules": {"s_min": s_min, "e_min": e_min}},
+            query_payload={
+                "rrf_mode": "equal_weight",
+                "expanded_path_policy": "distinct_expanded_all_branches",
+                "support_rules": {"s_min": s_min, "e_min": e_min},
+            },
             branch_queries=branch_compiled_queries,
             retrieval_keywords=retrieval_keywords,
             retrieval_score_traces=retrieval_score_traces,

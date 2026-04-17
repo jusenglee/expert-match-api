@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from typing import Protocol
 
@@ -13,10 +14,11 @@ from apps.domain.models import (
     ResearchProjectEvidence,
 )
 
+logger = logging.getLogger(__name__)
+
 RECENT_YEARS_WINDOW = 20
-MAX_RELEVANT_PAPERS = 10
-MAX_RELEVANT_PROJECTS = 10
-MAX_RELEVANT_PATENTS = 10
+MAX_SELECTED_EVIDENCE_TOTAL = 4
+MAX_ITEMS_PER_ASPECT = 2
 SNIPPET_MAX_LENGTH = 1000
 
 
@@ -28,7 +30,11 @@ class RelevantEvidenceItem(BaseModel):
     detail: str | None = None
     snippet: str | None = None
     matched_keywords: list[str] = Field(default_factory=list)
+    aspect_matches: list[str] = Field(default_factory=list)
+    generic_matches: list[str] = Field(default_factory=list)
+    direct_match: bool = False
     match_score: float = 0.0
+    is_future_item: bool = False
 
 
 class RelevantEvidenceBundle(BaseModel):
@@ -36,6 +42,13 @@ class RelevantEvidenceBundle(BaseModel):
     papers: list[RelevantEvidenceItem] = Field(default_factory=list)
     projects: list[RelevantEvidenceItem] = Field(default_factory=list)
     patents: list[RelevantEvidenceItem] = Field(default_factory=list)
+    matched_aspects: list[str] = Field(default_factory=list)
+    matched_generic_terms: list[str] = Field(default_factory=list)
+    direct_match_count: int = 0
+    aspect_coverage: int = 0
+    generic_only: bool = False
+    dedup_dropped_count: int = 0
+    future_selected_evidence_ids: list[str] = Field(default_factory=list)
 
     def all_items(self) -> list[RelevantEvidenceItem]:
         return [*self.papers, *self.projects, *self.patents]
@@ -61,6 +74,10 @@ def _compact_text(value: str | None) -> str:
     return _normalize_text(value).replace(" ", "")
 
 
+def _normalize_title_key(value: str | None) -> str:
+    return _compact_text(value)
+
+
 def _build_rich_snippet(
     *,
     main_text: str | None,
@@ -69,48 +86,43 @@ def _build_rich_snippet(
     matched_keywords: list[str] | None = None,
 ) -> str | None:
     parts: list[str] = []
-    
-    # 메타데이터 추가 (예: 학술지명, 기관명 등)
     if metadata:
-        meta_parts = [f"[{k}: {v}]" for k, v in metadata.items() if v]
+        meta_parts = [f"[{key}: {value}]" for key, value in metadata.items() if value]
         if meta_parts:
             parts.append(" ".join(meta_parts))
 
-    # 주요 텍스트 추가
     text_pool = []
     if main_text:
         text_pool.append(main_text)
     if secondary_text:
         text_pool.append(secondary_text)
-    
+
     full_text = " ".join(text_pool)
     normalized_text = " ".join(full_text.split())
-    
     if not normalized_text:
         return " ".join(parts) if parts else None
 
-    # 키워드 주변 문맥 추출 (간소화된 버전)
     if matched_keywords and len(normalized_text) > 500:
-        # 첫 번째 매칭된 키워드 위치 찾기
         best_pos = -1
-        for kw in matched_keywords:
-            pos = normalized_text.lower().find(kw.lower())
+        for keyword in matched_keywords:
+            pos = normalized_text.lower().find(keyword.lower())
             if pos != -1:
                 best_pos = pos
                 break
-        
         if best_pos != -1:
             start = max(0, best_pos - 200)
             end = min(len(normalized_text), best_pos + 600)
             snippet = normalized_text[start:end]
-            if start > 0: snippet = "..." + snippet
-            if end < len(normalized_text): snippet = snippet + "..."
+            if start > 0:
+                snippet = "..." + snippet
+            if end < len(normalized_text):
+                snippet = snippet + "..."
             parts.append(snippet)
         else:
             parts.append(normalized_text[:SNIPPET_MAX_LENGTH] + "...")
     else:
         parts.append(normalized_text[:SNIPPET_MAX_LENGTH])
-        
+
     return "\n".join(parts)
 
 
@@ -121,6 +133,20 @@ def _parse_year(value: str | None) -> int | None:
         return int(value[:4])
     except (TypeError, ValueError):
         return None
+
+
+def _sort_ranked_items(items: list[RelevantEvidenceItem]) -> list[RelevantEvidenceItem]:
+    return sorted(
+        items,
+        key=lambda item: (
+            not item.direct_match,
+            -len(item.aspect_matches),
+            -item.match_score,
+            -(_parse_year(item.date) or 0),
+            item.title,
+            item.item_id,
+        ),
+    )
 
 
 class KeywordEvidenceSelector:
@@ -134,51 +160,91 @@ class KeywordEvidenceSelector:
         candidates: list[CandidateCard],
         plan: PlannerOutput,
     ) -> dict[str, RelevantEvidenceBundle]:
-        keywords = self._normalize_keywords(plan.core_keywords)
+        aspects = self._normalize_keywords(
+            plan.must_aspects or plan.retrieval_core or plan.core_keywords
+        )
+        generic_terms = self._normalize_keywords(plan.generic_terms)
         bundles: dict[str, RelevantEvidenceBundle] = {}
-        candidate_evidence_counts: list[dict[str, object]] = []
+        candidate_diagnostics: list[dict[str, object]] = []
         empty_candidate_ids: list[str] = []
 
         for candidate in candidates:
-            # 개별 브랜치에서 후보군 랭킹 (내부 limit는 넉넉히 유지)
-            papers = self._rank_publications(candidate.top_papers, keywords)
-            projects = self._rank_projects(candidate.top_projects, keywords)
-            patents = self._rank_patents(candidate.top_patents, keywords)
-            
-            # 모든 증거를 합쳐서 매칭 점수순으로 최상위 3개만 엄선
-            # 이는 LLM(Reasoner)에게 노이즈 없는 핵심 데이터만 전달하기 위함임
-            top_evidence = sorted(
-                [*papers, *projects, *patents],
-                key=lambda item: -item.match_score
-            )[:3]
-
+            ranked_items = [
+                *self._rank_publications(candidate.top_papers, aspects, generic_terms),
+                *self._rank_projects(candidate.top_projects, aspects, generic_terms),
+                *self._rank_patents(candidate.top_patents, aspects, generic_terms),
+            ]
+            deduped_items, dedup_dropped_count = self._deduplicate_items(ranked_items)
+            selected_items = self._select_direct_evidence(deduped_items, aspects)
+            matched_aspects = self._collect_unique_keywords(
+                [match for item in selected_items for match in item.aspect_matches]
+            )
+            matched_generic_terms = self._collect_unique_keywords(
+                [match for item in deduped_items for match in item.generic_matches]
+            )
+            direct_match_count = sum(1 for item in deduped_items if item.direct_match)
             bundle = RelevantEvidenceBundle(
                 expert_id=candidate.expert_id,
-                papers=[e for e in top_evidence if e.type == "paper"],
-                projects=[e for e in top_evidence if e.type == "project"],
-                patents=[e for e in top_evidence if e.type == "patent"],
+                papers=[item for item in selected_items if item.type == "paper"],
+                projects=[item for item in selected_items if item.type == "project"],
+                patents=[item for item in selected_items if item.type == "patent"],
+                matched_aspects=matched_aspects,
+                matched_generic_terms=matched_generic_terms,
+                direct_match_count=direct_match_count,
+                aspect_coverage=len(matched_aspects),
+                generic_only=bool(matched_generic_terms) and direct_match_count == 0,
+                dedup_dropped_count=dedup_dropped_count,
+                future_selected_evidence_ids=[
+                    item.item_id for item in selected_items if item.is_future_item
+                ],
             )
             bundles[candidate.expert_id] = bundle
 
-            candidate_count = len(top_evidence)
-            if candidate_count == 0:
+            if not selected_items:
                 empty_candidate_ids.append(candidate.expert_id)
-            candidate_evidence_counts.append(
-                {
-                    "expert_id": candidate.expert_id,
-                    "papers": len(bundle.papers),
-                    "projects": len(bundle.projects),
-                    "patents": len(bundle.patents),
-                    "total": candidate_count,
-                }
+
+            diagnostic = {
+                "expert_id": candidate.expert_id,
+                "selected_evidence_ids": [item.item_id for item in selected_items],
+                "direct_match_count": direct_match_count,
+                "aspect_coverage": bundle.aspect_coverage,
+                "generic_only": bundle.generic_only,
+                "matched_aspects": matched_aspects,
+                "matched_generic_terms": matched_generic_terms,
+                "dedup_dropped_count": dedup_dropped_count,
+                "future_selected_evidence_ids": list(
+                    bundle.future_selected_evidence_ids
+                ),
+                "papers": len(bundle.papers),
+                "projects": len(bundle.projects),
+                "patents": len(bundle.patents),
+                "total": len(selected_items),
+            }
+            candidate_diagnostics.append(diagnostic)
+            logger.info(
+                "Evidence selection candidate summary: expert_id=%s direct_match_count=%d aspect_coverage=%d generic_only=%s selected_evidence_ids=%s future_selected_evidence_ids=%s dedup_dropped_count=%d",
+                candidate.expert_id,
+                direct_match_count,
+                bundle.aspect_coverage,
+                bundle.generic_only,
+                diagnostic["selected_evidence_ids"],
+                diagnostic["future_selected_evidence_ids"],
+                dedup_dropped_count,
             )
 
         self.last_trace = {
-            "mode": "keyword_lexical_top3",
-            "core_keywords": keywords,
-            "candidate_evidence_counts": candidate_evidence_counts,
+            "mode": "direct_match_aspect_quota",
+            "must_aspects": aspects,
+            "generic_terms": generic_terms,
+            "candidate_evidence_counts": candidate_diagnostics,
             "empty_candidate_ids": empty_candidate_ids,
         }
+        logger.info(
+            "Evidence selection completed: candidates=%d empty_candidates=%d must_aspects=%s",
+            len(candidates),
+            len(empty_candidate_ids),
+            aspects,
+        )
         return bundles
 
     @staticmethod
@@ -190,15 +256,25 @@ class KeywordEvidenceSelector:
                 normalized_keywords.append(normalized)
         return normalized_keywords
 
+    @staticmethod
+    def _collect_unique_keywords(values: list[str]) -> list[str]:
+        collected: list[str] = []
+        for value in values:
+            normalized = _normalize_text(value)
+            if normalized and normalized not in collected:
+                collected.append(normalized)
+        return collected
+
     def _rank_publications(
         self,
         publications: list[PublicationEvidence],
-        keywords: list[str],
+        aspects: list[str],
+        generic_terms: list[str],
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(publications):
             base_score = 1.0 + (len(publications) - index) * 0.1
-            score, matched_keywords = self._score_evidence(
+            score, aspect_matches, generic_matches = self._score_evidence(
                 title=item.publication_title,
                 body_parts=[
                     item.journal_name,
@@ -207,10 +283,9 @@ class KeywordEvidenceSelector:
                     " ".join(item.english_keywords),
                 ],
                 date_value=item.publication_year_month,
-                keywords=keywords,
+                aspects=aspects,
+                generic_terms=generic_terms,
             )
-            final_score = base_score + score
-
             ranked.append(
                 RelevantEvidenceItem(
                     item_id=f"paper:{index}",
@@ -221,24 +296,31 @@ class KeywordEvidenceSelector:
                     snippet=_build_rich_snippet(
                         main_text=item.abstract,
                         secondary_text=" ".join(item.korean_keywords + item.english_keywords),
-                        metadata={"학술지": item.journal_name},
-                        matched_keywords=matched_keywords,
+                        metadata={"journal": item.journal_name},
+                        matched_keywords=aspect_matches or generic_matches,
                     ),
-                    matched_keywords=matched_keywords,
-                    match_score=final_score,
-                )
+                    matched_keywords=self._collect_unique_keywords(
+                        [*aspect_matches, *generic_matches]
+                    ),
+                    aspect_matches=aspect_matches,
+                    generic_matches=generic_matches,
+                direct_match=bool(aspect_matches),
+                match_score=base_score + score,
+                is_future_item=False,
             )
-        return self._finalize_ranked_items(ranked, MAX_RELEVANT_PAPERS)
+            )
+        return _sort_ranked_items(ranked)
 
     def _rank_projects(
         self,
         projects: list[ResearchProjectEvidence],
-        keywords: list[str],
+        aspects: list[str],
+        generic_terms: list[str],
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(projects):
             base_score = 1.0 + (len(projects) - index) * 0.1
-            score, matched_keywords = self._score_evidence(
+            score, aspect_matches, generic_matches = self._score_evidence(
                 title=item.display_title,
                 body_parts=[
                     item.research_objective_summary,
@@ -247,10 +329,9 @@ class KeywordEvidenceSelector:
                     item.performing_organization,
                 ],
                 date_value=item.project_end_date or item.project_start_date,
-                keywords=keywords,
+                aspects=aspects,
+                generic_terms=generic_terms,
             )
-            final_score = base_score + score
-
             ranked.append(
                 RelevantEvidenceItem(
                     item_id=f"project:{index}",
@@ -261,34 +342,46 @@ class KeywordEvidenceSelector:
                     snippet=_build_rich_snippet(
                         main_text=item.research_objective_summary,
                         secondary_text=item.research_content_summary,
-                        metadata={"기관": item.performing_organization or item.managing_agency},
-                        matched_keywords=matched_keywords,
+                        metadata={
+                            "organization": item.performing_organization
+                            or item.managing_agency
+                        },
+                        matched_keywords=aspect_matches or generic_matches,
                     ),
-                    matched_keywords=matched_keywords,
-                    match_score=final_score,
-                )
+                    matched_keywords=self._collect_unique_keywords(
+                        [*aspect_matches, *generic_matches]
+                    ),
+                    aspect_matches=aspect_matches,
+                    generic_matches=generic_matches,
+                direct_match=bool(aspect_matches),
+                match_score=base_score + score,
+                is_future_item=bool(
+                    (year := _parse_year(item.project_end_date or item.project_start_date))
+                    and year > self.reference_year
+                ),
             )
-        return self._finalize_ranked_items(ranked, MAX_RELEVANT_PROJECTS)
+            )
+        return _sort_ranked_items(ranked)
 
     def _rank_patents(
         self,
         patents: list[IntellectualPropertyEvidence],
-        keywords: list[str],
+        aspects: list[str],
+        generic_terms: list[str],
     ) -> list[RelevantEvidenceItem]:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(patents):
             base_score = 1.0 + (len(patents) - index) * 0.1
-            score, matched_keywords = self._score_evidence(
+            score, aspect_matches, generic_matches = self._score_evidence(
                 title=item.intellectual_property_title,
                 body_parts=[
                     item.application_registration_type,
                     item.application_country,
                 ],
                 date_value=item.registration_date or item.application_date,
-                keywords=keywords,
+                aspects=aspects,
+                generic_terms=generic_terms,
             )
-            final_score = base_score + score
-
             ranked.append(
                 RelevantEvidenceItem(
                     item_id=f"patent:{index}",
@@ -299,14 +392,20 @@ class KeywordEvidenceSelector:
                     or item.application_country,
                     snippet=_build_rich_snippet(
                         main_text=item.intellectual_property_title,
-                        secondary_text=f"유형: {item.application_registration_type}, 국가: {item.application_country}",
-                        matched_keywords=matched_keywords,
+                        secondary_text=f"type: {item.application_registration_type}, country: {item.application_country}",
+                        matched_keywords=aspect_matches or generic_matches,
                     ),
-                    matched_keywords=matched_keywords,
-                    match_score=final_score,
-                )
+                    matched_keywords=self._collect_unique_keywords(
+                        [*aspect_matches, *generic_matches]
+                    ),
+                    aspect_matches=aspect_matches,
+                    generic_matches=generic_matches,
+                direct_match=bool(aspect_matches),
+                match_score=base_score + score,
+                is_future_item=False,
             )
-        return self._finalize_ranked_items(ranked, MAX_RELEVANT_PATENTS)
+            )
+        return _sort_ranked_items(ranked)
 
     def _score_evidence(
         self,
@@ -314,60 +413,118 @@ class KeywordEvidenceSelector:
         title: str | None,
         body_parts: list[str | None],
         date_value: str | None,
-        keywords: list[str],
-    ) -> tuple[float, list[str]]:
-        if not keywords:
-            return 0.0, []
-
+        aspects: list[str],
+        generic_terms: list[str],
+    ) -> tuple[float, list[str], list[str]]:
         normalized_title = _normalize_text(title)
         compact_title = _compact_text(title)
         normalized_body = _normalize_text(" ".join(part or "" for part in body_parts))
         compact_body = _compact_text(" ".join(part or "" for part in body_parts))
 
         score = 0.0
-        matched_keywords: list[str] = []
+        aspect_matches: list[str] = []
+        generic_matches: list[str] = []
 
-        for keyword in keywords:
-            compact_keyword = keyword.replace(" ", "")
+        for aspect in aspects:
+            compact_aspect = aspect.replace(" ", "")
             matched = False
-            if normalized_title == keyword or compact_title == compact_keyword:
+            if normalized_title == aspect or compact_title == compact_aspect:
                 score += 8.0
                 matched = True
-            elif keyword in normalized_title or compact_keyword in compact_title:
+            elif aspect in normalized_title or compact_aspect in compact_title:
                 score += 5.0
                 matched = True
 
-            if keyword in normalized_body or compact_keyword in compact_body:
+            if aspect in normalized_body or compact_aspect in compact_body:
                 score += 3.0
                 matched = True
 
-            if matched and keyword not in matched_keywords:
-                matched_keywords.append(keyword)
+            if matched and aspect not in aspect_matches:
+                aspect_matches.append(aspect)
 
-        if len(matched_keywords) > 1:
-            score += float(len(matched_keywords) - 1)
+        for generic_term in generic_terms:
+            compact_term = generic_term.replace(" ", "")
+            if (
+                generic_term in normalized_title
+                or compact_term in compact_title
+                or generic_term in normalized_body
+                or compact_term in compact_body
+            ) and generic_term not in generic_matches:
+                generic_matches.append(generic_term)
+
+        if len(aspect_matches) > 1:
+            score += float(len(aspect_matches) - 1)
 
         year = _parse_year(date_value)
         if (
-            matched_keywords
+            aspect_matches
             and year is not None
             and year >= self.reference_year - (RECENT_YEARS_WINDOW - 1)
         ):
             score += 0.5
 
-        return score, matched_keywords
+        return score, aspect_matches, generic_matches
 
     @staticmethod
-    def _finalize_ranked_items(
+    def _deduplicate_items(
         items: list[RelevantEvidenceItem],
-        limit: int,
+    ) -> tuple[list[RelevantEvidenceItem], int]:
+        deduped: dict[tuple[str, int | None], RelevantEvidenceItem] = {}
+        dedup_dropped_count = 0
+        for item in _sort_ranked_items(items):
+            dedup_key = (_normalize_title_key(item.title), _parse_year(item.date))
+            if dedup_key in deduped:
+                dedup_dropped_count += 1
+                continue
+            deduped[dedup_key] = item
+        return _sort_ranked_items(list(deduped.values())), dedup_dropped_count
+
+    @staticmethod
+    def _append_unique_item(
+        selected_items: list[RelevantEvidenceItem],
+        item: RelevantEvidenceItem,
+    ) -> bool:
+        if item.item_id in {selected.item_id for selected in selected_items}:
+            return False
+        selected_items.append(item)
+        return True
+
+    def _select_direct_evidence(
+        self,
+        items: list[RelevantEvidenceItem],
+        aspects: list[str],
     ) -> list[RelevantEvidenceItem]:
-        ranked = sorted(
-            items,
-            key=lambda item: (
-                -item.match_score,
-                -(_parse_year(item.date) or 0),
-                item.title,
-            ),
-        )
-        return ranked[:limit]
+        direct_items = [item for item in items if item.direct_match]
+        if not direct_items:
+            return []
+
+        selected_items: list[RelevantEvidenceItem] = []
+        aspect_counts = {aspect: 0 for aspect in aspects}
+
+        for aspect in aspects:
+            for item in direct_items:
+                if aspect not in item.aspect_matches or aspect_counts[aspect] >= 1:
+                    continue
+                if self._append_unique_item(selected_items, item):
+                    for matched_aspect in item.aspect_matches:
+                        if matched_aspect in aspect_counts:
+                            aspect_counts[matched_aspect] += 1
+                if len(selected_items) >= MAX_SELECTED_EVIDENCE_TOTAL:
+                    return _sort_ranked_items(selected_items)
+                if aspect_counts[aspect] >= 1:
+                    break
+
+        for item in direct_items:
+            if len(selected_items) >= MAX_SELECTED_EVIDENCE_TOTAL:
+                break
+            if any(
+                aspect_counts.get(aspect, 0) >= MAX_ITEMS_PER_ASPECT
+                for aspect in item.aspect_matches
+            ):
+                continue
+            if self._append_unique_item(selected_items, item):
+                for matched_aspect in item.aspect_matches:
+                    if matched_aspect in aspect_counts:
+                        aspect_counts[matched_aspect] += 1
+
+        return _sort_ranked_items(selected_items)

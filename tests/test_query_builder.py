@@ -2,37 +2,49 @@ from apps.domain.models import PlannerOutput
 from apps.search.query_builder import QueryTextBuilder
 
 
-def test_query_builder_uses_core_keywords_only_for_branch_queries():
+def test_query_builder_falls_back_to_core_keywords_for_display_and_branch_queries():
     builder = QueryTextBuilder()
     plan = PlannerOutput(
-        intent_summary="화재 진압 전문가 추천",
-        core_keywords=["화재진압", "드론"],
-        task_terms=["평가위원 추천"],
-        semantic_query="화재 진압 현장 드론 활용 연구 전문가"
+        intent_summary="Recommend fire suppression experts",
+        core_keywords=["fire suppression", "drone"],
+        task_terms=["expert recommendation"],
+        semantic_query="drone-assisted fire suppression expert",
     )
 
     query_text = builder.build_query_text(plan)
-    # build_branch_queries는 기본적으로 dense(semantic_query)를 사용함
     branch_queries = builder.build_branch_queries(
-        query="드론을 활용한 화재 진압 전문가를 추천해줘",
+        query="Recommend experts for drone-assisted fire suppression",
         plan=plan,
     )
 
-    assert "화재진압" in query_text
-    assert "드론" in query_text
-    assert "화재 진압" in query_text
-    
-    assert branch_queries["basic"].startswith("화재 진압 현장 드론 활용 연구 전문가")
-    assert "전공 학위" in branch_queries["basic"]
+    assert query_text == "fire suppression drone"
+    assert branch_queries["basic"].stable.startswith("fire suppression drone")
+    assert "Recommend experts" not in branch_queries["basic"].stable
+
+
+def test_query_builder_prefers_retrieval_core_over_legacy_core_keywords():
+    builder = QueryTextBuilder()
+    plan = PlannerOutput(
+        intent_summary="Recommend AI semiconductor experts",
+        core_keywords=["expert recommendation", "AI semiconductor"],
+        retrieval_core=["AI semiconductor", "chip reliability"],
+        must_aspects=["AI semiconductor", "chip reliability"],
+    )
+
+    query_text = builder.build_query_text(plan)
+    branch_queries = builder.build_branch_queries(
+        query="Recommend AI semiconductor experts",
+        plan=plan,
+    )
+
+    assert query_text == "AI semiconductor chip reliability"
+    assert branch_queries["basic"].stable.startswith("AI semiconductor chip reliability")
+    assert "expert recommendation" not in branch_queries["basic"].stable
 
 
 def test_query_builder_normalizes_and_deduplicates_core_keywords():
-    # 중복 제거 및 공백 처리 검증 (Kiwi 사용 안 함)
     keywords = QueryTextBuilder.normalize_keywords(
-        ["  화재진압  ", "", "드론", "화재"]
+        ["  fire suppression  ", "", "drone", "fire", "drone"]
     )
-    assert "화재진압" in keywords
-    assert "드론" in keywords
-    assert "화재" in keywords
-    # 중복 제거 확인
-    assert len(keywords) == 3
+
+    assert keywords == ["fire", "suppression", "drone"]

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import textwrap
 from typing import Any, Protocol
 
@@ -22,9 +23,71 @@ from apps.search.expansion_lexicon import EXPANSION_LEXICON, get_lexicon_summary
 logger = logging.getLogger(__name__)
 
 MAX_PLANNER_ATTEMPTS = 2
+PLANNER_VERSION = "v0.5.0"
 
+ROLE_QUERY_TERMS = (
+    "expert recommendation",
+    "reviewer recommendation",
+    "evaluation committee",
+    "expert",
+    "reviewer",
+    "reviewers",
+    "committee member",
+    "committee members",
+    "evaluation expert",
+    "evaluation experts",
+    "evaluation reviewer",
+    "evaluation reviewers",
+    "평가위원 추천",
+    "전문가 추천",
+    "평가위원",
+    "심사위원",
+    "전문가",
+    "리뷰어",
+    "자문위원",
+)
+ACTION_QUERY_TERMS = (
+    "recommendation",
+    "recommend",
+    "recommended",
+    "find",
+    "search",
+    "lookup",
+    "추천해줘",
+    "추천해주세요",
+    "추천해",
+    "추천",
+    "찾아줘",
+    "찾아주세요",
+    "찾아",
+    "매칭",
+)
+GENERIC_QUERY_TERMS = (
+    "experience",
+    "experiences",
+    "capability",
+    "capabilities",
+    "relevant",
+    "suitable",
+    "fit",
+    "fits",
+    "경험",
+    "경력",
+    "역량",
+    "전문성",
+    "관련",
+    "적합",
+    "평가",
+)
 
-PLANNER_VERSION = "v0.4.0"
+CONTEXTUAL_EVALUATION_PHRASES: tuple[tuple[str, str], ...] = (
+    ("과제 평가", r"(?:과제|프로젝트)(?:를|을)?\s*평가"),
+    ("기술 평가", r"기술(?:을|를)?\s*평가"),
+    ("논문 평가", r"논문(?:을|를)?\s*평가"),
+    ("project evaluation", r"\bprojects?\s+evaluation\b|\bevaluate\s+projects?\b"),
+    ("technology evaluation", r"\btechnology\s+evaluation\b|\bevaluate\s+technolog(?:y|ies)\b"),
+    ("paper evaluation", r"\bpapers?\s+evaluation\b|\bevaluate\s+papers?\b"),
+)
 
 
 class Planner(Protocol):
@@ -39,13 +102,74 @@ class Planner(Protocol):
     ) -> PlannerOutput: ...
 
 
+def _normalize_text(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
 def _normalize_string_list(values: list[str] | None) -> list[str]:
     normalized_values: list[str] = []
     for value in values or []:
-        normalized = " ".join(str(value).split())
+        normalized = _normalize_text(str(value))
         if normalized and normalized not in normalized_values:
             normalized_values.append(normalized)
     return normalized_values
+
+
+def _compile_term_pattern(terms: list[str]) -> re.Pattern[str] | None:
+    normalized_terms = _normalize_string_list(terms)
+    if not normalized_terms:
+        return None
+    escaped_terms = sorted(
+        {re.escape(term) for term in normalized_terms},
+        key=len,
+        reverse=True,
+    )
+    return re.compile("|".join(escaped_terms), flags=re.IGNORECASE)
+
+
+def _extract_query_terms(query: str, candidates: tuple[str, ...]) -> list[str]:
+    normalized_query = _normalize_text(query).lower()
+    found_terms: list[str] = []
+    for candidate in sorted({_normalize_text(term) for term in candidates if term}, key=len, reverse=True):
+        if candidate.lower() in normalized_query and candidate not in found_terms:
+            found_terms.append(candidate)
+    return found_terms
+
+
+def _strip_terms(value: str, terms: list[str]) -> str:
+    pattern = _compile_term_pattern(terms)
+    if pattern is None:
+        return _normalize_text(value)
+    return _normalize_text(pattern.sub(" ", value))
+
+
+def _filter_domain_terms(values: list[str], *, forbidden_terms: list[str]) -> list[str]:
+    filtered: list[str] = []
+    for value in _normalize_string_list(values):
+        cleaned = _strip_terms(value, forbidden_terms)
+        if not cleaned:
+            continue
+        if cleaned not in filtered:
+            filtered.append(cleaned)
+    return filtered
+
+
+def _split_fallback_tokens(value: str) -> list[str]:
+    tokens: list[str] = []
+    for part in _normalize_text(value).split():
+        if len(part) < 2:
+            continue
+        if part not in tokens:
+            tokens.append(part)
+    return tokens
+
+
+def _extract_contextual_evaluation_terms(query: str) -> list[str]:
+    contextual_terms: list[str] = []
+    for canonical_term, pattern_text in CONTEXTUAL_EVALUATION_PHRASES:
+        if re.search(pattern_text, query, flags=re.IGNORECASE):
+            contextual_terms.append(canonical_term)
+    return _normalize_string_list(contextual_terms)
 
 
 class HeuristicPlanner:
@@ -63,7 +187,7 @@ class HeuristicPlanner:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> PlannerOutput:
-        normalized_query = " ".join(query.split())
+        normalized_query = _normalize_text(query)
         output = PlannerOutput(
             intent_summary=normalized_query,
             hard_filters=dict(filters_override or {}),
@@ -72,6 +196,8 @@ class HeuristicPlanner:
             task_terms=[],
             core_keywords=[],
             retrieval_core=[],
+            must_aspects=[],
+            generic_terms=[],
             role_terms=[],
             action_terms=[],
             top_k=top_k or 15,
@@ -82,15 +208,18 @@ class HeuristicPlanner:
             "planner_retry_count": 0,
             "planner_keywords": [],
             "retrieval_keywords": [],
+            "must_aspects": [],
+            "generic_terms": [],
+            "removed_meta_terms": [],
             "attempts": [],
         }
         return output
 
 
 class OpenAICompatPlanner:
-    """LLM-backed planner that extracts pure retrieval keywords and explicit request terms."""
+    """LLM-backed planner that extracts retrieval-safe domain requirements."""
 
-    def __init__(self, settings: Settings, cache: PlanCache | None = None) -> None:
+    def __init__(self, settings: Settings, cache: Any | None = None) -> None:
         self.settings = settings
         self.fallback = HeuristicPlanner()
         self.model = OpenAICompatChatModel(
@@ -105,76 +234,71 @@ class OpenAICompatPlanner:
     def _build_system_prompt() -> str:
         lexicon_summary = get_lexicon_summary()
         prompt = f"""
-                # 역할
-                당신은 ***동질적인 전문가 코퍼스***를 검색하는 전문가 추천 시스템의 R&D 질의 플래너입니다.
-                당신은 전문가/평가위원을 모아놓은 qdrant 벡터DB 에 검색 할 쿼리를 만들기 위해, 사용자의 질의를 분석하고 정규화해야 합니다.
-            
-                # 출력 목표
-                - `retrieval_core`: 실제 기술/도메인 매칭에 필요한 핵심 키워드 리스트(Sparse/Keyword 검색용). "평가위원", "전문가" 등 역할어는 제외하세요.
-                - `bundle_ids`: 질의의 기술적 맥락을 확장하기 위해 아래 [확장 번들 목록]에서 가장 적합한 ID들을 선택하세요. (없으면 빈 리스트)
-                - `semantic_query`: 검색 의도를 담은 자연어 문장(Vector 검색용). 핵심 기술 키워드와 맥락을 포함하세요.
-                - `role_terms`: "평가위원", "교수", "전문가" 등 검색 대상의 페르소나/역할 용어 리스트.
-                - `action_terms`: "추천", "찾아줘", "선정해줘" 등 사용자가 요청한 행동 용어 리스트.
-                - `intent_flags`: 검색 의도에 대한 플래그 (예: "need_experience": true, "prefer_recent": true 등).
-                - `intent_summary`: UI/추적용 짧은 요약 문장.
-            
-                # [확장 번들 목록]
-                {lexicon_summary}
+        You are the query planner for an R&D expert recommendation service.
 
-                # 규칙
-                1. 사용자 질의의 주 언어를 유지하세요. 번역하거나 언어를 섞지 마세요.
-                2. `retrieval_core`에는 도메인 개념, 기술, 재료, 분야만 포함해야 합니다. 코퍼스에 공통적으로 나타나는 "전문가", "추천" 등은 여기에 넣지 마세요.
-                3. `bundle_ids`는 반드시 위에 제공된 [확장 번들 목록]의 ID 중에서만 선택하세요.
-                4. `role_terms`와 `action_terms`는 검색어(Query)가 아니라 제어 신호로 활용됩니다.
-                5. 명시적으로 주어진 기관 제약만 `include_orgs`와 `exclude_orgs`에 복사하세요.
-                6. 명시적으로 지원되는 구조화 필터만 `hard_filters`에 복사하세요.
-                7. 안전한 도메인 키워드가 없으면 `retrieval_core`는 빈 리스트로 반환하세요.
-                8. JSON만 반환하세요. 마크다운 펜스, 설명문, 숨겨진 추론은 포함하지 마세요.
-                
-                # 출력 스키마
-                {{
-                  "intent_summary": "string",
-                  "retrieval_core": ["string"],
-                  "bundle_ids": ["string"],
-                  "semantic_query": "string",
-                  "role_terms": ["string"],
-                  "action_terms": ["string"],
-                  "intent_flags": {{}},
-                  "hard_filters": {{}},
-                  "include_orgs": ["string"],
-                  "exclude_orgs": ["string"],
-                  "top_k": integer
-                }}
-            
-                # 예시
-                Input:
-                {{
-                  "query": "난접근성 화재 진압에서 드론을 접목하려고해. 드론을 화재진압 연구에 사용한 경험이 있는 관련된 전문가를 5명 추천해줘",
-                  "filters_override": {{}},
-                  "include_orgs": [],
-                  "exclude_orgs": [],
-                  "top_k": 5
-                }}
-            
-                Output:
-                {{
-                  "intent_summary": "난접근성 화재 진압과 드론 접목 관련 전문가 탐색",
-                  "retrieval_core": ["난접근성 화재 진압", "드론"],
-                  "bundle_ids": ["uav", "fire_response"],
-                  "semantic_query": "난접근성 화재 현장의 화재 진압을 위한 드론 및 무인 로봇 활용 연구 전문가",
-                  "role_terms": ["전문가"],
-                  "action_terms": ["추천"],
-                  "intent_flags": {{ "need_experience": true }},
-                  "hard_filters": {{}},
-                  "include_orgs": [],
-                  "exclude_orgs": [],
-                  "top_k": 5
-                }}
-            """
+        Return one JSON object only. Do not return markdown or prose.
+
+        Goal:
+        - separate domain requirements from meta request words
+        - keep retrieval keywords safe for search
+        - expose must-have aspects for downstream evidence gating
+
+        Field guide:
+        - `retrieval_core`: domain terms that are safe to send to retrieval.
+        - `must_aspects`: optional domain aspects. If unsure, leave empty.
+        - `generic_terms`: generic request words such as broad capability or experience words.
+        - `role_terms`: meta nouns such as expert, reviewer, evaluation committee.
+        - `action_terms`: request verbs such as recommend, find, search.
+        - `bundle_ids`: optional expansion bundle ids chosen only from the bundle list below.
+        - `semantic_query`: one natural sentence for dense retrieval.
+        - `intent_flags`, `hard_filters`, `include_orgs`, `exclude_orgs`, `top_k`: copy only when explicitly supported by the request.
+
+        Rules:
+        1. Preserve the user's language.
+        2. Put only domain terms in `retrieval_core`.
+        3. Put meta request words in `role_terms`, `action_terms`, or `generic_terms`, not in `retrieval_core`.
+        4. Do not invent filters, bundle ids, or aspects.
+        5. Return empty arrays instead of fabricated terms.
+
+        Expansion bundles:
+        {lexicon_summary}
+
+        Output schema:
+        {{
+          "intent_summary": "string",
+          "retrieval_core": ["string"],
+          "must_aspects": ["string"],
+          "generic_terms": ["string"],
+          "bundle_ids": ["string"],
+          "semantic_query": "string",
+          "role_terms": ["string"],
+          "action_terms": ["string"],
+          "intent_flags": {{}},
+          "hard_filters": {{}},
+          "include_orgs": ["string"],
+          "exclude_orgs": ["string"],
+          "top_k": 5
+        }}
+        """
         return textwrap.dedent(prompt).strip()
 
     @staticmethod
+    def _extract_meta_terms(
+        normalized_query: str,
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        role_terms = _extract_query_terms(normalized_query, ROLE_QUERY_TERMS)
+        action_terms = _extract_query_terms(normalized_query, ACTION_QUERY_TERMS)
+        contextual_terms = _extract_contextual_evaluation_terms(normalized_query)
+        generic_terms = _extract_query_terms(normalized_query, GENERIC_QUERY_TERMS)
+        if contextual_terms:
+            generic_terms = [
+                term for term in generic_terms if term.lower() not in {"평가", "evaluation"}
+            ]
+        return role_terms, action_terms, generic_terms, contextual_terms
+
+    @classmethod
     def _apply_request_constraints(
+        cls,
         *,
         output: PlannerOutput,
         normalized_query: str,
@@ -182,18 +306,50 @@ class OpenAICompatPlanner:
         include_orgs: list[str] | None,
         exclude_orgs: list[str] | None,
         top_k: int | None,
+        contextual_terms: list[str] | None = None,
     ) -> PlannerOutput:
-        output.intent_summary = " ".join(output.intent_summary.split()) or normalized_query
-        output.retrieval_core = _normalize_string_list(output.retrieval_core)
-        output.role_terms = _normalize_string_list(output.role_terms)
-        output.action_terms = _normalize_string_list(output.action_terms)
-        
-        # 번들 ID 유효성 검사 (존재하지 않는 ID는 제거)
-        output.bundle_ids = [bid for bid in _normalize_string_list(output.bundle_ids) if bid in EXPANSION_LEXICON]
+        output.intent_summary = _normalize_text(output.intent_summary) or normalized_query
 
-        # Backward compatibility mapping
+        role_terms, action_terms, generic_terms, query_contextual_terms = cls._extract_meta_terms(
+            normalized_query
+        )
+        effective_contextual_terms = _normalize_string_list(
+            list(contextual_terms or []) + query_contextual_terms
+        )
+        output.role_terms = _normalize_string_list(output.role_terms + role_terms)
+        output.action_terms = _normalize_string_list(output.action_terms + action_terms)
+        output.generic_terms = _normalize_string_list(output.generic_terms + generic_terms)
+        if effective_contextual_terms:
+            output.generic_terms = [
+                term
+                for term in output.generic_terms
+                if term.lower() not in {"평가", "evaluation"}
+            ]
+
+        forbidden_terms = _normalize_string_list(
+            output.role_terms + output.action_terms + output.generic_terms
+        )
+
+        raw_retrieval_terms = _normalize_string_list(
+            list(output.retrieval_core or output.core_keywords) + effective_contextual_terms
+        )
+        output.retrieval_core = _filter_domain_terms(
+            raw_retrieval_terms,
+            forbidden_terms=forbidden_terms,
+        )
+        output.must_aspects = list(output.retrieval_core)
         output.core_keywords = list(output.retrieval_core)
         output.task_terms = _normalize_string_list(output.role_terms + output.action_terms)
+
+        output.bundle_ids = [
+            bundle_id
+            for bundle_id in _normalize_string_list(output.bundle_ids)
+            if bundle_id in EXPANSION_LEXICON
+        ]
+        if not output.semantic_query:
+            output.semantic_query = (
+                " ".join(output.retrieval_core) if output.retrieval_core else output.intent_summary
+            )
 
         if filters_override:
             merged_filters = dict(output.hard_filters)
@@ -243,10 +399,18 @@ class OpenAICompatPlanner:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> PlannerOutput:
-        normalized_query = " ".join(query.split())
+        normalized_query = _normalize_text(query)
         filters = filters_override or {}
+        (
+            detected_role_terms,
+            detected_action_terms,
+            detected_generic_terms,
+            retained_contextual_terms,
+        ) = self._extract_meta_terms(normalized_query)
+        removed_meta_terms = _normalize_string_list(
+            detected_role_terms + detected_action_terms + detected_generic_terms
+        )
 
-        # 1. L1 캐시 조회
         if self.cache:
             cached_output = self.cache.get(normalized_query, filters, PLANNER_VERSION)
             if cached_output:
@@ -258,6 +422,7 @@ class OpenAICompatPlanner:
                     include_orgs=include_orgs,
                     exclude_orgs=exclude_orgs,
                     top_k=top_k,
+                    contextual_terms=retained_contextual_terms,
                 )
                 self.last_trace = {
                     "mode": "cache_hit",
@@ -266,11 +431,21 @@ class OpenAICompatPlanner:
                     "normalized_query": normalized_query,
                     "planner_keywords": list(output.retrieval_core),
                     "retrieval_keywords": list(output.retrieval_core),
-                    "removed_role_terms": list(output.role_terms + output.action_terms),
+                    "must_aspects": list(output.must_aspects),
+                    "generic_terms": list(output.generic_terms),
+                    "removed_meta_terms": removed_meta_terms,
+                    "retained_contextual_terms": retained_contextual_terms,
                 }
+                logger.info(
+                    "Planner cache applied: query=%r removed_meta_terms=%s retained_contextual_terms=%s retrieval_core=%s must_aspects=%s",
+                    normalized_query,
+                    removed_meta_terms,
+                    retained_contextual_terms,
+                    output.retrieval_core,
+                    output.must_aspects,
+                )
                 return output
 
-        # 2. 캐시 미스 시 LLM 호출
         payload = {
             "query": normalized_query,
             "filters_override": filters,
@@ -283,7 +458,7 @@ class OpenAICompatPlanner:
         for attempt_index in range(MAX_PLANNER_ATTEMPTS):
             seed = build_deterministic_seed("planner", payload, attempt_index)
             logger.info(
-                "LLM planning start: query=%s attempt=%d",
+                "LLM planning start: query=%r attempt=%d",
                 normalized_query,
                 attempt_index + 1,
             )
@@ -299,6 +474,7 @@ class OpenAICompatPlanner:
                     include_orgs=include_orgs,
                     exclude_orgs=exclude_orgs,
                     top_k=top_k,
+                    contextual_terms=retained_contextual_terms,
                 )
                 attempt_trace = {
                     "attempt": attempt_index + 1,
@@ -307,6 +483,8 @@ class OpenAICompatPlanner:
                     "raw_response": raw_response,
                     "parsed_json": parsed_payload,
                     "planner_keywords": list(output.retrieval_core),
+                    "must_aspects": list(output.must_aspects),
+                    "generic_terms": list(output.generic_terms),
                 }
                 attempts.append(attempt_trace)
 
@@ -319,30 +497,32 @@ class OpenAICompatPlanner:
                         "planner_retry_count": attempt_index,
                         "planner_keywords": list(output.retrieval_core),
                         "retrieval_keywords": list(output.retrieval_core),
-                        "removed_role_terms": list(output.role_terms + output.action_terms),
+                        "must_aspects": list(output.must_aspects),
+                        "generic_terms": list(output.generic_terms),
+                        "removed_meta_terms": removed_meta_terms,
+                        "retained_contextual_terms": retained_contextual_terms,
                         "attempts": attempts,
                     }
-                    
-                    # 결과 캐싱
                     if self.cache:
                         self.cache.set(normalized_query, filters, PLANNER_VERSION, output)
-
                     logger.info(
-                        "LLM planning success: intent=%r keywords=%d include_orgs=%d exclude_orgs=%d filters=%r",
-                        output.intent_summary,
-                        len(output.retrieval_core),
-                        len(output.include_orgs),
-                        len(output.exclude_orgs),
-                        output.hard_filters,
+                        "LLM planning success: query=%r removed_meta_terms=%s retained_contextual_terms=%s retrieval_core=%s must_aspects=%s generic_terms=%s",
+                        normalized_query,
+                        removed_meta_terms,
+                        retained_contextual_terms,
+                        output.retrieval_core,
+                        output.must_aspects,
+                        output.generic_terms,
                     )
                     return output
 
                 attempt_trace["status"] = "empty_keywords"
-                attempt_trace["reason"] = "planner_retrieval_core_empty"
+                attempt_trace["reason"] = "planner_retrieval_core_empty_after_meta_strip"
                 logger.warning(
-                    "Planner returned empty retrieval_core: query=%s attempt=%d",
+                    "Planner returned no usable retrieval keywords after meta removal: query=%r attempt=%d removed_meta_terms=%s",
                     normalized_query,
                     attempt_index + 1,
+                    removed_meta_terms,
                 )
             except Exception as exc:
                 attempts.append(
@@ -354,57 +534,57 @@ class OpenAICompatPlanner:
                     }
                 )
                 logger.warning(
-                    "Planner attempt failed: query=%s attempt=%d reason=%s",
+                    "Planner attempt failed: query=%r attempt=%d reason=%s",
                     normalized_query,
                     attempt_index + 1,
                     exc,
                 )
 
-        # 3. 모든 시도 실패 시 Fallback 1: 역할어 제거 후 Broad Search
-        logger.warning(
-            "Planner fallback activated: query=%s attempts=%d",
-            normalized_query,
-            len(attempts),
-        )
-        
-        # 마지막 시도에서 역할어 추출 정보가 있다면 활용
-        last_role_terms = []
-        last_action_terms = []
-        for att in reversed(attempts):
-            if "parsed_json" in att:
-                last_role_terms = att["parsed_json"].get("role_terms", [])
-                last_action_terms = att["parsed_json"].get("action_terms", [])
-                break
-
-        fallback_keywords = []
-        clean_query = normalized_query
-        for term in (last_role_terms + last_action_terms):
-            clean_query = clean_query.replace(term, " ")
-        
-        # 남은 단어들을 키워드로 사용
-        fallback_keywords = [kw.strip() for kw in clean_query.split() if len(kw.strip()) > 1]
-
+        fallback_query = _strip_terms(normalized_query, removed_meta_terms)
+        fallback_keywords = _split_fallback_tokens(fallback_query)
         fallback_output = PlannerOutput(
             intent_summary=f"[Fallback] {normalized_query}",
             hard_filters=dict(filters),
             include_orgs=list(include_orgs or []),
             exclude_orgs=list(exclude_orgs or []),
             retrieval_core=fallback_keywords,
-            core_keywords=fallback_keywords, # 하위 호환
-            role_terms=last_role_terms,
-            action_terms=last_action_terms,
+            core_keywords=fallback_keywords,
+            must_aspects=fallback_keywords,
+            generic_terms=detected_generic_terms,
+            role_terms=detected_role_terms,
+            action_terms=detected_action_terms,
             top_k=top_k or 15,
         )
-
+        fallback_output = self._apply_request_constraints(
+            output=fallback_output,
+            normalized_query=normalized_query,
+            filters_override=filters_override,
+            include_orgs=include_orgs,
+            exclude_orgs=exclude_orgs,
+            top_k=top_k,
+            contextual_terms=retained_contextual_terms,
+        )
         self.last_trace = {
             "mode": "fallback_broad_search",
             "cache": {"canonical_plan": "miss"},
+            "planner_version": PLANNER_VERSION,
             "normalized_query": normalized_query,
             "planner_retry_count": max(0, len(attempts) - 1),
-            "planner_keywords": fallback_keywords,
-            "retrieval_keywords": fallback_keywords,
-            "removed_role_terms": list(last_role_terms + last_action_terms),
+            "planner_keywords": list(fallback_output.retrieval_core),
+            "retrieval_keywords": list(fallback_output.retrieval_core),
+            "must_aspects": list(fallback_output.must_aspects),
+            "generic_terms": list(fallback_output.generic_terms),
+            "removed_meta_terms": removed_meta_terms,
+            "retained_contextual_terms": retained_contextual_terms,
+            "fallback_terms": list(fallback_output.retrieval_core),
             "reason": "planner_retry_exhausted_or_empty",
             "attempts": attempts,
         }
+        logger.warning(
+            "Planner fallback activated: query=%r removed_meta_terms=%s retained_contextual_terms=%s fallback_terms=%s",
+            normalized_query,
+            removed_meta_terms,
+            retained_contextual_terms,
+            fallback_output.retrieval_core,
+        )
         return fallback_output
