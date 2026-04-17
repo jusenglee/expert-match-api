@@ -634,3 +634,58 @@ def test_recommend_returns_gated_empty_when_no_candidate_passes():
         "1",
         "2",
     ]
+
+
+def test_required_aspect_coverage_uses_phrase_count_not_token_count():
+    plan = _plan(top_k=3, must_aspects=["medical imaging analysis"])
+
+    assert RecommendationService._required_aspect_coverage(plan) == 1
+
+
+def test_recommend_validator_uses_bundle_scope_not_title_only():
+    service, _, evidence_selector = _build_service(
+        ReasonGenerationOutput(
+            items=[
+                ReasonedCandidate(
+                    expert_id="1",
+                    fit=FIT_HIGH,
+                    recommendation_reason="의료영상 분석 경험이 직접 확인됩니다.",
+                )
+            ]
+        )
+    )
+    cards = [_candidate_card("1", "Alpha", 98.0)]
+    evidence_selector.bundles_by_id = {
+        "1": _bundle(
+            "1",
+            RelevantEvidenceItem(
+                item_id="paper:0",
+                type="paper",
+                title="General AI study",
+                date="2025-01",
+                detail="Clinical imaging collaboration",
+                snippet="medical imaging analysis pipeline and validation",
+                matched_keywords=["medical imaging analysis"],
+                aspect_matches=["medical imaging analysis"],
+                generic_matches=[],
+                direct_match=True,
+                match_score=10.0,
+            ),
+            direct_match_count=1,
+            aspect_coverage=1,
+            matched_aspects=["medical imaging analysis"],
+        )
+    }
+    _bind_search_result(
+        service,
+        cards=cards,
+        retrieved_count=1,
+        plan=_plan(top_k=1, must_aspects=["medical imaging analysis"]),
+    )
+
+    result = asyncio.run(service.recommend(query="medical imaging analysis", top_k=1))
+
+    recommendation = result["recommendations"][0]
+    assert recommendation.recommendation_reason == "의료영상 분석 경험이 직접 확인됩니다."
+    validator_trace = result["trace"]["reason_generation_trace"]["reason_sync_validator"]
+    assert validator_trace["fallback_count"] == 0

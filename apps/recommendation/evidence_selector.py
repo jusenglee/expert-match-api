@@ -78,6 +78,15 @@ def _normalize_title_key(value: str | None) -> str:
     return _compact_text(value)
 
 
+def normalize_phrase_keywords(keywords: list[str] | None) -> list[str]:
+    normalized_keywords: list[str] = []
+    for keyword in keywords or []:
+        normalized = _normalize_text(keyword)
+        if normalized and normalized not in normalized_keywords:
+            normalized_keywords.append(normalized)
+    return normalized_keywords
+
+
 def _build_rich_snippet(
     *,
     main_text: str | None,
@@ -160,10 +169,17 @@ class KeywordEvidenceSelector:
         candidates: list[CandidateCard],
         plan: PlannerOutput,
     ) -> dict[str, RelevantEvidenceBundle]:
-        aspects = self._normalize_keywords(
-            plan.must_aspects or plan.retrieval_core or plan.core_keywords
+        # evidence_aspects: 한국어+영어 혼합 매칭 용어 (planner v0.7.0+ 생성).
+        # 없으면 한국어 must_aspects → retrieval_core 순으로 폴백.
+        # evidence_aspects는 실제 논문/과제/특허 텍스트에 등장하는 표현을 포함하므로
+        # Korean/English 혼합 데이터베이스에서 직접 매칭이 동작한다.
+        aspects = normalize_phrase_keywords(
+            plan.evidence_aspects
+            or plan.must_aspects
+            or plan.retrieval_core
+            or plan.core_keywords
         )
-        generic_terms = self._normalize_keywords(plan.generic_terms)
+        generic_terms = normalize_phrase_keywords(plan.generic_terms)
         bundles: dict[str, RelevantEvidenceBundle] = {}
         candidate_diagnostics: list[dict[str, object]] = []
         empty_candidate_ids: list[str] = []
@@ -232,29 +248,31 @@ class KeywordEvidenceSelector:
                 dedup_dropped_count,
             )
 
+        aspect_source = (
+            "evidence_aspects" if plan.evidence_aspects
+            else "must_aspects" if plan.must_aspects
+            else "retrieval_core"
+        )
         self.last_trace = {
             "mode": "direct_match_aspect_quota",
-            "must_aspects": aspects,
+            "aspect_source": aspect_source,
+            "aspects": aspects,
             "generic_terms": generic_terms,
             "candidate_evidence_counts": candidate_diagnostics,
             "empty_candidate_ids": empty_candidate_ids,
         }
         logger.info(
-            "Evidence selection completed: candidates=%d empty_candidates=%d must_aspects=%s",
+            "Evidence selection completed: candidates=%d empty_candidates=%d aspect_source=%s aspects=%s",
             len(candidates),
             len(empty_candidate_ids),
+            aspect_source,
             aspects,
         )
         return bundles
 
     @staticmethod
     def _normalize_keywords(keywords: list[str]) -> list[str]:
-        normalized_keywords: list[str] = []
-        for keyword in keywords:
-            normalized = _normalize_text(keyword)
-            if normalized and normalized not in normalized_keywords:
-                normalized_keywords.append(normalized)
-        return normalized_keywords
+        return normalize_phrase_keywords(keywords)
 
     @staticmethod
     def _collect_unique_keywords(values: list[str]) -> list[str]:
@@ -320,9 +338,18 @@ class KeywordEvidenceSelector:
         ranked: list[RelevantEvidenceItem] = []
         for index, item in enumerate(projects):
             base_score = 1.0 + (len(projects) - index) * 0.1
+            # project_title_english을 body_parts에 추가.
+            # display_title은 한국어 제목을 우선하므로, 영어 제목이 검색에서 누락될 수 있음.
+            # evidence_aspects에 영어 용어가 포함된 경우 영어 제목에서도 매칭되어야 함.
+            en_title_supplement = (
+                item.project_title_english
+                if item.project_title_english and item.project_title_english != item.display_title
+                else None
+            )
             score, aspect_matches, generic_matches = self._score_evidence(
                 title=item.display_title,
                 body_parts=[
+                    en_title_supplement,
                     item.research_objective_summary,
                     item.research_content_summary,
                     item.managing_agency,

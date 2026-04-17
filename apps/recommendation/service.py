@@ -19,6 +19,7 @@ from apps.recommendation.evidence_selector import (
     EvidenceSelector,
     RelevantEvidenceBundle,
     RelevantEvidenceItem,
+    normalize_phrase_keywords,
 )
 from apps.recommendation.planner import Planner
 from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonGenerator
@@ -560,8 +561,14 @@ class RecommendationService:
 
     @classmethod
     def _required_aspect_coverage(cls, plan: PlannerOutput) -> int:
-        target_aspects = QueryTextBuilder.normalize_keywords(
-            getattr(plan, "must_aspects", None) or plan.retrieval_core or plan.core_keywords
+        # evidence_aspects가 있으면 그것을 기준으로 threshold 계산.
+        # evidence_aspects는 bilingual이고 must_aspects보다 세분화된 용어이므로,
+        # 더 많은 수의 aspects 중 최소 2개만 매칭해도 충분히 관련성 있는 후보로 판단.
+        target_aspects = normalize_phrase_keywords(
+            plan.evidence_aspects
+            or getattr(plan, "must_aspects", None)
+            or plan.retrieval_core
+            or plan.core_keywords
         )
         if not target_aspects:
             return 0
@@ -575,6 +582,13 @@ class RecommendationService:
         plan: PlannerOutput,
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
     ) -> tuple[list[CandidateCard], dict[str, Any]]:
+        # gate diagnostic 표시용 — evidence_selector가 실제로 사용한 것과 동일한 소스 사용
+        target_aspects = normalize_phrase_keywords(
+            plan.evidence_aspects
+            or getattr(plan, "must_aspects", None)
+            or plan.retrieval_core
+            or plan.core_keywords
+        )
         coverage_threshold = cls._required_aspect_coverage(plan)
         keep_cards: list[CandidateCard] = []
         low_coverage_cards: list[CandidateCard] = []
@@ -615,8 +629,16 @@ class RecommendationService:
                 }
             )
 
+        aspect_source = (
+            "evidence_aspects" if plan.evidence_aspects
+            else "must_aspects" if plan.must_aspects
+            else "retrieval_core"
+        )
         return [*keep_cards, *low_coverage_cards, *generic_only_cards], {
             "coverage_threshold": coverage_threshold,
+            "coverage_threshold_basis": "phrase",
+            "aspect_source": aspect_source,
+            "target_aspects": target_aspects,
             "kept_candidate_ids": [card.expert_id for card in keep_cards],
             "low_coverage_candidate_ids": [card.expert_id for card in low_coverage_cards],
             "generic_only_candidate_ids": [card.expert_id for card in generic_only_cards],
@@ -754,6 +776,7 @@ class RecommendationService:
         card: CandidateCard,
         recommendation_reason: str,
         evidence: list[EvidenceItem],
+        relevant_bundle: RelevantEvidenceBundle,
         candidate_names: list[str],
     ) -> list[str]:
         normalized_reason = cls._normalize_text(recommendation_reason)
@@ -774,19 +797,32 @@ class RecommendationService:
         if INTERNAL_EVIDENCE_ID_PATTERN.search(recommendation_reason):
             violations.append("internal_evidence_id")
 
-        target_aspects = QueryTextBuilder.normalize_keywords(
+        target_aspects = normalize_phrase_keywords(
             getattr(plan, "must_aspects", None) or plan.retrieval_core or plan.core_keywords
         )
-        non_profile_titles = [
-            cls._normalize_text(item.title) for item in evidence if item.type != "profile"
+        evidence_scope_texts = [
+            cls._normalize_text(
+                " ".join(
+                    value
+                    for value in [item.title, item.detail, item.snippet]
+                    if value
+                )
+            )
+            for item in relevant_bundle.all_items()
         ]
-        if target_aspects and non_profile_titles:
+        if not evidence_scope_texts:
+            evidence_scope_texts = [
+                cls._normalize_text(" ".join(value for value in [item.title, item.detail] if value))
+                for item in evidence
+                if item.type != "profile"
+            ]
+        if target_aspects and evidence_scope_texts:
             if not any(
-                cls._normalize_text(aspect) in title
+                cls._normalize_text(aspect) in scope_text
                 for aspect in target_aspects
-                for title in non_profile_titles
+                for scope_text in evidence_scope_texts
             ):
-                violations.append("aspect_title_miss")
+                violations.append("aspect_scope_miss")
 
         non_profile_evidence = [item for item in evidence if item.type != "profile"]
         if not non_profile_evidence and any(
@@ -873,6 +909,7 @@ class RecommendationService:
                     card=card,
                     recommendation_reason=recommendation_reason,
                     evidence=evidence,
+                    relevant_bundle=relevant_bundle,
                     candidate_names=candidate_names,
                 )
                 if violations:

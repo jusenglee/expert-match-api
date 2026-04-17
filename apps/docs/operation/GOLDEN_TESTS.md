@@ -1,113 +1,130 @@
 # Golden Tests
 
-## Scenarios
+## Required Scenarios
 
-### 1. 메타어 제거
+### 1. Meta-term removal
 
-- 입력: `AI 반도체 평가위원 추천`
-- 기대값:
-  - `평가위원`, `추천`은 `removed_meta_terms`로만 추적된다.
-  - `retrieval_core`와 `must_aspects`에는 `AI 반도체`만 남는다.
-  - raw query의 메타어가 branch query에 재주입되지 않는다.
+Input:
 
-### 2. planner fallback의 안전한 broad search
+- `AI 반도체 평가위원 추천`
 
-- 입력: 메타어를 제거하면 검색어가 거의 남지 않는 질의
-- 기대값:
-  - planner는 broad fallback으로 내려갈 수 있다.
-  - fallback에서도 제거된 메타어를 다시 검색어로 쓰지 않는다.
-  - 남은 토큰이 없으면 retrieval skip으로 끝난다.
+Expected:
 
-### 3. 직접 매치 evidence만 선택
+- `평가위원`, `추천` only appear in `removed_meta_terms`
+- `retrieval_core` contains only domain terms
+- raw meta terms are not re-injected into sparse retrieval text
 
-- 입력: 최신이지만 무관한 실적과 오래됐지만 직접 매치되는 실적이 함께 있는 후보
-- 기대값:
-  - selector는 직접 매치 evidence만 relevant pool에 넣는다.
-  - 무관한 최신 실적은 recommendation evidence에 들어가지 않는다.
+### 2. Dense vs sparse query split
 
-### 4. evidence dedup과 quota
+Input:
 
-- 입력: 같은 제목과 같은 연도의 중복 project/paper
-- 기대값:
-  - dedup key `title + year` 기준으로 중복 제거
-  - aspect별 최대 2건
-  - 후보당 전체 최대 4건
+- planner returns both `retrieval_core` and `semantic_query`
 
-### 5. shortlist gate
+Expected:
 
-- 입력: direct evidence 0건 후보, low coverage 후보, generic-only 후보가 함께 있는 질의
-- 기대값:
-  - direct evidence 0건 후보는 drop
-  - low coverage 후보는 keep 뒤로 밀림
-  - generic-only 후보는 하단 고정
-  - 점수 가중합 없이 gate 순서로만 재배치
+- dense retrieval uses `semantic_query`
+- sparse retrieval uses `retrieval_core`
+- query trace records the dense/sparse base source
 
-### 6. `/search/candidates` vs `/recommend`
+### 3. Deterministic must-aspect pruning
 
-- 입력: 같은 질의에 대해 `/search/candidates`와 `/recommend` 각각 호출
-- 기대값:
-  - `/search/candidates`는 retrieval 순서만 보여준다.
-  - `/recommend`는 evidence selector와 shortlist gate를 추가로 적용한다.
+Input:
 
-### 7. reason generator는 요약만 수행
+- `retrieval_core = ["의료영상 분석", "AI 기반", "기술"]`
+- `must_aspects = ["의료영상 분석", "AI 기반", "기술 개발"]`
 
-- 입력: 후보별 `selected_evidence`가 이미 확정된 상태
-- 기대값:
-  - LLM payload에 `selected_evidence`, `do_not_mention`이 포함된다.
-  - LLM tool/json schema는 `selected_evidence_ids`를 요구하지 않는다.
-  - 최종 `recommendation.evidence`는 서버가 확정한 evidence를 사용한다.
+Expected:
 
-### 8. empty reason fallback
+- `must_aspects` is pruned to the domain-specific phrases only
+- generic phrases such as `AI 기반`, `기술 개발` do not survive as hard gates
 
-- 입력: LLM이 후보를 반환했지만 `recommendation_reason`을 비운 경우
-- 기대값:
-  - 서버가 `selected_evidence` 기반 fallback 사유를 생성한다.
-  - `server_fallback_reasons.source == "selected_evidence"`가 trace에 남는다.
+### 4. Contextual evaluation phrase handling
 
-### 9. reason sync validator
+Input:
 
-- 입력: 추천 사유에 다른 후보 이름, 내부 evidence id, 무근거 강한 표현이 포함된 경우
-- 기대값:
-  - validator가 이를 탐지한다.
-  - 사유는 서버 fallback으로 치환된다.
-  - `reason_sync_validator.fallback_count`와 violation 목록이 trace에 남는다.
+- `AI 기반 의료영상 과제를 평가할 수 있는 전문가 추천`
 
-### 10. batched reason generation
+Expected:
 
-- 입력: gate를 통과한 최종 shortlist가 6명 이상인 질의
-- 기대값:
-  - reason generation은 최대 5명씩 순차 batch로 실행된다.
-  - 최종 추천 순서는 shortlist 순서를 유지한다.
-  - batch trace에 candidate ids가 남는다.
+- `과제 평가` does not remain in `must_aspects`
+- `intent_flags.review_context == true`
+- `intent_flags.review_targets == ["과제 평가"]`
 
-### 11. retrieval skipped on empty keywords
+### 5. Phrase-based coverage threshold
 
-- 입력: planner가 메타어 제거 후 안전한 검색어를 만들지 못하는 질의
-- 기대값:
-  - retrieval이 스킵된다.
-  - `retrieval_skipped_reason`이 trace에 남는다.
-  - `recommendations=[]`
+Input:
+
+- `evidence_aspects = ["medical imaging analysis", "의료영상 분석"]`
+
+Expected:
+
+- coverage threshold is `min(2, 2) = 2`, not token-count based
+- threshold uses `evidence_aspects` length when available, not `must_aspects`
+
+### 6. Selector / validator scope alignment
+
+Input:
+
+- selector matches an aspect in evidence `snippet` or `detail`, not in title
+
+Expected:
+
+- validator does not false-fallback on title-only grounds
+
+### 7. Partial batch retry
+
+Input:
+
+- first reasoner batch returns partial output
+
+Expected:
+
+- one compact retry occurs
+- unresolved candidates only then fall back to server-generated reasons
+
+### 8. Future-dated projects
+
+Input:
+
+- direct-match project evidence with a future end date
+
+Expected:
+
+- evidence remains eligible
+- trace includes `future_selected_evidence_ids`
+
+### 9. Bilingual evidence_aspects matching
+
+Input:
+
+- `query = "AI 기반 의료영상 분석 과제 평가 전문가 추천"`
+- researcher with English paper titles/abstracts about medical image analysis
+
+Expected:
+
+- `evidence_aspects` includes both Korean (`의료영상 분석`) and English (`medical image analysis`) terms
+- English paper titles/abstracts matched via `evidence_aspects` English terms
+- `aspect_source = "evidence_aspects"` in selector trace
+- `direct_match_count > 0` for matching researcher
+
+### 10. evidence_aspects fallback to must_aspects
+
+Input:
+
+- LLM-generated `PlannerOutput` with empty `evidence_aspects`
+
+Expected:
+
+- selector falls back to `must_aspects` automatically
+- `aspect_source = "must_aspects"` in selector trace
+- no error; behavior identical to pre-v0.7.0 pipeline
 
 ## Acceptance Criteria
 
-- 검색어는 `retrieval_core`를 우선 사용하고, 없을 때만 `core_keywords`를 사용한다.
-- `평가위원`, `전문가`, `추천` 같은 메타어는 검색어에 남지 않는다.
-- evidence selector는 직접 매치 evidence만 선택한다.
-- evidence 선택은 dedup과 quota 규칙을 따른다.
-- `/recommend`는 retrieval 후보 전체에 먼저 evidence selector를 적용한다.
-- shortlist는 deterministic gate로만 재배치된다.
-- reason generator는 요약만 수행하고 evidence를 다시 고르지 않는다.
-- empty reason과 validator failure는 서버 fallback으로 치환된다.
-- trace는 `evidence_selection`, `shortlist_gate`, `selected_evidence`, `server_fallback_reasons`, `reason_sync_validator`를 포함한다.
-- 운영 로그에서 planner, evidence selector, shortlist gate, validator fallback을 추적할 수 있다.
-## 2026-04-17 additions
-
-- Contextual evaluation phrase case: `AI 기반 의료영상 과제를 평가할 수 있는 전문가를 추천해 주세요`
-  - `평가위원`, `전문가`, `추천` are still stripped as meta terms.
-  - `과제 평가` remains in `must_aspects`.
-- Equal-weight retrieval case:
-  - branch/path weights are absent from query payload and trace.
-  - expanded search is executed only for distinct expanded text.
-- Partial batch retry case:
-  - the first reasoner batch may return partial output.
-  - one compact retry is executed before server fallback.
+- equal-weight RRF only
+- stable / expanded path model remains two-path
+- dense/sparse query split is visible in trace
+- contextual evaluation phrases are intent flags, not hard lexical gates
+- gate and validator use the same phrase/evidence scope assumptions
+- `evidence_aspects` is bilingual; `retrieval_core` and `must_aspects` are Korean-only
+- selector `aspect_source` trace field is present and correct
