@@ -17,12 +17,17 @@ class CompiledBranchQueries:
 
 
 class QueryTextBuilder:
+    @staticmethod
+    def _planner_keywords(plan: PlannerOutput) -> list[str]:
+        return list(plan.retrieval_core or plan.core_keywords)
+
     def build_branch_queries(self, query: str, plan: PlannerOutput) -> dict[str, CompiledBranchQueries]:
         """
         플랜 정보를 바탕으로 각 브랜치(basic, art, pat, pjt)의 Stable 및 Expanded 쿼리를 생성합니다.
         """
         # Stable: Planner가 추출한 핵심 기술어 (모든 브랜치 공통 기준축)
-        stable_base = " ".join(plan.retrieval_core) if plan.retrieval_core else query
+        planner_keywords = self._planner_keywords(plan)
+        stable_base = " ".join(planner_keywords) if planner_keywords else query
         
         results = {}
         branches = ["basic", "art", "pat", "pjt"]
@@ -48,8 +53,9 @@ class QueryTextBuilder:
 
     def build_query_text(self, plan: PlannerOutput) -> str:
         """전체 검색 맥락을 대표하는 텍스트를 생성합니다. (UI/Trace용)"""
-        if plan.retrieval_core:
-            return " ".join(plan.retrieval_core)
+        planner_keywords = self._planner_keywords(plan)
+        if planner_keywords:
+            return " ".join(planner_keywords)
         return plan.intent_summary
 
     @staticmethod

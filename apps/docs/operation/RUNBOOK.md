@@ -1,106 +1,163 @@
-# 운영 매뉴얼 (RUNBOOK)
+# 운영 Runbook
 
-이 문서는 전문가 추천 시스템의 설치, 실행, 상태 점검 및 실시간 모니터링을 위한 운영 지침을 담고 있습니다.
+이 문서는 현재 추천 런타임 기준의 설치, 실행, readiness 점검, 로그 확인 절차를 정리한다.
 
-## 1. 패키지 설치
-
-최신 Python 3.12 이상의 환경에서 다음 명령어를 실행하여 필요한 패키지를 설치합니다.
+## 1. 설치
 
 ```powershell
 python -m pip install -e .[dev]
 ```
 
-## 2. Qdrant 및 데이터 준비
+## 2. Qdrant 준비
 
-- Qdrant 서버가 구동 중인지, 설정된 URL에 접근 가능한지 확인합니다.
-- 기본 컬렉션 이름은 `researcher_recommend_proto`이며, 필요 시 환경 변수 `NTIS_QDRANT_COLLECTION_NAME`으로 덮어쓸 수 있습니다.
-- 애플리케이션 시작 시, 실제로 선택된 sparse backend 에 맞춰 컬렉션의 Sparse Vector 수정자(`IDF` 또는 없음)를 자동으로 확인하고 필요 시 복구를 시도합니다.
+점검 항목:
 
-## 3. 시스템 준비 상태 점검 (Readiness)
+- Qdrant URL 접근 가능 여부
+- 대상 collection 존재 여부
+- required named vector 존재 여부
+- sparse modifier 상태
+- 샘플 point 존재 여부
 
-추천 API를 호출하기 전, 다음 순서대로 시스템 상태를 점검하십시오.
+현재 sparse runtime은 실제 선택된 backend에 따라 modifier 기대값이 달라진다.
 
-1. `ntis-validate-live` 명령 실행 (CLI 도구)
-2. `GET /health` 호출 (기본 헬스체크)
-3. `GET /health/ready` 호출 (상세 준비 상태 확인)
+- PIXIE / custom SPLADE: sparse modifier `None`
+- `Qdrant/bm25` FastEmbed builtin: sparse modifier `IDF`
 
-`ntis-validate-live` 는 앱 startup 과 동일한 sparse backend 선택 로직을 사용합니다. 따라서 local/online PIXIE 가 모두 실패해 `Qdrant/bm25` fallback 이 선택되면 sparse vector modifier 기대값은 `None` 이 아니라 `IDF` 입니다.
+## 3. Readiness 점검
 
-만약 `/health/ready` 결과가 `503` 에러 또는 `ready: false`를 반환한다면 다음 항목을 점검하십시오:
-- Qdrant 컬렉션 존재 여부
-- 필수 Named Vector(Dense/Sparse) 존재 여부
-- Sparse Vector의 IDF 설정 값
-- 필수 Payload 인덱스 생성 여부
-- 유효한 샘플 데이터(Point) 존재 여부 및 데이터 구조(`publications[]`, `research_projects[]` 등)
+추천 API 호출 전 다음 순서로 점검한다.
+
+1. `python -m apps.tools.validate_live`
+2. `GET /health`
+3. `GET /health/ready`
+
+`validate_live`와 `/health/ready`는 같은 sparse runtime resolver를 사용한다.
+
+로컬 PIXIE와 online PIXIE가 모두 실패해 `Qdrant/bm25`로 fallback된 경우에도 서비스는 정상 기동될 수 있다. 이때 modifier 기대값은 `IDF`다.
 
 ## 4. 서버 실행
-
-다음 명령어를 통해 API 서버를 실행합니다.
 
 ```powershell
 uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 ```
 
-- **LLM 일관성 모드**: Planner와 Reasoner는 환경변수로 노출하지 않은 고정 저변동 샘플링(`temperature=0.0`, `top_p=0.2`, `reasoning_effort=low`, `include_reasoning=false`, `disable_thinking=true`)을 사용합니다. 운영 중 튜닝이 필요하면 코드 변경이 필요합니다.
-- **참고**: `NTIS_EMBEDDING_BACKEND=local` 모드 사용 시, 루트의 `multilingual-e5-large-instruct` 폴더 내에 모델 파일들이 온전히 존재해야 합니다.
-- **참고**: sparse backend 는 `로컬 PIXIE -> online PIXIE -> Qdrant/bm25` 순서로 선택됩니다. online PIXIE 는 `telepix/PIXIE-Splade-v1.0` 를 사용합니다.
-- **참고**: `NTIS_HF_HUB_OFFLINE=true` 또는 `NTIS_SPARSE_LOCAL_FILES_ONLY=true` 이면 online PIXIE 단계는 건너뛰고 `Qdrant/bm25` fallback 을 시도합니다.
-- **참고**: `Qdrant/bm25` fallback 은 FastEmbed/Qdrant builtin sparse 경로를 사용하므로 startup 성공 시 서비스는 계속 기동됩니다. 이때 sparse vector modifier 는 `IDF` 여야 하고, PIXIE/SPLADE 가 선택된 경우에는 modifier 가 없어야 합니다.
-- **추천 사유 생성**: `/recommend` 요청 시 LLM이 전문가별 추천 사유를 생성하며, 이는 검색 결과의 숏리스트(Top-k)를 대상으로 합니다.
+운영 중 확인할 핵심 흐름:
 
-## 5. 브라우저 플레이그라운드 (Playground) 활용
+- planner가 메타어를 제거하고 `retrieval_core`를 생성
+- retrieval이 branch query를 구성하고 후보를 수집
+- evidence selector가 전체 후보에서 직접 매치 evidence를 선별
+- shortlist gate가 drop / low coverage / generic-only를 분리
+- reason generator가 최대 5명씩 batch 실행
+- validator가 사유를 검증하고 필요 시 fallback
 
-웹 브라우저에서 다음 주소로 접속하여 대화형 테스트를 수행할 수 있습니다.
+## 5. Playground / API 확인
+
+브라우저:
 
 ```text
 http://127.0.0.1:8011/
 ```
 
-**플레이그라운드 주요 기능:**
-1. **상태 배지 확인**: 페이지 상단의 배지가 녹색(시스템 정상)인지 확인합니다.
-2. **분석 결과 창**: 자연어 질의를 입력하여 실제 추천 결과와 선정 사유를 확인합니다.
-3. **실시간 서버 로그 콘솔**: **(신규)** 결과창 하단의 콘솔을 통해 서버 내부에서 발생하는 **Trace ID 기반 한글 로그**를 즉시 모니터링합니다. AI의 사고 과정을 투명하게 확인할 수 있습니다.
+`/search/candidates` 예시:
 
-## 6. API 테스트 (curl 예시)
-
-**전문가 후보 목록 조회 (`/search/candidates`)**
 ```powershell
 curl -X POST http://127.0.0.1:8011/search/candidates `
      -H "Content-Type: application/json" `
-     -d "{\"query\":\"AI 반도체 분야의 SCIE 논문 실적이 우수한 전문가 후보를 찾아줘\"}"
+     -d "{\"query\":\"AI 반도체 설계 경험이 있는 후보를 찾아줘\"}"
 ```
 
-**최종 전문가 추천 (`/recommend`)**
+`/recommend` 예시:
+
 ```powershell
 curl -X POST http://127.0.0.1:8011/recommend `
      -H "Content-Type: application/json" `
-     -d "{\"query\":\"AI 반도체 설계 과제 경험이 있는 전문가를 추천해주고 특정 기관은 제외해줘\", \"exclude_orgs\":[\"A기관\"]}"
+     -d "{\"query\":\"AI 반도체 설계 과제 경험이 있는 전문가를 추천해줘\"}"
 ```
 
-## 7. 가시성 및 로깅 시스템 (중요)
+## 6. 로그 확인 포인트
 
-본 시스템은 모든 요청에 대해 **Trace ID**를 부여하여 추적성을 보장합니다.
+### Planner
 
-### 주요 추적 로그 포인트 (한글 로그)
-- **Planner**: 사용자 질의 분석 결과, 하드 필터 추출 정보, LLM 응답 소요시간 및 토큰 수
-- **Retriever**: 하이브리드 검색 실행 결과, 검색된 후보 수, 필터 적용 현황
-- **Judge Map 라운드**: 배치 분할 정보(라운드 번호, 배치 수, 배치 크기), 후보별 예상 토큰 크기, `max_tokens=3000` 제한 적용, LLM 호출 슬롯 획득(세마포어), 경량 응답 수신 시간, 생존자(survivors) 수
-- **Judge Reduce 라운드**: 생존 후보의 전체 직렬화 토큰 추정, `max_tokens=unlimited` 적용, 상세 응답 수신 시간
-- **Judge JSON 추출**: 3단계 방어 JSON 추출 결과 (추출된 텍스트 로깅)
-- **Judge 정규화**: 문자열/리스트 불일치 자동 교정 횟수
-- **Fallback**: LLM 오류 또는 JSON 파싱 실패 시 휴리스틱 모드로의 전환 안내 (Planner/Judge 각각)
-- **Data Gap**: 특정 전문가의 데이터 누락(논문 없음 등)에 대한 경고
+INFO 로그:
 
-로그 형식은 다음과 같으며, Playground UI의 콘솔에서 레벨별 색상과 함께 확인할 수 있습니다.
-`[시간] [레벨] [ID:TraceID] [모듈명] 메시지`
+- `retrieval_core`
+- `must_aspects`
+- `removed_meta_terms`
+- fallback 진입 여부
 
-### 로그 예시 (Map-Reduce 심사)
-```
-[09:45:54] [INFO] [ID:abc123] [Judge] Map-Reduce 분할 시작: 총 후보=37 배치크기=10 배치수=4
-[09:45:54] [INFO] [ID:abc123] [Judge] 데이터당 예상 토큰 크기: context=map 총 추정=1200 토큰 후보 수=10
-[09:45:54] [INFO] [ID:abc123] [Judge] LLM 호출 슬롯 획득: context=map round=1 batch=1/4 max_concurrency=10 max_tokens=3000
-[09:45:56] [INFO] [ID:abc123] [Judge] LLM 응답 수신 완료: context=map round=1 batch=1/4 소요시간=1823.45ms
-[09:45:58] [INFO] [ID:abc123] [Judge] Map 라운드 완료: 생존 후보=15
-[09:45:58] [INFO] [ID:abc123] [Judge] LLM 판정 시작: context=reduce round=2 batch=1/1 후보 수=15 max_tokens=unlimited
-[09:46:09] [INFO] [ID:abc123] [Judge] LLM 응답 수신 완료: context=reduce round=2 batch=1/1 소요시간=10894.23ms
-```
+이 로그로 메타어가 실제 검색어에서 제거됐는지 확인한다.
+
+### Evidence Selector
+
+INFO 로그:
+
+- 후보별 `direct_match_count`
+- 후보별 `aspect_coverage`
+- 후보별 `generic_only`
+- 후보별 `selected_evidence_ids`
+- 후보별 `dedup_dropped_count`
+
+이 로그로 반복 evidence, 0매치 후보, aspect 부족 후보를 바로 확인할 수 있다.
+
+### Shortlist Gate
+
+INFO 로그:
+
+- `kept`
+- `low_coverage`
+- `generic_only`
+- `dropped`
+- 최종 shortlist candidate ids
+
+이 로그는 왜 특정 후보가 LLM 단계에 들어갔는지 설명하는 기준 로그다.
+
+### Reason Generation
+
+INFO 로그:
+
+- batch index
+- batch size
+- batch candidate ids
+- returned candidate 수
+- missing candidate 수
+- empty reason candidate 수
+
+WARNING 로그:
+
+- empty reason fallback 발생
+
+### Validator / Fallback
+
+WARNING 로그:
+
+- `reason_sync_validator` fallback 발생
+- violation 종류
+- fallback에 사용된 evidence ids
+
+주요 violation 종류:
+
+- `other_candidate_name`
+- `internal_evidence_id`
+- `aspect_title_miss`
+- `strong_claim_without_direct_evidence`
+
+## 7. Trace 확인 포인트
+
+추천 응답 trace에서 우선 확인할 필드:
+
+- `planner_trace.removed_meta_terms`
+- `planner_trace.must_aspects`
+- `planner_trace.generic_terms`
+- `reason_generation_trace.evidence_selection`
+- `reason_generation_trace.shortlist_gate`
+- `reason_generation_trace.selected_evidence`
+- `reason_generation_trace.server_fallback_reasons`
+- `reason_generation_trace.reason_sync_validator`
+
+이 조합으로 후보 탈락, evidence 선택, 사유 fallback 원인을 대부분 재구성할 수 있다.
+## 2026-04-17 observability notes
+
+- Retrieval logs should be read as equal-weight RRF. Do not expect branch/path weight tables in the active runtime.
+- Planner logs now separate `removed_meta_terms` from `retained_contextual_terms`.
+- Evidence selector logs may include `future_selected_evidence_ids` when a future-dated project is selected.
+- Reason generation batch logs now include `retry_triggered` and `retry_reason` for partial-output compact retries.

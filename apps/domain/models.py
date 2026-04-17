@@ -195,6 +195,8 @@ class PlannerOutput(BaseModel):
     task_terms: list[str] = Field(default_factory=list)
     core_keywords: list[str] = Field(default_factory=list)
     retrieval_core: list[str] = Field(default_factory=list)
+    must_aspects: list[str] = Field(default_factory=list)
+    generic_terms: list[str] = Field(default_factory=list)
     role_terms: list[str] = Field(default_factory=list)
     action_terms: list[str] = Field(default_factory=list)
     bundle_ids: list[str] = Field(default_factory=list)
@@ -208,6 +210,8 @@ class PlannerOutput(BaseModel):
         "task_terms",
         "core_keywords",
         "retrieval_core",
+        "must_aspects",
+        "generic_terms",
         "role_terms",
         "action_terms",
         "bundle_ids",

@@ -106,7 +106,7 @@ def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak
     assert "AI semiconductor" in result.branch_queries["pjt"].stable
     assert "chip design" in result.branch_queries["pjt"].stable
     assert {hit.expert_id for hit in result.hits} == {"1", "2"}
-    assert len(encoder.inputs) == 6
+    assert len(encoder.inputs) == 4
     assert all("AI semiconductor" in text for text in encoder.inputs)
     assert all("chip design" in text for text in encoder.inputs)
     sparse_texts = [
@@ -114,8 +114,10 @@ def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak
         for call in client.calls
     ]
     assert sparse_texts == encoder.inputs
-    assert len(client.calls) == 6
+    assert len(client.calls) == 4
     assert len(result.retrieval_score_traces) == 2
+    assert result.query_payload["rrf_mode"] == "equal_weight"
+    assert result.query_payload["expanded_path_policy"] == "distinct_expanded_all_branches"
     assert result.retrieval_score_traces[0]["expert_id"] in {"1", "2"}
     assert {item["branch"] for item in result.retrieval_score_traces[0]["branch_matches"]} == {
         "basic",
@@ -208,4 +210,4 @@ def test_retriever_uses_active_sparse_runtime_model_for_builtin_queries():
         call["prefetch"][1].query.model
         for call in client.calls
     ]
-    assert sparse_models == ["Qdrant/bm25"] * 6
+    assert sparse_models == ["Qdrant/bm25"] * 4
