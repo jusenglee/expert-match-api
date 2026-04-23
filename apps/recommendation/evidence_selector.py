@@ -140,27 +140,19 @@ class KeywordEvidenceSelector:
         empty_candidate_ids: list[str] = []
 
         for candidate in candidates:
-            # 개별 브랜치에서 후보군 랭킹 (내부 limit는 넉넉히 유지)
             papers = self._rank_publications(candidate.top_papers, keywords)
             projects = self._rank_projects(candidate.top_projects, keywords)
             patents = self._rank_patents(candidate.top_patents, keywords)
-            
-            # 모든 증거를 합쳐서 매칭 점수순으로 최상위 3개만 엄선
-            # 이는 LLM(Reasoner)에게 노이즈 없는 핵심 데이터만 전달하기 위함임
-            top_evidence = sorted(
-                [*papers, *projects, *patents],
-                key=lambda item: -item.match_score
-            )[:3]
 
             bundle = RelevantEvidenceBundle(
                 expert_id=candidate.expert_id,
-                papers=[e for e in top_evidence if e.type == "paper"],
-                projects=[e for e in top_evidence if e.type == "project"],
-                patents=[e for e in top_evidence if e.type == "patent"],
+                papers=papers,
+                projects=projects,
+                patents=patents,
             )
             bundles[candidate.expert_id] = bundle
 
-            candidate_count = len(top_evidence)
+            candidate_count = len(bundle.all_items())
             if candidate_count == 0:
                 empty_candidate_ids.append(candidate.expert_id)
             candidate_evidence_counts.append(
@@ -174,7 +166,7 @@ class KeywordEvidenceSelector:
             )
 
         self.last_trace = {
-            "mode": "keyword_lexical_top3",
+            "mode": "keyword_lexical_branch_limits",
             "core_keywords": keywords,
             "candidate_evidence_counts": candidate_evidence_counts,
             "empty_candidate_ids": empty_candidate_ids,
@@ -209,6 +201,8 @@ class KeywordEvidenceSelector:
                 date_value=item.publication_year_month,
                 keywords=keywords,
             )
+            if not matched_keywords:
+                continue
             final_score = base_score + score
 
             ranked.append(
@@ -249,6 +243,8 @@ class KeywordEvidenceSelector:
                 date_value=item.project_end_date or item.project_start_date,
                 keywords=keywords,
             )
+            if not matched_keywords:
+                continue
             final_score = base_score + score
 
             ranked.append(
@@ -287,6 +283,8 @@ class KeywordEvidenceSelector:
                 date_value=item.registration_date or item.application_date,
                 keywords=keywords,
             )
+            if not matched_keywords:
+                continue
             final_score = base_score + score
 
             ranked.append(

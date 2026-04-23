@@ -19,10 +19,12 @@
 
 ### 2. 검색 및 추출 (Retrieval)
 
-`QueryTextBuilder`는 플래너의 `core_keywords`를 하나의 정제된 검색 쿼리로 결합합니다.
+`QueryTextBuilder`는 1단계 sparse 키워드 검색에는 `retrieval_core`/`core_keywords` 기반 쿼리를, 2단계 hybrid 검색에는 `semantic_query` 기반 쿼리를 생성합니다.
 
 `QdrantHybridRetriever`의 동작:
-- 각 브랜치(기본, 논문, 특허, 과제)별로 Dense + Sparse 검색 수행
+- 검색 모드는 `keyword_pool_then_hybrid`로 고정
+- 1단계에서 각 브랜치/경로별 sparse 키워드 검색을 수행하고 `basic_info.researcher_id` 후보 풀 수집
+- 2단계에서 후보 풀을 `basic_info.researcher_id MatchAny` 필터로 제한한 뒤 각 브랜치(기본, 논문, 특허, 과제)별 Dense + Sparse 검색 수행
 - RRF(Reciprocal Rank Fusion) 알고리즘을 통해 브랜치 내 결과 통합
 - 모든 브랜치의 결과를 다시 RRF로 최종 통합
 - 각 결과 항목에 브랜치별 매칭 근거(`retrieval_score_traces`) 기록
@@ -77,4 +79,10 @@
 - `retrieval_keywords`: 실제 검색에 사용된 키워드
 - `branch_queries`: 브랜치별 쿼리 내역
 - `retrieval_score_traces`: 검색 점수 근거
+- `query_payload.retrieval_mode`: 고정 2단계 검색 모드
+- `query_payload.keyword_stage_candidate_count`: 1차 sparse 키워드 검색에서 수집한 후보 ID 수
+- `query_payload.hybrid_stage_raw_branch_counts`: 2차 hybrid 검색의 branch/path별 raw hit 수
+- `query_payload.aggregated_candidate_count`: 최종 support rule 적용 전 집계 후보 수
+- `query_payload.support_pass_count` / `support_filtered_count`: support rule 통과/탈락 수
+- `server_logs`: Trace ID로 캡처된 사용자 질의, 플래너, 1차 검색, 2차 검색 단계별 운영 로그
 - `timers`: 구간별 실행 시간

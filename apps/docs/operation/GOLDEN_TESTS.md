@@ -117,9 +117,27 @@
   - trace exposes both the ids returned by the LLM and the ids actually available to the resolver
   - profile fallback is explainable from trace without relying on server logs
 
+### 16. Keyword pool then hybrid retrieval
+
+- Input: a query whose sparse keyword stage returns a narrower candidate pool than a direct hybrid search would return
+- Expected:
+  - sparse keyword retrieval runs before hybrid retrieval on every request
+  - hybrid retrieval is restricted to the keyword-stage `basic_info.researcher_id` pool
+  - candidates outside the keyword-stage pool are not returned even if they appear in the hybrid response
+  - trace exposes `query_payload.retrieval_mode="keyword_pool_then_hybrid"` and `keyword_stage_candidate_count`
+
+### 17. Step-by-step retrieval logging
+
+- Input: a normal `/recommend` or `/search/candidates` request
+- Expected:
+  - `trace.server_logs` includes user-query receipt, planner start/completion, retrieval start/completion, and candidate card build logs
+  - retriever logs include 1st-stage keyword search start/completion and 2nd-stage hybrid search start/completion
+  - `trace.query_payload` exposes branch/path counts and support pass/filter counts without logging vectors or full payloads
+
 ## Acceptance Criteria
 
-- Retrieval text is built only from planner `core_keywords`.
+- Sparse keyword retrieval text is built only from planner `retrieval_core`/`core_keywords`; hybrid retrieval may use planner `semantic_query` inside that keyword candidate pool.
+- Retrieval always uses the fixed `keyword_pool_then_hybrid` flow: sparse keyword candidate pool first, then hybrid RRF inside that pool.
 - `/search/candidates` preserves retrieval order.
 - `/recommend` preserves retrieval order for returned items.
 - `/recommend` sends only Top-k candidates to the LLM.
@@ -129,5 +147,6 @@
 - `/recommend` uses tool calling first, then one compact JSON retry, then deterministic server fallback.
 - `/recommend` resolves final `recommendation.evidence` from the LLM-selected relevant evidence ids.
 - `/recommend` generates a conservative fallback reason when the LLM omits a candidate or returns an empty reason.
-- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `reason_generation_trace.batches`, `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`, and candidate-level evidence resolution details needed to explain fallback.
+- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.batches`, `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`, and candidate-level evidence resolution details needed to explain fallback.
+- Server logs must summarize user query, planner, 1st-stage keyword retrieval, and 2nd-stage hybrid retrieval without printing LLM raw responses, dense vectors, or full Qdrant payloads.
 - Legacy verifier, multi-view retrieval, judge, and evidence-resolver traces are no longer part of the active contract.

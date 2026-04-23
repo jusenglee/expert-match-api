@@ -48,6 +48,10 @@ def _normalize_string_list(values: list[str] | None) -> list[str]:
     return normalized_values
 
 
+def _sorted_filter_keys(filters: dict[str, Any] | None) -> list[str]:
+    return sorted((filters or {}).keys())
+
+
 class HeuristicPlanner:
     """Deterministic fallback planner used when LLM planning is unavailable."""
 
@@ -64,6 +68,14 @@ class HeuristicPlanner:
         top_k: int | None = None,
     ) -> PlannerOutput:
         normalized_query = " ".join(query.split())
+        logger.info(
+            "플래너 내부 시작: mode=heuristic query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d filter_keys=%s",
+            len(normalized_query),
+            top_k,
+            len(include_orgs or []),
+            len(exclude_orgs or []),
+            _sorted_filter_keys(filters_override),
+        )
         output = PlannerOutput(
             intent_summary=normalized_query,
             hard_filters=dict(filters_override or {}),
@@ -84,6 +96,11 @@ class HeuristicPlanner:
             "retrieval_keywords": [],
             "attempts": [],
         }
+        logger.info(
+            "플래너 내부 완료: mode=heuristic keywords=0 filters=%s top_k=%d",
+            _sorted_filter_keys(output.hard_filters),
+            output.top_k,
+        )
         return output
 
 
@@ -245,12 +262,25 @@ class OpenAICompatPlanner:
     ) -> PlannerOutput:
         normalized_query = " ".join(query.split())
         filters = filters_override or {}
+        logger.info(
+            "플래너 내부 시작: mode=openai_compat query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d filter_keys=%s",
+            len(normalized_query),
+            top_k,
+            len(include_orgs or []),
+            len(exclude_orgs or []),
+            _sorted_filter_keys(filters),
+        )
 
         # 1. L1 캐시 조회
         if self.cache:
             cached_output = self.cache.get(normalized_query, filters, PLANNER_VERSION)
             if cached_output:
-                logger.info("Planner cache hit: query=%r", normalized_query)
+                logger.info(
+                    "플래너 캐시 적중: version=%s query_chars=%d filter_keys=%s",
+                    PLANNER_VERSION,
+                    len(normalized_query),
+                    _sorted_filter_keys(filters),
+                )
                 output = self._apply_request_constraints(
                     output=cached_output,
                     normalized_query=normalized_query,
@@ -268,6 +298,14 @@ class OpenAICompatPlanner:
                     "retrieval_keywords": list(output.retrieval_core),
                     "removed_role_terms": list(output.role_terms + output.action_terms),
                 }
+                logger.info(
+                    "플래너 내부 완료: mode=cache_hit keywords=%d role_terms=%d action_terms=%d filters=%s top_k=%d",
+                    len(output.retrieval_core),
+                    len(output.role_terms),
+                    len(output.action_terms),
+                    _sorted_filter_keys(output.hard_filters),
+                    output.top_k,
+                )
                 return output
 
         # 2. 캐시 미스 시 LLM 호출
@@ -283,9 +321,11 @@ class OpenAICompatPlanner:
         for attempt_index in range(MAX_PLANNER_ATTEMPTS):
             seed = build_deterministic_seed("planner", payload, attempt_index)
             logger.info(
-                "LLM planning start: query=%s attempt=%d",
-                normalized_query,
+                "플래너 LLM 시도 시작: attempt=%d seed=%d query_chars=%d filter_keys=%s",
                 attempt_index + 1,
+                seed,
+                len(normalized_query),
+                _sorted_filter_keys(filters),
             )
             try:
                 output, parsed_payload, raw_response = await self._invoke_json_output(
@@ -309,6 +349,15 @@ class OpenAICompatPlanner:
                     "planner_keywords": list(output.retrieval_core),
                 }
                 attempts.append(attempt_trace)
+                logger.info(
+                    "플래너 LLM 시도 완료: attempt=%d status=ok keywords=%d role_terms=%d action_terms=%d bundles=%d filters=%s",
+                    attempt_index + 1,
+                    len(output.retrieval_core),
+                    len(output.role_terms),
+                    len(output.action_terms),
+                    len(output.bundle_ids),
+                    _sorted_filter_keys(output.hard_filters),
+                )
 
                 if output.retrieval_core:
                     self.last_trace = {
@@ -328,21 +377,23 @@ class OpenAICompatPlanner:
                         self.cache.set(normalized_query, filters, PLANNER_VERSION, output)
 
                     logger.info(
-                        "LLM planning success: intent=%r keywords=%d include_orgs=%d exclude_orgs=%d filters=%r",
+                        "플래너 내부 완료: mode=openai_compat intent=%r keywords=%d semantic_query=%s include_orgs=%d exclude_orgs=%d filters=%s top_k=%d",
                         output.intent_summary,
                         len(output.retrieval_core),
+                        bool(output.semantic_query),
                         len(output.include_orgs),
                         len(output.exclude_orgs),
-                        output.hard_filters,
+                        _sorted_filter_keys(output.hard_filters),
+                        output.top_k,
                     )
                     return output
 
                 attempt_trace["status"] = "empty_keywords"
                 attempt_trace["reason"] = "planner_retrieval_core_empty"
                 logger.warning(
-                    "Planner returned empty retrieval_core: query=%s attempt=%d",
-                    normalized_query,
+                    "플래너 LLM 시도 결과 키워드 없음: attempt=%d query_chars=%d",
                     attempt_index + 1,
+                    len(normalized_query),
                 )
             except Exception as exc:
                 attempts.append(
@@ -354,16 +405,15 @@ class OpenAICompatPlanner:
                     }
                 )
                 logger.warning(
-                    "Planner attempt failed: query=%s attempt=%d reason=%s",
-                    normalized_query,
+                    "플래너 LLM 시도 실패: attempt=%d reason=%s",
                     attempt_index + 1,
                     exc,
                 )
 
         # 3. 모든 시도 실패 시 Fallback 1: 역할어 제거 후 Broad Search
         logger.warning(
-            "Planner fallback activated: query=%s attempts=%d",
-            normalized_query,
+            "플래너 fallback 활성화: query_chars=%d attempts=%d",
+            len(normalized_query),
             len(attempts),
         )
         
@@ -407,4 +457,11 @@ class OpenAICompatPlanner:
             "reason": "planner_retry_exhausted_or_empty",
             "attempts": attempts,
         }
+        logger.info(
+            "플래너 내부 완료: mode=fallback_broad_search keywords=%d removed_terms=%d filters=%s top_k=%d",
+            len(fallback_keywords),
+            len(last_role_terms + last_action_terms),
+            _sorted_filter_keys(fallback_output.hard_filters),
+            fallback_output.top_k,
+        )
         return fallback_output

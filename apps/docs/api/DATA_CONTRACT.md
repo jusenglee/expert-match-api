@@ -30,14 +30,20 @@
 **현재 동작:**
 - 원본 사용자 질의는 검색 텍스트로 사용하지 않습니다.
 - `intent_summary` 및 `task_terms`는 검색 텍스트에서 제외됩니다.
-- 검색 텍스트는 `core_keywords`를 줄바꿈(`\n`)으로 결합하여 생성합니다.
-- 4개의 모든 브랜치(기본, 논문, 특허, 과제)는 동일한 검색 텍스트를 수신합니다.
+- 1단계 sparse 키워드 검색 텍스트는 `retrieval_core` 또는 `core_keywords`를 결합하여 생성합니다.
+- 2단계 hybrid 검색 텍스트는 `semantic_query`가 있으면 이를 사용하고, 없으면 동일한 키워드 텍스트를 사용합니다.
+- 4개의 모든 브랜치(기본, 논문, 특허, 과제)는 stage별로 동일한 기본 텍스트와 branch hint를 수신합니다.
 
 ## 검색 규약 (Retrieval Contract)
 
 `QdrantHybridRetriever`는 항상 `basic`, `art`, `pat`, `pjt` 4개 브랜치를 검색합니다.
 
 **브랜치별 동작:**
+- 검색 모드는 `keyword_pool_then_hybrid`로 고정합니다.
+- 1단계는 항상 sparse 키워드 검색을 먼저 실행하고 `basic_info.researcher_id` 후보 풀을 중복 없이 수집합니다.
+- 2단계는 후보 풀을 `basic_info.researcher_id MatchAny` payload 필터로 제한한 뒤 Dense + Sparse 하이브리드 RRF를 실행합니다.
+- 1단계에서 유효한 후보 ID가 없으면 2단계 하이브리드는 실행하지 않고 빈 결과와 `keyword_stage_candidate_count=0` trace를 반환합니다.
+- `trace.query_payload`는 1차 후보 수, 1차 branch/path별 count, 2차 branch/path별 raw count, 집계 후보 수, support rule 통과/탈락 수를 포함합니다.
 - Dense 검색: 브랜치별 밀집 벡터 공간에서 수행
 - Sparse 검색: BM25 알고리즘을 사용하여 희소 벡터 공간에서 수행
 - RRF 결합: 브랜치 내에서 Dense와 Sparse 결과를 통합

@@ -15,41 +15,76 @@ class CompiledBranchQueries:
     stable: str
     expanded: str
 
+    def startswith(self, prefix: str) -> bool:
+        return self.stable.startswith(prefix)
+
+    def __contains__(self, value: str) -> bool:
+        return value in self.stable
+
+    def __str__(self) -> str:
+        return self.stable
+
 
 class QueryTextBuilder:
     def build_branch_queries(self, query: str, plan: PlannerOutput) -> dict[str, CompiledBranchQueries]:
         """
         플랜 정보를 바탕으로 각 브랜치(basic, art, pat, pjt)의 Stable 및 Expanded 쿼리를 생성합니다.
         """
-        # Stable: Planner가 추출한 핵심 기술어 (모든 브랜치 공통 기준축)
-        stable_base = " ".join(plan.retrieval_core) if plan.retrieval_core else query
-        
+        stable_base = plan.semantic_query.strip() or self.build_keyword_query_text(query, plan)
+        return self._build_queries_from_base(stable_base, plan)
+
+    def build_keyword_branch_queries(
+        self, query: str, plan: PlannerOutput
+    ) -> dict[str, CompiledBranchQueries]:
+        """Sparse keyword-first stage에서 사용할 브랜치별 쿼리를 생성합니다."""
+        return self._build_queries_from_base(
+            self.build_keyword_query_text(query, plan),
+            plan,
+        )
+
+    def build_keyword_query_text(self, query: str, plan: PlannerOutput) -> str:
+        keywords = plan.retrieval_core or plan.core_keywords
+        if keywords:
+            return " ".join(keywords)
+        return query.strip()
+
+    def _build_queries_from_base(
+        self,
+        stable_base: str,
+        plan: PlannerOutput,
+    ) -> dict[str, CompiledBranchQueries]:
         results = {}
         branches = ["basic", "art", "pat", "pjt"]
-        
+
         for branch in branches:
             # 1. Stable Path 구축
             stable_text = self._compose_stable(stable_base, branch)
-            
+
             # 2. Expanded Path 구축 (Shadow Mode용)
             expanded_keywords = get_expanded_keywords(plan.bundle_ids, branch)
             expanded_base = stable_base
             if expanded_keywords:
                 expanded_base = stable_base + " " + " ".join(expanded_keywords)
-            
+
             expanded_text = self._compose_expanded(expanded_base, branch)
-            
+
             results[branch] = CompiledBranchQueries(
                 stable=stable_text,
                 expanded=expanded_text
             )
-            
+
         return results
 
     def build_query_text(self, plan: PlannerOutput) -> str:
         """전체 검색 맥락을 대표하는 텍스트를 생성합니다. (UI/Trace용)"""
-        if plan.retrieval_core:
-            return " ".join(plan.retrieval_core)
+        keywords = plan.retrieval_core or plan.core_keywords
+        parts = []
+        if keywords:
+            parts.append(" ".join(keywords))
+        if plan.semantic_query:
+            parts.append(plan.semantic_query)
+        if parts:
+            return " ".join(parts)
         return plan.intent_summary
 
     @staticmethod

@@ -66,6 +66,26 @@ def _normalize_query_text(query: str) -> str:
     return ", ".join(line.strip() for line in query.splitlines() if line.strip())
 
 
+def _log_api_query_received(
+    *,
+    endpoint: str,
+    raw_query: str,
+    normalized_query: str,
+    request: RecommendationRequest,
+) -> None:
+    logger.info(
+        "사용자 질의 수신: endpoint=%s raw_chars=%d normalized_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d filter_keys=%s query=%r",
+        endpoint,
+        len(raw_query),
+        len(normalized_query),
+        request.top_k,
+        len(request.include_orgs),
+        len(request.exclude_orgs),
+        sorted(request.filters_override.keys()),
+        normalized_query,
+    )
+
+
 def build_dense_encoder(settings: Settings):
     """
     설정에 따라 적절한 Dense Encoder(임베딩 엔진)를 생성합니다.
@@ -332,6 +352,12 @@ def create_app(
     async def recommend(request: RecommendationRequest) -> RecommendationResponse:
         service = get_service()
         normalized_query = _normalize_query_text(request.query)
+        _log_api_query_received(
+            endpoint="/recommend",
+            raw_query=request.query,
+            normalized_query=normalized_query,
+            request=request,
+        )
         result = await service.recommend(
             query=normalized_query,
             filters_override=request.filters_override,
@@ -352,6 +378,12 @@ def create_app(
     ) -> SearchCandidatesResponse:
         service = get_service()
         normalized_query = _normalize_query_text(request.query)
+        _log_api_query_received(
+            endpoint="/search/candidates",
+            raw_query=request.query,
+            normalized_query=normalized_query,
+            request=request,
+        )
         result = await service.search_candidates(
             query=normalized_query,
             filters_override=request.filters_override,

@@ -19,6 +19,7 @@
 | 2026-04-15 | `b9084c4` | 주요 변경 | `/recommend.recommendations[*]`의 핵심 사유 필드가 `reasons: list[str]`에서 `recommendation_reason: str`로 바뀌었습니다. 동시에 `trace.judge_trace`, `trace.evidence_resolution_trace`, `trace.recommendation_evidence_summary`, `trace.final_reduce_*`, `trace.planner_raw_keywords`, `trace.verifier_*`가 제거되고, `trace.reason_generation_trace`, `trace.planner_keywords`, `trace.recommendation_ids`, `trace.final_sort_policy`, `trace.top_k_used`가 추가되었습니다. 또한 `/search/candidates`는 이 시점부터 요청의 `top_k`를 실제 응답 개수 제한에 반영합니다. |
 | 2026-04-15 | `8c4b8e7` | 하위 호환 | 구 프런트 호환을 위해 `/recommend.recommendations[*].reasons`가 계산 필드 alias로 다시 제공되었습니다. 기본 계약은 여전히 `recommendation_reason`이며, `reasons`는 구형 소비자 보호용입니다. 같은 시점에 `trace.reason_generation_trace.evidence_selection`이 중첩 추적으로 추가되었습니다. |
 | 2026-04-15 | `3c9bceb` | 주요 변경 | `/search/candidates.candidates[*].branch_coverage`가 `branch_presence_flags`로 이름이 바뀌었습니다. `/search/candidates.trace`에는 `retrieval_score_traces`와 `final_sort_policy`가 추가되어, 최종 점수와 branch 매칭 근거를 외부에서 직접 볼 수 있게 되었습니다. |
+| 2026-04-23 | `pending` | 확장 | 검색 동작이 고정 2단계(`keyword_pool_then_hybrid`)로 바뀌었습니다. 외부 최상위 스키마는 유지되지만 `trace.query_payload`에서 `retrieval_mode`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다. 같은 변경에서 `trace.server_logs`에는 사용자 질의, 플래너, 1차 검색, 2차 검색 단계별 요약 로그가 포함됩니다. |
 
 ## 변경 상세
 
@@ -44,7 +45,7 @@
 ### 4. `trace`는 디버그 계약이며, 2026-04-15에 한 번 크게 재편됨
 
 - 제거된 축: `judge_trace`, `evidence_resolution_trace`, `final_reduce_*`, `verifier_*`
-- 추가된 축: `reason_generation_trace`, `retrieval_score_traces`, `recommendation_ids`, `final_sort_policy`, `top_k_used`
+- 추가된 축: `reason_generation_trace`, `retrieval_score_traces`, `recommendation_ids`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`
 - 소비자 영향: 운영 UI가 `trace`를 강하게 파싱한다면, 이 변경점을 기준으로 버전 분기 또는 방어 코드를 둬야 합니다.
 
 ## 현재 기준 호환성 메모
