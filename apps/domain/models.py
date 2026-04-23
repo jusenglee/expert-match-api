@@ -223,6 +223,7 @@ class PlannerOutput(BaseModel):
     LLM 기반 플래너가 사용자 검색 쿼리를 분석하여 추출한 검색 의도(Intent) 및 각종 키워드/필터 조건들을 담는 데이터 모델입니다.
     이후 검색(Retriever)과 추천 사유 생성(Reasoner) 단계의 핵심 가이드라인으로 사용됩니다.
     """
+    reasoning: str = Field(default="", description="LLM의 CoT(Chain-of-Thought) 중간 사고 과정을 담는 필드입니다.")
     intent_summary: str
     hard_filters: dict[str, Any] = Field(default_factory=dict)
     include_orgs: list[str] = Field(default_factory=list)
