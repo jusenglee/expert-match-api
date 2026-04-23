@@ -1,130 +1,152 @@
 # Golden Tests
 
-## Required Scenarios
+## Scenarios
 
-### 1. Meta-term removal
+### 1. Pure keyword extraction
 
-Input:
+- Input: a natural-language recommendation query with request-role wording
+- Expected:
+  - planner extracts only domain `core_keywords`
+  - request-role wording stays out of retrieval text
 
-- `AI 반도체 평가위원 추천`
+### 2. Explicit Top-k priority
 
-Expected:
+- Input: a query plus explicit `top_k`
+- Expected:
+  - explicit `top_k` wins over any count implied in natural language
+  - `/recommend` returns exactly that Top-k count
 
-- `평가위원`, `추천` only appear in `removed_meta_terms`
-- `retrieval_core` contains only domain terms
-- raw meta terms are not re-injected into sparse retrieval text
+### 3. Search ordering stability
 
-### 2. Dense vs sparse query split
+- Input: a query that produces equal RRF scores for at least two hits
+- Expected:
+  - final order uses `score desc`
+  - score ties are broken by `name asc`
 
-Input:
+### 4. Search vs recommend split
 
-- planner returns both `retrieval_core` and `semantic_query`
+- Input: a query without explicit candidate limit
+- Expected:
+  - `/search/candidates` returns the full retrieval-ordered candidate set
+  - `/recommend` returns only ordered Top-k
 
-Expected:
+### 5. Reason generation does not rerank
 
-- dense retrieval uses `semantic_query`
-- sparse retrieval uses `retrieval_core`
-- query trace records the dense/sparse base source
+- Input: a query with several strong candidates
+- Expected:
+  - only ordered Top-k candidates are sent to the LLM
+  - returned recommendations keep the exact retrieval order
 
-### 3. Deterministic must-aspect pruning
+### 6. Retrieval skipped on empty planner keywords
 
-Input:
+- Input: a query whose planner cannot produce safe `core_keywords`
+- Expected:
+  - Qdrant retrieval is skipped
+  - `retrieval_skipped_reason` is present in trace
+  - `recommendations=[]`
 
-- `retrieval_core = ["의료영상 분석", "AI 기반", "기술"]`
-- `must_aspects = ["의료영상 분석", "AI 기반", "기술 개발"]`
+### 7. Payload-backed evidence
 
-Expected:
+- Input: a query whose recommended candidate has publications or projects
+- Expected:
+  - final evidence comes from payload-backed preview data
+  - evidence is deterministic and does not depend on LLM post-selection
 
-- `must_aspects` is pruned to the domain-specific phrases only
-- generic phrases such as `AI 기반`, `기술 개발` do not survive as hard gates
+### 8. Relevant evidence selection for reasons
 
-### 4. Contextual evaluation phrase handling
+- Input: a query whose recommended candidate has both newer irrelevant evidence and older relevant evidence
+- Expected:
+  - `/recommend` still preserves candidate retrieval order
+  - reason generation receives only query-relevant evidence
+  - newer but irrelevant evidence is not used as direct grounding for `recommendation_reason`
 
-Input:
+### 9. LLM-selected evidence alignment
 
-- `AI 기반 의료영상 과제를 평가할 수 있는 전문가 추천`
+- Input: a query whose recommended candidate has multiple relevant evidence items
+- Expected:
+  - the LLM receives a bounded per-candidate evidence pool
+  - the LLM returns `selected_evidence_ids` from that pool
+  - final `recommendation.evidence` resolves from those selected ids instead of latest preview data
+  - invalid or empty evidence selections fall back deterministically
 
-Expected:
+### 10. Batched reason generation and server fallback
 
-- `과제 평가` does not remain in `must_aspects`
-- `intent_flags.review_context == true`
-- `intent_flags.review_targets == ["과제 평가"]`
+- Input: a query whose `/recommend` Top-k is larger than 5 and whose LLM output omits or empties some candidates
+- Expected:
+  - reason generation runs in sequential batches of up to 5 candidates
+  - returned recommendations still preserve the original retrieval order
+  - omitted or empty reason candidates receive a conservative server fallback reason
+  - trace exposes per-batch candidate ids and server fallback targets
 
-### 5. Phrase-based coverage threshold
+### 11. Broad raw candidate context in LLM prompt
 
-Input:
+- Input: a query with returned recommendation candidates
+- Expected:
+  - the LLM payload includes the bounded relevant evidence pool
+  - the same payload also includes broad raw candidate context such as retrieval grounding, evaluation activities, and full paper/project/patent summaries for the Top-k candidates
+  - external API response shape remains unchanged
 
-- `evidence_aspects = ["medical imaging analysis", "의료영상 분석"]`
+### 12. Retrieval score provenance trace
 
-Expected:
+- Input: a query with returned candidates
+- Expected:
+  - trace exposes `retrieval_score_traces`
+  - each trace item identifies the returned expert and matched branch list
+  - playground can display the primary retrieval branch and branch-local match ranks
 
-- coverage threshold is `min(2, 2) = 2`, not token-count based
-- threshold uses `evidence_aspects` length when available, not `must_aspects`
+### 13. Tool-calling reason generation with retry
 
-### 6. Selector / validator scope alignment
+- Input: a `/recommend` query whose first reason-generation attempt fails to return usable structured output
+- Expected:
+  - the service first attempts tool-calling structured output
+  - one smaller-payload retry is attempted before server fallback
+  - trace exposes per-batch `mode`, `retry_count`, `returned_ratio`, `prompt_budget_mode`, `trim_applied`, and `attempts`
 
-Input:
+### 14. Relevant evidence pool policy
 
-- selector matches an aspect in evidence `snippet` or `detail`, not in title
+- Input: a candidate with many matching papers, projects, and patents
+- Expected:
+  - evidence selection caps the relevant pool at `10` papers, `10` projects, and `10` patents
+  - final `recommendation.evidence` still resolves from the selected ids or deterministic fallback
 
-Expected:
+### 15. Evidence id contract and resolve trace
 
-- validator does not false-fallback on title-only grounds
+- Input: a recommendation response where the model returns invalid-format ids or ids not present in the candidate pool
+- Expected:
+  - invalid-format ids are recorded separately from unresolved-but-well-formed ids
+  - trace exposes both the ids returned by the LLM and the ids actually available to the resolver
+  - profile fallback is explainable from trace without relying on server logs
 
-### 7. Partial batch retry
+### 16. Keyword pool then hybrid retrieval
 
-Input:
+- Input: a query whose sparse keyword stage returns a narrower candidate pool than a direct hybrid search would return
+- Expected:
+  - sparse keyword retrieval runs before hybrid retrieval on every request
+  - hybrid retrieval is restricted to the keyword-stage `basic_info.researcher_id` pool
+  - candidates outside the keyword-stage pool are not returned even if they appear in the hybrid response
+  - trace exposes `query_payload.retrieval_mode="keyword_pool_then_hybrid"` and `keyword_stage_candidate_count`
 
-- first reasoner batch returns partial output
+### 17. Step-by-step retrieval logging
 
-Expected:
-
-- one compact retry occurs
-- unresolved candidates only then fall back to server-generated reasons
-
-### 8. Future-dated projects
-
-Input:
-
-- direct-match project evidence with a future end date
-
-Expected:
-
-- evidence remains eligible
-- trace includes `future_selected_evidence_ids`
-
-### 9. Bilingual evidence_aspects matching
-
-Input:
-
-- `query = "AI 기반 의료영상 분석 과제 평가 전문가 추천"`
-- researcher with English paper titles/abstracts about medical image analysis
-
-Expected:
-
-- `evidence_aspects` includes both Korean (`의료영상 분석`) and English (`medical image analysis`) terms
-- English paper titles/abstracts matched via `evidence_aspects` English terms
-- `aspect_source = "evidence_aspects"` in selector trace
-- `direct_match_count > 0` for matching researcher
-
-### 10. evidence_aspects fallback to must_aspects
-
-Input:
-
-- LLM-generated `PlannerOutput` with empty `evidence_aspects`
-
-Expected:
-
-- selector falls back to `must_aspects` automatically
-- `aspect_source = "must_aspects"` in selector trace
-- no error; behavior identical to pre-v0.7.0 pipeline
+- Input: a normal `/recommend` or `/search/candidates` request
+- Expected:
+  - `trace.server_logs` includes user-query receipt, planner start/completion, retrieval start/completion, and candidate card build logs
+  - retriever logs include 1st-stage keyword search start/completion and 2nd-stage hybrid search start/completion
+  - `trace.query_payload` exposes branch/path counts and support pass/filter counts without logging vectors or full payloads
 
 ## Acceptance Criteria
 
-- equal-weight RRF only
-- stable / expanded path model remains two-path
-- dense/sparse query split is visible in trace
-- contextual evaluation phrases are intent flags, not hard lexical gates
-- gate and validator use the same phrase/evidence scope assumptions
-- `evidence_aspects` is bilingual; `retrieval_core` and `must_aspects` are Korean-only
-- selector `aspect_source` trace field is present and correct
+- Sparse keyword retrieval text is built only from planner `retrieval_core`/`core_keywords`; hybrid retrieval may use planner `semantic_query` inside that keyword candidate pool.
+- Retrieval always uses the fixed `keyword_pool_then_hybrid` flow: sparse keyword candidate pool first, then hybrid RRF inside that pool.
+- `/search/candidates` preserves retrieval order.
+- `/recommend` preserves retrieval order for returned items.
+- `/recommend` sends only Top-k candidates to the LLM.
+- `/recommend` re-ranks candidate-internal evidence against planner `core_keywords` before LLM reason generation.
+- `/recommend` builds a relevant evidence pool capped at `10/10/10` before LLM reason generation.
+- `/recommend` batches reason generation in groups of up to 5 candidates.
+- `/recommend` uses tool calling first, then one compact JSON retry, then deterministic server fallback.
+- `/recommend` resolves final `recommendation.evidence` from the LLM-selected relevant evidence ids.
+- `/recommend` generates a conservative fallback reason when the LLM omits a candidate or returns an empty reason.
+- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.batches`, `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`, and candidate-level evidence resolution details needed to explain fallback.
+- Server logs must summarize user query, planner, 1st-stage keyword retrieval, and 2nd-stage hybrid retrieval without printing LLM raw responses, dense vectors, or full Qdrant payloads.
+- Legacy verifier, multi-view retrieval, judge, and evidence-resolver traces are no longer part of the active contract.

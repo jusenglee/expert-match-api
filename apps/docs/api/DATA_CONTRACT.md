@@ -1,204 +1,87 @@
-# Data Contract
+# 데이터 규약 (Data Contract)
 
-## Planner Output
+## 플래너 출력 (Planner Output)
 
-`PlannerOutput` is the shared contract between planning, retrieval, evidence selection, and recommendation assembly.
+`PlannerOutput`은 플래너와 검색 엔진 사이의 구조화된 규약입니다.
 
 ```json
 {
-  "intent_summary": "AI 기반 의료영상 분석 기술 개발 과제 추천",
+  "intent_summary": "드론 화재 진압 전문가 찾기",
   "hard_filters": {},
   "include_orgs": [],
   "exclude_orgs": [],
-  "task_terms": [],
-  "core_keywords": ["의료영상 분석", "AI 기반", "기술"],
-  "retrieval_core": ["의료영상 분석", "AI 기반", "기술"],
-  "must_aspects": ["의료영상 분석"],
-  "generic_terms": ["경험"],
-  "role_terms": ["전문가"],
-  "action_terms": ["추천"],
-  "bundle_ids": [],
-  "intent_flags": {
-    "review_context": true,
-    "review_targets": ["과제 평가"]
-  },
-  "semantic_query": "AI 기반 의료영상 분석 기술 개발 과제",
+  "task_terms": ["전문가 추천"],
+  "core_keywords": ["화재 진압", "드론"],
   "top_k": 5
 }
 ```
 
-## Active Meanings
+**플래너 규칙:**
+- 하나의 JSON 객체만 반환합니다.
+- `core_keywords`는 검색에 안전한 도메인 명사 또는 명사구만 포함합니다.
+- `task_terms`는 요청의 목적이나 액션 관련 용어만 포함합니다.
+- 명시적인 요청 파라미터는 자연어 추출 결과보다 우선합니다.
+- 출력값이 유효하지 않거나 키워드가 비어있으면 1회 재시도합니다.
 
-- `retrieval_core` is the sparse / lexical retrieval basis (Korean-only).
-- `core_keywords` remains a compatibility alias of `retrieval_core`.
-- `semantic_query` is a dense-only natural-language query.
-- `must_aspects` is the Korean-only semantic quality description and evidence gate fallback. No longer the primary gate basis when `evidence_aspects` is present.
-- `evidence_aspects` is the bilingual (Korean + English) evidence matching basis. Takes priority over `must_aspects` in the evidence selector and shortlist gate. See the Evidence Aspects Contract section below.
-- `intent_flags.review_context` and `intent_flags.review_targets` capture review/evaluation context such as `과제 평가`, `기술 평가`, `논문 평가`.
-- Meta request terms such as `평가위원`, `전문가`, `추천` do not remain in `retrieval_core`, `must_aspects`, or `evidence_aspects`.
+## 쿼리 빌더 규약 (Query Builder Contract)
 
-## Evidence Aspects Contract
+`QueryTextBuilder`는 플래너 출력을 바탕으로 단일 검색 쿼리를 생성합니다.
 
-`evidence_aspects` is a new bilingual field in `PlannerOutput` (planner v0.7.0+).
+**현재 동작:**
+- 원본 사용자 질의는 검색 텍스트로 사용하지 않습니다.
+- `intent_summary` 및 `task_terms`는 검색 텍스트에서 제외됩니다.
+- 1단계 sparse 키워드 검색 텍스트는 `retrieval_core` 또는 `core_keywords`를 결합하여 생성합니다.
+- 2단계 hybrid 검색 텍스트는 `semantic_query`가 있으면 이를 사용하고, 없으면 동일한 키워드 텍스트를 사용합니다.
+- 4개의 모든 브랜치(기본, 논문, 특허, 과제)는 stage별로 동일한 기본 텍스트와 branch hint를 수신합니다.
 
+## 검색 규약 (Retrieval Contract)
+
+`QdrantHybridRetriever`는 항상 `basic`, `art`, `pat`, `pjt` 4개 브랜치를 검색합니다.
+
+**브랜치별 동작:**
+- 검색 모드는 `keyword_pool_then_hybrid`로 고정합니다.
+- 1단계는 항상 sparse 키워드 검색을 먼저 실행하고 `basic_info.researcher_id` 후보 풀을 중복 없이 수집합니다.
+- 2단계는 후보 풀을 `basic_info.researcher_id MatchAny` payload 필터로 제한한 뒤 Dense + Sparse 하이브리드 RRF를 실행합니다.
+- 1단계에서 유효한 후보 ID가 없으면 2단계 하이브리드는 실행하지 않고 빈 결과와 `keyword_stage_candidate_count=0` trace를 반환합니다.
+- `trace.query_payload`는 1차 후보 수, 1차 branch/path별 count, 2차 branch/path별 raw count, 집계 후보 수, support rule 통과/탈락 수를 포함합니다.
+- Dense 검색: 브랜치별 밀집 벡터 공간에서 수행
+- Sparse 검색: BM25 알고리즘을 사용하여 희소 벡터 공간에서 수행
+- RRF 결합: 브랜치 내에서 Dense와 Sparse 결과를 통합
+- 최상위 RRF: 모든 브랜치의 결과를 하나로 통합
+
+## 후보자 카드 규약 (Candidate Card Contract)
+
+`CandidateCard`는 내부 검색 결과 규약으로, `/search/candidates`와 `/recommend`에서 공통으로 사용됩니다.
+
+**주요 특징:**
+- 카드 순서는 검색 엔진의 정렬 순서를 엄격히 따릅니다.
+- `rank_score`는 검색 점수를 정규화한 값입니다.
+- `/recommend` 단계 이전에 각 후보자의 증빙 자료(논문, 특허, 과제)를 미리보기 형태로 포함합니다.
+
+## 추천 사유 생성 규약 (Reason Generation Contract)
+
+`OpenAICompatReasonGenerator`는 정렬된 상위 K명의 후보자 정보만 수신합니다.
+
+**출력 스키마:**
 ```json
 {
-  "retrieval_core":    ["의료영상 분석", "AI 기반 의료영상"],
-  "must_aspects":      ["의료영상 분석"],
-  "evidence_aspects":  ["의료영상 분석", "medical image analysis",
-                        "딥러닝", "deep learning",
-                        "영상 진단", "image segmentation"]
+  "items": [
+    {
+      "expert_id": "11008395",
+      "fit": "높음",
+      "recommendation_reason": "화재 대응 관련 논문 및 과제 수행 이력이 다수 존재함.",
+      "selected_evidence_ids": ["paper:0", "project:1"],
+      "risks": []
+    }
+  ],
+  "data_gaps": []
 }
 ```
 
-Field responsibilities:
-
-- `retrieval_core`: Korean-only, for sparse BM25 retrieval query.
-- `must_aspects`: Korean-only, for semantic quality description and fallback.
-- `evidence_aspects`: **Bilingual** (Korean + English), for direct evidence text matching.
-
-The evidence selector prefers `evidence_aspects` over `must_aspects`. If empty, it falls back to `must_aspects → retrieval_core → core_keywords`.
-
-The shortlist gate's `_required_aspect_coverage` computes the threshold from the same priority chain the selector uses: `evidence_aspects → must_aspects → retrieval_core → core_keywords`. Threshold = `min(2, len(target_aspects))`.
-
-### Evidence selector search scope by item type
-
-| Item type | Title field searched | Body fields searched |
-|---|---|---|
-| paper | `publication_title` | `abstract`, `journal_name`, `korean_keywords`, `english_keywords` |
-| project | `display_title` (Korean-first) | `project_title_english` (supplement), `research_objective_summary`, `research_content_summary`, `managing_agency` |
-| patent | `intellectual_property_title` | `application_registration_type`, `application_country` |
-
-`project_title_english` is added to body_parts so that English evidence_aspects can match English project titles even when the Korean title takes precedence in display_title.
-
-## Query Builder Contract
-
-`QueryTextBuilder` compiles two modalities per branch:
-
-- `stable_dense`
-- `stable_sparse`
-- `expanded_dense`
-- `expanded_sparse`
-
-The public `stable` / `expanded` strings remain sparse-oriented summaries for trace compatibility.
-
-Priority rules:
-
-- Sparse base: `retrieval_core -> core_keywords -> raw query`
-- Dense base: `semantic_query -> retrieval_core -> core_keywords -> raw query`
-
-Path model:
-
-- Stable path: `stable_dense + stable_sparse`
-- Expanded path: only the modality that actually changed is expanded; the other modality reuses the stable value
-
-Branch context model:
-
-- Branch hints are **not** appended to query text inside QueryTextBuilder.
-- Branch context is carried exclusively by the branch-specific instruct prefix in `QdrantHybridRetriever`.
-- This keeps query text clean for embedding (no awkward `keyword_list\nbranch_hints` suffix).
-
-Expansion policy for dense when `semantic_query` is active:
-
-- Expanded keywords are **not** appended to `semantic_query`-based dense text.
-- Appending technical keyword suffixes to a natural-language sentence degrades embedding quality.
-- Expansion applies only to the sparse modality when `dense_base_source == "semantic_query"`.
-
-## Evidence Selector Contract
-
-`KeywordEvidenceSelector` selects only direct-match evidence.
-
-Selection rules:
-
-- direct lexical match only
-- dedup key: `normalized title + year`
-- max `2` items per aspect
-- max `4` total items per candidate
-- future-dated projects are allowed
-
-Output bundle fields:
-
-- `matched_aspects`
-- `matched_generic_terms`
-- `direct_match_count`
-- `aspect_coverage`
-- `generic_only`
-- `dedup_dropped_count`
-- `future_selected_evidence_ids`
-
-`aspect_coverage` is phrase-based, not token-count based.
-
-## Recommendation Contract
-
-`RecommendationDecision` is assembled by the server.
-
-- `evidence` comes from server-selected evidence only
-- `recommendation_reason` may come from the LLM or a server fallback
-- `fit` remains the LLM summary label, but quality control is enforced by retrieval and deterministic gates
-
-LLM input per candidate includes both `selected_evidence` and `retrieval_grounding`:
-
-```json
-{
-  "retrieval_grounding": {
-    "primary_branch": "art",
-    "final_score": 0.0312,
-    "branch_matches": [
-      {"branch": "art", "rank": 2, "score": 0.021},
-      {"branch": "pjt", "rank": 5, "score": 0.018}
-    ]
-  }
-}
-```
-
-The LLM uses `retrieval_grounding` to:
-- Assign `fit` level (높음 if final_score is high and 3+ branches match)
-- Note multi-branch retrieval breadth in natural language when direct evidence is limited
-- Must NOT quote raw score numbers or rank numbers in the reason text
-
-## Validator Contract
-
-The reason sync validator checks:
-
-- other candidate names leaking into the reason
-- internal evidence ids leaking into the reason
-- `must_aspects` touching the same evidence scope the selector used (Korean-only; the validator checks Korean reason text against Korean aspects)
-- strong claims without direct evidence
-
-Note: the validator intentionally uses `must_aspects` (Korean-only) for the aspect scope check, not `evidence_aspects`. The reason text is generated in Korean, so bilingual English terms from `evidence_aspects` would produce false positives in the scope check.
-
-Evidence scope for aspect checks is:
-
-- `title`
-- `detail`
-- `snippet`
-
-This avoids selector/validator disagreement caused by title-only checks.
-
-## Trace Contract
-
-Important trace fields:
-
-- `planner_trace.removed_meta_terms`
-- `planner_trace.retained_contextual_terms`
-- `planner_trace.raw_must_aspects`
-- `planner_trace.normalized_must_aspects`
-- `planner_trace.pruned_must_aspects`
-- `planner_trace.must_aspect_prune_reasons`
-- `planner_trace.intent_flags`
-- `reason_generation_trace.evidence_selection`
-- `reason_generation_trace.shortlist_gate`
-- `reason_generation_trace.reason_sync_validator`
-- `reason_generation_trace.server_fallback_reasons`
-
-## 2026-04-17 Contract Notes
-
-- Retrieval score fusion is equal-weight RRF (schema version: `v3_branch_instruct_prefix`).
-- `semantic_query` is active for the dense retrieval base (priority over `retrieval_core`).
-- When `dense_base_source == "semantic_query"`, expansion keywords are NOT appended to the dense query.
-- Branch query hints removed from query text; branch context moved to retriever-side instruct prefix.
-- Each branch (`basic`, `art`, `pat`, `pjt`) now has a dedicated e5-instruct prefix in the retriever.
-- `must_aspects` is no longer a direct copy of `retrieval_core`.
-- Contextual evaluation phrases are tracked in `intent_flags`, not `must_aspects`.
-- Phrase normalization is shared between selector, gate, and validator.
-- LLM reasoner can reference `retrieval_grounding` for `fit` assignment and breadth notes.
+**생성 규칙:**
+- LLM은 후보자의 순위를 변경하지 않습니다.
+- LLM은 후보자를 누락시키지 않습니다.
+- LLM은 새로운 전문가 ID를 임의로 생성하지 않습니다.
+- 후보자별 증빙 자료는 LLM 전달 전 `core_keywords`를 기준으로 재정렬됩니다.
+- LLM은 후보자당 최대 논문 4건, 과제 4건, 특허 4건의 증빙 후보를 수신합니다.
+- 심사는 최대 5명 단위의 순차 배치(Batch)로 진행됩니다.

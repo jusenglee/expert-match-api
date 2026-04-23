@@ -1,209 +1,88 @@
-# Service Flow
-
-## 1. Planner
-
-`RecommendationService.search_candidates()` starts with the planner.
-
-Planner responsibilities:
-
-- normalize the query into `PlannerOutput`
-- strip meta request terms from retrieval fields
-- produce `retrieval_core` (Korean-only, for sparse BM25)
-- produce dense-only `semantic_query`
-- derive pruned `must_aspects` (Korean-only, semantic quality description)
-- produce bilingual `evidence_aspects` (Korean + English, for actual evidence text matching)
-- record review/evaluation context in `intent_flags.review_context` and `intent_flags.review_targets`
-
-Field responsibilities are separated by design:
-
-| Field | Language | Purpose |
-|---|---|---|
-| `retrieval_core` | Korean only | Sparse BM25 retrieval query |
-| `must_aspects` | Korean only | Semantic quality fallback and gate |
-| `evidence_aspects` | Korean + English | Direct text matching in evidence selector |
-
-When the LLM does not populate `evidence_aspects`, the selector falls back to `must_aspects → retrieval_core → core_keywords`.
-
-Planner does not:
-
-- rank candidates
-- choose evidence
-- apply branch/path weights
-
-## 2. Query Builder
-
-`QueryTextBuilder` creates per-branch query text for two modalities.
-
-- sparse uses `retrieval_core`
-- dense prefers `semantic_query`
-
-The runtime still uses only two paths:
-
-- `stable`
-- `expanded`
-
-Expanded execution is runtime-driven. If the expanded modality text is identical to the stable one, that modality is reused.
-
-## 3. Retrieval
-
-`QdrantHybridRetriever` executes hybrid retrieval on `basic`, `art`, `pat`, `pjt`.
-
-Per path:
-
-- dense prefetch (query encoded with branch-specific instruct prefix)
-- sparse prefetch
-- branch-local RRF fusion
-
-Across paths / branches:
-
-- equal-weight RRF
-
-There is no active branch/path weighting table in the runtime.
-
-### 3-1. Branch-specific Instruct Prefix
-
-`multilingual-e5-large-instruct` requires asymmetric encoding: the query side receives a
-task-specific `Instruct: ...\nQuery: ` prefix; the document side is indexed as raw text.
-
-Each branch uses a different prefix to align the query embedding direction with the branch's
-document space:
-
-- `basic`: academic background, affiliation, technical expertise
-- `art`: academic publications and research papers
-- `pat`: patents and inventions
-- `pjt`: government-funded research projects
-
-Branch hints are no longer appended to the query text itself. The instruct prefix in the
-retriever is the sole carrier of branch context for the dense modality.
-
-## 4. `/search/candidates`
-
-`/search/candidates` stops after retrieval and card assembly.
-
-It returns:
-
-- planner output
-- compiled branch queries
-- retrieval score traces
-- candidate cards
-
-It does not run:
-
-- evidence selector
-- shortlist gate
-- reason generation
-- validator
-
-## 5. `/recommend`
-
-`/recommend` builds on top of retrieval.
-
-### 5-1. Evidence Selection
-
-`KeywordEvidenceSelector` runs over all retrieved candidates first.
-
-Rules:
-
-- direct match evidence only
-- phrase-based aspect matching
-- `title + year` dedup
-- max `2` items per aspect
-- max `4` items total
-
-#### Bilingual aspect matching
-
-The selector uses `evidence_aspects` as the primary match source. Because the research database
-contains mixed-language data (English paper titles/abstracts, Korean project summaries), `evidence_aspects`
-is bilingual so evidence in either language can be matched.
-
-| Item type | Title field | Body fields searched |
-|---|---|---|
-| paper | `publication_title` | `abstract`, `journal_name`, `korean_keywords`, `english_keywords` |
-| project | `display_title` (Korean-first) | `project_title_english` (supplement), `research_objective_summary`, `research_content_summary`, `managing_agency` |
-| patent | `intellectual_property_title` | `application_registration_type`, `application_country` |
-
-`project_title_english` is searched separately from `display_title` so that English aspects can
-match English project titles even when the Korean title takes precedence in display.
-
-Fallback priority when `evidence_aspects` is empty: `must_aspects → retrieval_core → core_keywords`.
-
-### 5-2. Deterministic Shortlist Gate
-
-Gate order:
-
-1. `direct_match_count == 0` → drop
-2. `aspect_coverage < min(2, len(target_aspects))` → demote
-3. `generic_only == true` → bottom group
-
-`aspect_coverage` uses phrase count, not token count.
-
-`target_aspects` for the gate threshold follows the same priority chain as the selector:
-`evidence_aspects → must_aspects → retrieval_core → core_keywords`.
-
-### 5-3. Reason Generation
-
-Reason generation runs in batches of `5`.
-
-The LLM receives two data sources per candidate:
-
-- `selected_evidence`: server-chosen direct-match evidence items (papers, patents, projects)
-- `retrieval_grounding`: compact retrieval signals — `primary_branch`, `final_score`, `branch_matches`
-
-The LLM:
-
-- does not choose evidence
-- summarizes `selected_evidence` as the primary basis for `recommendation_reason`
-- uses `retrieval_grounding` to inform the `fit` level assignment (높음/중간/보통)
-- may mention retrieval breadth (e.g., multi-branch match) in natural language when direct evidence is limited
-- must not quote raw numeric scores or rank numbers in the reason text
-
-If a batch returns partial output, the runtime runs one compact retry before falling back to server-generated reasons.
-
-### 5-4. Reason Sync Validator
-
-Validator checks:
-
-- other candidate names
-- internal evidence ids
-- aspect/evidence consistency
-- strong claims without direct evidence
-
-Aspect validation uses the same evidence scope as the selector:
-
-- `title`
-- `detail`
-- `snippet`
-
-This avoids selector/validator disagreement from title-only checks.
-
-## 6. Fallback Paths
-
-Fallbacks exist at two points:
-
-- selected-evidence fallback when the LLM omits or empties a reason
-- validator fallback when the LLM returns a reason that fails deterministic checks
-
-If every candidate is removed by the shortlist gate, the response returns no recommendations with a gate-specific reason.
-
-## 7. Trace and Logging
-
-Key runtime trace fields:
-
-- `planner_trace.raw_must_aspects`
-- `planner_trace.normalized_must_aspects`
-- `planner_trace.pruned_must_aspects`
-- `planner_trace.intent_flags`
-- `reason_generation_trace.evidence_selection.aspect_source` — which field the selector used (`evidence_aspects` / `must_aspects` / `retrieval_core` / `core_keywords`)
-- `reason_generation_trace.shortlist_gate.aspect_source` — which field the gate threshold was derived from
-- `reason_generation_trace.evidence_selection`
-- `reason_generation_trace.shortlist_gate`
-- `reason_generation_trace.reason_sync_validator`
-
-Key logs:
-
-- planner contract summary
-- branch query source summary
-- selector candidate summary
-- shortlist gate outcome
-- reason batch retry/fallback
-- validator fallback
+# 서비스 동작 흐름 (Service Flow)
+
+## 런타임 흐름 (Runtime Flow)
+
+### 1. 플래너 (Planner)
+
+`RecommendationService.search_candidates()`는 플래너 실행과 함께 시작됩니다.
+
+**플래너의 역할:**
+- 입력된 자연어 질의 정규화
+- 순수 도메인 명사인 `core_keywords` 추출
+- 요청의 목적(역할) 언어를 `task_terms`로 분리
+- 명시적 필터, 포함/제외 기관, `top_k` 설정 보존
+
+**플래너가 하지 않는 것:**
+- 검색용 재작성 문장 생성
+- 검색 뷰(View) 생성
+- 브랜치 힌트 생성
+
+### 2. 검색 및 추출 (Retrieval)
+
+`QueryTextBuilder`는 1단계 sparse 키워드 검색에는 `retrieval_core`/`core_keywords` 기반 쿼리를, 2단계 hybrid 검색에는 `semantic_query` 기반 쿼리를 생성합니다.
+
+`QdrantHybridRetriever`의 동작:
+- 검색 모드는 `keyword_pool_then_hybrid`로 고정
+- 1단계에서 각 브랜치/경로별 sparse 키워드 검색을 수행하고 `basic_info.researcher_id` 후보 풀 수집
+- 2단계에서 후보 풀을 `basic_info.researcher_id MatchAny` 필터로 제한한 뒤 각 브랜치(기본, 논문, 특허, 과제)별 Dense + Sparse 검색 수행
+- RRF(Reciprocal Rank Fusion) 알고리즘을 통해 브랜치 내 결과 통합
+- 모든 브랜치의 결과를 다시 RRF로 최종 통합
+- 각 결과 항목에 브랜치별 매칭 근거(`retrieval_score_traces`) 기록
+- **결정론적 최종 정렬 적용:**
+  1. 점수(Score) 내림차순
+  2. 성명(Name) 오름차순 (점수 동점 시)
+  3. 전문가 ID(Expert ID) 오름차순 (최종 순위 고정)
+
+### 3. 후보자 반환 (Candidate Return)
+
+`/search/candidates` 엔드포인트는 정렬된 후보자 목록을 즉시 반환합니다.
+
+**동작 특징:**
+- 요청 시 `top_k`가 명시된 경우 해당 수만큼 제한하여 반환
+- 명시되지 않은 경우 전체 검색 결과 반환
+
+### 4. 추천 결과 생성 (Recommendation Return)
+
+`/recommend` 엔드포인트는 검색 과정을 거친 후 다음 단계를 추가로 수행합니다.
+
+**추천 파이프라인:**
+- 정렬된 상위 K명의 후보자 선택
+- 플래너의 `core_keywords`를 기준으로 각 후보자의 내부 증빙 자료(논문, 과제, 특허) 재랭킹
+- 후보자당 최대 논문 4건, 과제 4건, 특허 4건으로 구성된 **LLM 증빙 풀(Pool)** 구축
+- 최대 5명의 후보자를 한 배치로 묶어 순차적으로 LLM에 전달
+- LLM에 후보자의 기본 맥락(검색 근거, 평가 활동, 기술 분류 등)과 요약 정보 전달
+- LLM으로부터 적합도(`fit`), 추천 사유(`recommendation_reason`), 선택된 증빙 ID를 수신
+- **검색 시의 원본 순서 유지**
+- LLM이 선택한 증빙 ID를 바탕으로 최종 `recommendation.evidence` 구성
+- LLM이 응답을 누락하거나 사유가 없는 경우, 서버 측에서 증빙 기반의 보수적 사유(Fallback) 자동 생성
+
+**LLM이 하지 않는 것:**
+- 후보자 재정렬 (Reranking)
+- 후보자 탈락 시키기 (Filtering)
+- 새로운 전문가 ID 생성
+
+### 5. 검색 결과 없음 또는 실패 처리
+
+플래너가 재시도 후에도 빈 `core_keywords`를 반환하는 경우:
+- 검색 단계를 건너跳
+- `/search/candidates`는 빈 목록 반환
+- `/recommend`는 구조화된 사유와 함께 빈 추천 목록 반환
+
+## 추적 기록 (Trace Behavior)
+
+현재 활성화된 추적 필드 목록:
+- `planner`: 플래너 출력물
+- `planner_trace`: 플래너 실행 상세
+- `reason_generation_trace`: 추천 사유 생성 상세
+- `raw_query`: 원본 사용자 질의
+- `planner_keywords`: 플래너 추출 키워드
+- `retrieval_keywords`: 실제 검색에 사용된 키워드
+- `branch_queries`: 브랜치별 쿼리 내역
+- `retrieval_score_traces`: 검색 점수 근거
+- `query_payload.retrieval_mode`: 고정 2단계 검색 모드
+- `query_payload.keyword_stage_candidate_count`: 1차 sparse 키워드 검색에서 수집한 후보 ID 수
+- `query_payload.hybrid_stage_raw_branch_counts`: 2차 hybrid 검색의 branch/path별 raw hit 수
+- `query_payload.aggregated_candidate_count`: 최종 support rule 적용 전 집계 후보 수
+- `query_payload.support_pass_count` / `support_filtered_count`: support rule 통과/탈락 수
+- `server_logs`: Trace ID로 캡처된 사용자 질의, 플래너, 1차 검색, 2차 검색 단계별 운영 로그
+- `timers`: 구간별 실행 시간

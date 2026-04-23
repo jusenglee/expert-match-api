@@ -82,8 +82,9 @@ curl -X POST http://127.0.0.1:8011/recommend `
 본 시스템은 모든 요청에 대해 **Trace ID**를 부여하여 추적성을 보장합니다.
 
 ### 주요 추적 로그 포인트 (한글 로그)
+- **사용자 질의**: endpoint, 정규화 전/후 길이, `top_k`, include/exclude 기관 수, filter override key, 정규화된 질의
 - **Planner**: 사용자 질의 분석 결과, 하드 필터 추출 정보, LLM 응답 소요시간 및 토큰 수
-- **Retriever**: 하이브리드 검색 실행 결과, 검색된 후보 수, 필터 적용 현황
+- **Retriever**: 1차 sparse 키워드 후보 풀, 2차 하이브리드 검색 범위, branch/path별 hit count, support rule 통과/탈락 수
 - **Judge Map 라운드**: 배치 분할 정보(라운드 번호, 배치 수, 배치 크기), 후보별 예상 토큰 크기, `max_tokens=3000` 제한 적용, LLM 호출 슬롯 획득(세마포어), 경량 응답 수신 시간, 생존자(survivors) 수
 - **Judge Reduce 라운드**: 생존 후보의 전체 직렬화 토큰 추정, `max_tokens=unlimited` 적용, 상세 응답 수신 시간
 - **Judge JSON 추출**: 3단계 방어 JSON 추출 결과 (추출된 텍스트 로깅)
@@ -93,6 +94,18 @@ curl -X POST http://127.0.0.1:8011/recommend `
 
 로그 형식은 다음과 같으며, Playground UI의 콘솔에서 레벨별 색상과 함께 확인할 수 있습니다.
 `[시간] [레벨] [ID:TraceID] [모듈명] 메시지`
+
+### 로그 예시 (질의 → 플래너 → 1차 검색 → 2차 검색)
+```
+[09:45:51] [INFO] [ID:abc123] [apps.api.main] 사용자 질의 수신: endpoint=/recommend raw_chars=42 normalized_chars=42 top_k=5 include_orgs=0 exclude_orgs=1 filter_keys=[] query='드론 화재 진압 전문가 추천'
+[09:45:51] [INFO] [ID:abc123] [apps.recommendation.service] 플래너 단계 시작: query='드론 화재 진압 전문가 추천'
+[09:45:52] [INFO] [ID:abc123] [apps.recommendation.planner] 플래너 내부 완료: mode=openai_compat intent='드론 화재 진압 전문가 탐색' keywords=2 semantic_query=True include_orgs=0 exclude_orgs=1 filters=[] top_k=5
+[09:45:52] [INFO] [ID:abc123] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.14 unique_candidates=37 branch_counts={'basic:stable': 8, 'art:stable': 15, 'art:expanded': 4, 'pat:stable': 2, 'pjt:stable': 6, 'pjt:expanded': 2}
+[09:45:52] [INFO] [ID:abc123] [apps.search.retriever] 2차 하이브리드 검색 시작: paths=6 candidate_filter_count=37 query_filter=True semantic_query=True
+[09:45:52] [INFO] [ID:abc123] [apps.search.retriever] 검색 집계 완료: raw_branch_counts={'basic:stable': 20, 'art:stable': 20, 'art:expanded': 12, 'pat:stable': 5, 'pjt:stable': 18, 'pjt:expanded': 9} aggregated_candidates=24 support_pass=15 support_filtered=9 final_hits=15
+```
+
+`trace.query_payload`에서도 `retrieval_mode`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다.
 
 ### 로그 예시 (Map-Reduce 심사)
 ```

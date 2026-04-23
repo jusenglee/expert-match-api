@@ -34,6 +34,10 @@ FINAL_SORT_POLICY = "rrf_score_desc_name_asc"
 REASON_GENERATION_BATCH_SIZE = 5
 
 
+def _sorted_filter_keys(filters: dict[str, Any] | None) -> list[str]:
+    return sorted((filters or {}).keys())
+
+
 class RecommendationService:
     def __init__(
         self,
@@ -63,6 +67,15 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
+        logger.info(
+            "검색 파이프라인 시작: query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d override_filter_keys=%s",
+            len(query),
+            top_k,
+            len(include_orgs or []),
+            len(exclude_orgs or []),
+            _sorted_filter_keys(filters_override),
+        )
+        logger.info("플래너 단계 시작: query=%r", query)
         with Timer() as plan_timer:
             plan = await self.planner.plan(
                 query=query,
@@ -73,13 +86,20 @@ class RecommendationService:
             )
 
         planner_trace = self._extract_component_trace(self.planner)
-        retrieval_keywords = QueryTextBuilder.normalize_keywords(plan.core_keywords)
+        retrieval_keywords = QueryTextBuilder.normalize_keywords(
+            plan.retrieval_core or plan.core_keywords
+        )
         logger.info(
-            "Planner completed: elapsed_ms=%.2f intent=%r filters=%r keywords=%d",
+            "플래너 단계 완료: elapsed_ms=%.2f mode=%s intent=%r retrieval_keywords=%d semantic_query=%s bundles=%d include_orgs=%d exclude_orgs=%d hard_filter_keys=%s",
             plan_timer.elapsed_ms,
+            (planner_trace or {}).get("mode", "unknown"),
             plan.intent_summary,
-            plan.hard_filters,
             len(retrieval_keywords),
+            bool(plan.semantic_query),
+            len(plan.bundle_ids),
+            len(plan.include_orgs),
+            len(plan.exclude_orgs),
+            _sorted_filter_keys(plan.hard_filters),
         )
 
         query_filter = self.filter_compiler.compile(
@@ -87,10 +107,17 @@ class RecommendationService:
             plan.exclude_orgs,
             include_orgs=plan.include_orgs,
         )
+        logger.info(
+            "검색 필터 컴파일 완료: has_filter=%s include_orgs=%d exclude_orgs=%d hard_filter_keys=%s",
+            query_filter is not None,
+            len(plan.include_orgs),
+            len(plan.exclude_orgs),
+            _sorted_filter_keys(plan.hard_filters),
+        )
 
         if not retrieval_keywords:
             logger.warning(
-                "Retriever skipped: query=%r reason=%s",
+                "검색 단계 스킵: query=%r reason=%s",
                 query,
                 EMPTY_RETRIEVAL_KEYWORDS_REASON,
             )
@@ -116,6 +143,11 @@ class RecommendationService:
                 },
             }
 
+        logger.info(
+            "검색 단계 시작: mode=keyword_pool_then_hybrid retrieval_keywords=%d query_filter=%s",
+            len(retrieval_keywords),
+            query_filter is not None,
+        )
         with Timer() as search_timer:
             retrieval = await self.retriever.search(
                 query=query,
@@ -123,14 +155,29 @@ class RecommendationService:
                 query_filter=query_filter,
             )
 
+        retrieval_payload = retrieval.query_payload or {}
         logger.info(
-            "Retriever completed: elapsed_ms=%.2f hits=%d",
+            "검색 단계 완료: elapsed_ms=%.2f hits=%d cache_hit=%s mode=%s keyword_candidates=%s hybrid_filter_candidates=%s aggregated_candidates=%s support_pass=%s support_filtered=%s",
             search_timer.elapsed_ms,
             len(retrieval.hits),
+            retrieval.cache_hit,
+            retrieval_payload.get("retrieval_mode"),
+            retrieval_payload.get("keyword_stage_candidate_count"),
+            retrieval_payload.get("hybrid_stage_candidate_filter_count"),
+            retrieval_payload.get("aggregated_candidate_count"),
+            retrieval_payload.get("support_pass_count"),
+            retrieval_payload.get("support_filtered_count"),
         )
 
         display_hits = retrieval.hits[:top_k] if top_k is not None else retrieval.hits
         cards = self.card_builder.build_small_cards(display_hits, plan)
+        logger.info(
+            "후보 카드 생성 완료: display_hits=%d cards=%d requested_top_k=%s total_retrieved=%d",
+            len(display_hits),
+            len(cards),
+            top_k,
+            len(retrieval.hits),
+        )
         return {
             "planner": plan,
             "planner_trace": planner_trace,
