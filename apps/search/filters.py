@@ -16,7 +16,8 @@ from apps.search.text_utils import normalize_org_name
 
 class QdrantFilterCompiler:
     """
-    고수준의 검색 조건을 저수준의 Qdrant 필터 객체로 컴파일하는 클래스입니다.
+    고수준의 검색 조건(Planner가 추출한 hard_filters 등)을 
+    실제 Qdrant 벡터 데이터베이스가 이해할 수 있는 저수준의 필터 구조(models.Filter)로 컴파일하는 클래스입니다.
     """
     def compile(
         self,
@@ -25,12 +26,12 @@ class QdrantFilterCompiler:
         include_orgs: list[str] | None = None,
     ) -> models.Filter | None:
         """
-        주어진 하드 필터, 포함/제외 기관 목록을 바탕으로 Qdrant 필터 객체를 생성합니다.
+        주어진 하드 필터(hard_filters) 및 소속 기관 포함/제외 명단을 분석하여 단일 Qdrant 필터 객체를 생성합니다.
 
-        - 'must': 모든 조건을 만족해야 함 (AND)
-          → include_orgs: 지정 기관 소속 연구자만 포함 (must)
-        - 'must_not': 해당 조건에 맞으면 제외함 (NOT)
-          → exclude_orgs: 지정 기관 소속 연구자 제외 (must_not)
+        [Qdrant 필터 논리 구조]
+        - 'must': 배열 내의 모든 조건을 동시에 만족해야 함 (AND 조건)
+        - 'must_not': 배열 내의 조건 중 하나라도 맞으면 결과에서 제외함 (NOT 조건)
+        - 'min_should': 배열 내 조건 중 최소 N개 이상을 만족해야 함 (OR 조건, min_count 설정)
         """
         # planner는 질의 의도 위주로 조건을 뽑고, 이 컴파일러는 이를 실제 DB 스키마 필드와 매핑하여 확정한다.
         must: list[models.Condition] = []

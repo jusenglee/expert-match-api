@@ -79,6 +79,10 @@ def _truncate_text(value: Any, max_chars: int) -> str | None:
 
 
 class ReasonedCandidate(BaseModel):
+    """
+    LLM 추론을 거쳐 평가된 개별 전문가의 추천 사유, 적합도(fit), 그리고 잠재적 리스크를 담는 데이터 모델입니다.
+    """
+
     expert_id: str
     fit: str = FIT_NORMAL
     recommendation_reason: str = ""
@@ -119,6 +123,11 @@ class ReasonGenerator(Protocol):
 
 
 class PassThroughReasonGenerator:
+    """
+    LLM 추론 없이 기본값(보통, 빈 사유)으로 후보자 정보를 통과시키는 폴백(Fallback)용 생성기입니다.
+    네트워크 오류나 LLM 제한 발생 시 안전하게 결과를 반환하기 위해 사용됩니다.
+    """
+
     def __init__(self) -> None:
         self.last_trace: dict[str, Any] = {}
 
@@ -170,6 +179,11 @@ class PassThroughReasonGenerator:
 
 
 class OpenAICompatReasonGenerator:
+    """
+    OpenAI 호환 LLM API를 사용하여 각 후보자의 추천 사유와 적합도를 생성(추론)하는 클래스입니다.
+    검색된 증거(논문, 특허 등)와 검색 엔진 랭킹 정보를 기반으로 다량의 후보자를 한 번에 평가합니다.
+    """
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.fallback = PassThroughReasonGenerator()
@@ -323,11 +337,17 @@ class OpenAICompatReasonGenerator:
         retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]] | None,
         profile: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        """
+        LLM에게 전달할 후보자 목록을 프롬프트 예산(profile)에 맞게 직렬화(JSON 구조화)합니다.
+        불필요한 글자수를 자르거나(Truncate), 검색된 증거(evidence) 중 상위 항목만 선별하여 토큰 초과를 방지합니다.
+        """
         serialized: list[dict[str, Any]] = []
         relevant_evidence_by_expert_id = relevant_evidence_by_expert_id or {}
         retrieval_score_traces_by_expert_id = retrieval_score_traces_by_expert_id or {}
         candidate_names = {
-            candidate.expert_id: _truncate_text(candidate.name, profile["name_char_limit"])
+            candidate.expert_id: _truncate_text(
+                candidate.name, profile["name_char_limit"]
+            )
             or candidate.expert_id
             for candidate in candidates
         }
@@ -369,8 +389,12 @@ class OpenAICompatReasonGenerator:
                     "position": _truncate_text(
                         candidate.position, profile["detail_char_limit"]
                     ),
-                    "degree": _truncate_text(candidate.degree, profile["detail_char_limit"]),
-                    "major": _truncate_text(candidate.major, profile["detail_char_limit"]),
+                    "degree": _truncate_text(
+                        candidate.degree, profile["detail_char_limit"]
+                    ),
+                    "major": _truncate_text(
+                        candidate.major, profile["detail_char_limit"]
+                    ),
                     "rank_score": candidate.rank_score,
                     "shortlist_score": candidate.shortlist_score,
                     "retrieval_grounding": cls._compact_retrieval_grounding(
@@ -393,6 +417,10 @@ class OpenAICompatReasonGenerator:
         output: ReasonGenerationOutput,
         candidates: list[CandidateCard],
     ) -> tuple[ReasonGenerationOutput, dict[str, Any]]:
+        """
+        LLM이 반환한 응답(ReasonGenerationOutput)을 정규화합니다.
+        누락된 후보자가 있거나 잘못된 적합도 값이 들어온 경우 기본값으로 보정합니다.
+        """
         by_expert_id = {item.expert_id: item for item in output.items}
         normalized_items: list[ReasonedCandidate] = []
         returned_ids = [item.expert_id for item in output.items]
@@ -494,7 +522,9 @@ class OpenAICompatReasonGenerator:
         )
 
     @staticmethod
-    def _build_partial_retry_decision(trace: dict[str, Any]) -> tuple[bool, str | None, str | None]:
+    def _build_partial_retry_decision(
+        trace: dict[str, Any],
+    ) -> tuple[bool, str | None, str | None]:
         missing_candidate_ids = list(trace.get("missing_candidate_ids", []))
         empty_reason_candidate_ids = list(trace.get("empty_reason_candidate_ids", []))
         returned_ratio = float(trace.get("returned_ratio", 0.0) or 0.0)
@@ -531,6 +561,10 @@ class OpenAICompatReasonGenerator:
         use_tools: bool,
         profile: dict[str, Any],
     ) -> tuple[ReasonGenerationOutput, dict[str, Any]]:
+        """
+        주어진 프로필(글자수 제한 등)과 도구(Tool) 사용 여부에 따라 LLM API를 한 번 호출합니다.
+        호출 결과를 파싱하고 정규화한 뒤, 추적용 메타데이터(trace)와 함께 반환합니다.
+        """
         serialized_candidates = self._serialize_candidates(
             candidates,
             relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
@@ -572,9 +606,12 @@ class OpenAICompatReasonGenerator:
             raise ValueError("Reason generator returned no matching candidate ids")
 
         candidate_count = len(candidates)
-        returned_ratio = round(len(returned_ids) / candidate_count, 3) if candidate_count else 0.0
+        returned_ratio = (
+            round(len(returned_ids) / candidate_count, 3) if candidate_count else 0.0
+        )
         selected_evidence_count = sum(
-            len(candidate.get("selected_evidence", [])) for candidate in serialized_candidates
+            len(candidate.get("selected_evidence", []))
+            for candidate in serialized_candidates
         )
         trace = {
             "mode": parse_mode,
@@ -608,6 +645,12 @@ class OpenAICompatReasonGenerator:
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
         retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]] | None = None,
     ) -> ReasonGenerationOutput:
+        """
+        후보자 목록에 대한 추천 사유 생성을 시도합니다.
+        기본적으로 풍부한 데이터(PRIMARY_PAYLOAD_PROFILE)로 시도하고,
+        일부 응답 누락 시 글자수를 줄인 재시도 프로필(RETRY_PAYLOAD_PROFILE)로 한 번 더 시도합니다.
+        최종 실패 시 PassThrough(폴백) 로직을 탑니다.
+        """
         if not candidates:
             self.last_trace = {
                 "mode": "tool_call",

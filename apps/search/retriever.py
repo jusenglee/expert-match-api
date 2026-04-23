@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class RetrievalResult:
+    """
+    Qdrant 검색 엔진의 최종 검색 결과를 담는 데이터 구조입니다.
+    검색된 전문가 목록(hits)과 검색에 사용된 쿼리 메타데이터, 추적용 로그 정보(traces)들을 포괄합니다.
+    """
     hits: list[SearchHit]
     query_payload: dict[str, Any]
     branch_queries: dict[str, CompiledBranchQueries]
@@ -68,6 +72,11 @@ BRANCH_INSTRUCT_PREFIXES: dict[str, str] = {
 
 
 class QdrantHybridRetriever:
+    """
+    Qdrant 벡터 데이터베이스를 사용하여 전문가를 검색하는 핵심 하이브리드(Hybrid) 검색기입니다.
+    Dense(의미 기반) 임베딩과 Sparse(키워드 기반, BM25) 임베딩을 결합하여, 
+    논문(art), 특허(pat), 과제(pjt) 등 각 데이터 브랜치별로 병렬 검색을 수행하고 결과를 집계합니다.
+    """
     def __init__(
         self,
         *,
@@ -152,24 +161,32 @@ class QdrantHybridRetriever:
         sparse_query: models.Document | models.SparseVector,
         query_filter: models.Filter | None,
     ) -> dict[str, Any]:
+        keyword_prefetch = models.Prefetch(
+            query=sparse_query,
+            using=self.registry.sparse_vector_by_branch[branch],
+            limit=self.settings.keyword_prefetch_limit,
+            filter=query_filter,
+        )
+        
         return {
             "collection_name": self.settings.qdrant_collection_name,
             "prefetch": [
+                # Dense branch: narrow down candidates first using keyword_prefetch, then apply dense search
                 models.Prefetch(
+                    prefetch=[keyword_prefetch],
                     query=dense_query,
                     using=self.registry.dense_vector_by_branch[branch],
                     limit=self.settings.branch_prefetch_limit,
-                    filter=query_filter,
                 ),
+                # Sparse branch: narrow down candidates first using keyword_prefetch, then apply sparse search
                 models.Prefetch(
+                    prefetch=[keyword_prefetch],
                     query=sparse_query,
                     using=self.registry.sparse_vector_by_branch[branch],
                     limit=self.settings.branch_prefetch_limit,
-                    filter=query_filter,
                 ),
             ],
             "query": models.FusionQuery(fusion=models.Fusion.RRF),
-            "query_filter": query_filter,
             "limit": self.settings.branch_output_limit,
             "with_payload": True,
             "with_vectors": False,
@@ -213,6 +230,11 @@ class QdrantHybridRetriever:
         plan: PlannerOutput,
         query_filter: models.Filter | None,
     ) -> RetrievalResult:
+        """
+        플래너가 추출한 검색 의도(plan)를 바탕으로 여러 브랜치(기본정보, 논문, 특허, 과제)와 
+        경로(기본 쿼리, 확장 쿼리)에 대해 병렬로 Qdrant 검색을 실행합니다.
+        검색된 여러 결과들의 점수를 하나로 합산(Aggregating)하고 필터링하여 최종 후보자 목록을 반환합니다.
+        """
         # 1. 쿼리 컴파일
         branch_compiled_queries = self.query_builder.build_branch_queries(query, plan)
         retrieval_keywords = self.query_builder.normalize_keywords(plan.retrieval_core)
@@ -294,7 +316,7 @@ class QdrantHybridRetriever:
         
         logger.info("Multi-path parallel search finished: elapsed_ms=%.2f", timer.elapsed_ms)
 
-        # 5. 결과 집계 및 Weighted RRF 계산
+        # 5. 결과 집계 및 점수 산정 (Max Embedding Score)
         aggregator: dict[str, dict[str, Any]] = {}
         for result in raw_results:
             if isinstance(result, Exception):
@@ -311,24 +333,31 @@ class QdrantHybridRetriever:
                 except ValidationError: continue
                 
                 eid = payload.basic_info.researcher_id
-                rrf_contribution = 1.0 / (rank + RRF_K)
+                raw_score = float(getattr(pt, "score", 0.0) if hasattr(pt, "score") else pt.get("score", 0.0))
+                
+                if raw_score < self.settings.retrieval_score_cutoff:
+                    continue
+                    
+                branch_weight = self.settings.branch_weights.get(branch, 1.0)
+                score = raw_score * branch_weight
                 
                 if eid not in aggregator:
                     aggregator[eid] = {
-                        "score": 0.0, "stable_hits": 0, "expanded_hits": 0,
+                        "score": score, "stable_hits": 0, "expanded_hits": 0,
                         "branches": set(), "payload": payload, "point_id": self._point_key(pt_id),
                         "branch_matches": []
                     }
+                else:
+                    aggregator[eid]["score"] = max(aggregator[eid]["score"], score)
                 
                 entry = aggregator[eid]
-                entry["score"] += rrf_contribution
                 entry["branches"].add(branch)
                 if path == "stable": entry["stable_hits"] += 1
                 else: entry["expanded_hits"] += 1
                 
                 entry["branch_matches"].append({
                     "branch": branch, "path": path, "rank": rank,
-                    "score": float(getattr(pt, "score", 0.0) if hasattr(pt, "score") else pt.get("score", 0.0))
+                    "score": score
                 })
 
         # 6. Support Rule 필터링 및 결과 생성
@@ -344,6 +373,11 @@ class QdrantHybridRetriever:
                 normalized_org = normalize_org_name(organization) or ""
                 if any((normalize_org_name(ex) in normalized_org for ex in plan.exclude_orgs if normalize_org_name(ex))):
                     continue
+
+            # 소속 미상(organization missing)인 경우 약간의 페널티 부여
+            if not data["payload"].basic_info.affiliated_organization:
+                data["score"] *= 0.98
+
 
             is_supported = (data["stable_hits"] >= s_min) or (data["expanded_hits"] >= e_min and len(data["branches"]) >= e_min)
             
@@ -399,7 +433,7 @@ class QdrantHybridRetriever:
         return RetrievalResult(
             hits=final_hits,
             query_payload={
-                "rrf_mode": "equal_weight",
+                "retrieve_mode": "sparse_then_dense_max_score",
                 "expanded_path_policy": "distinct_expanded_all_branches",
                 "query_schema_version": RETRIEVAL_QUERY_SCHEMA_VERSION,
                 "support_rules": {"s_min": s_min, "e_min": e_min},
@@ -425,7 +459,11 @@ class QdrantHybridRetriever:
         sparse_text: str,
         query_filter: models.Filter | None
     ) -> tuple[str, str, Any]:
-        """단일 브랜치/경로에 대해 Qdrant 하이브리드 검색을 수행합니다."""
+        """
+        단일 브랜치/경로에 대해 Qdrant에 실제 하이브리드 검색(Dense + Sparse) 요청을 보냅니다.
+        E5-Instruct 임베딩 모델의 특성을 살려 브랜치별 작업 지시어(Instruct prefix)를 쿼리에 추가함으로써, 
+        검색 의도에 맞는 방향으로 벡터 임베딩이 생성되도록 유도합니다.
+        """
         # multilingual-e5-large-instruct 계열: 브랜치별 task-specific instruct prefix 적용.
         # 브랜치 컨텍스트를 Instruct 문장에 통합하여 쿼리 임베딩 방향을 특화.
         processed_query = dense_text

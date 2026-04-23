@@ -59,19 +59,21 @@ class OpenAICompatStreamError(RuntimeError):
 
 class EmptyStreamContentError(OpenAICompatStreamError):
     """
-    스트리밍 응답이 종료되었으나 사용자에게 보여줄 실제 콘텐츠가 전혀 없을 때 발생하는 예외입니다.
-    원인 추적을 위해 Trace ID 등을 보존합니다.
+    LLM의 스트리밍 응답이 정상적으로 종료되었으나, 사용자에게 반환할 최종 텍스트(Content)가 
+    전혀 생성되지 않았을 때 발생하는 예외입니다. 
+    이는 모델의 컨텍스트 한계 초과나 비정상 응답을 탐지하고, 상위 계층에서 폴백(Fallback) 로직을 트리거하는 데 핵심적으로 사용됩니다.
     """
 
 
 class OpenAICompatChatModel(BaseChatModel):
     """
-    LangChain의 BaseChatModel 인터페이스를 OpenAI 호환 서버(vLLM 등)에 맞춰 구현한 모델입니다.
+    LangChain의 BaseChatModel 인터페이스를 준수하면서, vLLM이나 Solar 같은 
+    OpenAI 호환 API 서버와 효율적으로 통신할 수 있도록 자체 구현된 커스텀 LLM 어댑터 클래스입니다.
 
-    주요 기능:
-    - 비동기 비스트리밍(ainvoke_non_stream) 및 스트리밍(astream) 호출 지원
-    - 사고 과정(Reasoning Content)과 최종 답변 분리 처리
-    - 요청별 트레이싱을 위한 request_id 헤더 주입 및 로깅
+    [주요 기능]
+    - 비동기 호출 지원 (스트리밍 및 비스트리밍 방식 모두 최적화)
+    - 최신 추론형 LLM의 사고 과정(Reasoning Content, 예: thinking 단계)과 최종 답변을 분리하여 처리
+    - 추천 파이프라인 전반의 트러블슈팅을 위한 추적 ID(request_id) 주입 및 메타데이터 로깅
     """
 
     # 기본 연결 설정

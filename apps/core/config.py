@@ -22,8 +22,9 @@ except ImportError:
 
 class Settings(BaseSettings):
     """
-    애플리케이션 전역 설정 클래스입니다.
-    모든 환경 변수는 'NTIS_' 접두사를 사용하여 재정의할 수 있습니다.
+    애플리케이션 전역 설정(Configuration)을 관리하는 데이터 클래스입니다.
+    .env 파일이나 시스템 환경 변수를 통해 런타임에 필요한 파라미터들을 동적으로 로드합니다.
+    모든 환경 변수는 'NTIS_' 접두사를 사용하여 쉽게 재정의(Override)할 수 있습니다.
     예) NTIS_QDRANT_URL=http://localhost:6333
     """
 
@@ -52,9 +53,9 @@ class Settings(BaseSettings):
     qdrant_cloud_inference: bool = False
     qdrant_collection_release_id: str = "v0.3.0"  # L3 캐시 무효화용
 
-    # 아키텍처 Support Rule 설정
-    support_rule_stable_min: int = 1
-    support_rule_expanded_min: int = 2
+    # 아키텍처 Support Rule 설정: 전문가가 검색 결과에 포함되기 위한 최소 방어 조건
+    support_rule_stable_min: int = 1  # 안정적 쿼리에서 매칭되어야 하는 최소 횟수
+    support_rule_expanded_min: int = 2 # 확장 쿼리에서 매칭되어야 하는 최소 횟수
 
     # 캐시 설정
     cache_enabled: bool = True
@@ -92,11 +93,22 @@ class Settings(BaseSettings):
     hf_hub_offline: bool = False
 
     # 검색 및 추천 오케스트레이션 파라미터
+    keyword_prefetch_limit: int = 1000 # 1단계 키워드 기반 하드 필터링 시 가져올 후보 수
     branch_prefetch_limit: int = 100  # 각 브랜치별 초기 검색 수
     branch_output_limit: int = 50  # RRF 결합 후 브랜치별 출력 수
     retrieval_limit: int = 80  # 최종 리트리벌 결과 수
     final_recommendation_min: int = 1  # 최소 추천 인원
     final_recommendation_max: int = 20  # 최대 추천 인원
+    
+    # 검색 정밀도 및 추천 최적화 튜닝 옵션
+    retrieval_score_cutoff: float = 0.82  # 유사도 점수가 이 값 미만인 검색 결과(노이즈)는 버림
+    branch_weights: dict = Field(
+        # 브랜치별 가중치 (과제 > 특허 > 논문 > 기본정보 순으로 점수 보정)
+        # E5 임베딩의 높은 기본 유사도(Representation Collapse)로 인해 1.2와 같은 큰 곱연산 시 
+        # 점수 역전 현상(의미적 유사도보다 브랜치 가중치가 랭킹을 지배)이 발생하므로 편차를 줄임
+        default_factory=lambda: {"pjt": 1.015, "pat": 1.005, "art": 1.0, "basic": 0.99}
+    )
+    strict_evidence_gating: bool = True
     
     # LLM 심사 (Judge) 상세 설정
     llm_judge_batch_size: int = 10  # 병렬 심사 배치 크기

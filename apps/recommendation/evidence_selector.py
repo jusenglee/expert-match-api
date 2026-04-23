@@ -23,6 +23,9 @@ SNIPPET_MAX_LENGTH = 1000
 
 
 class RelevantEvidenceItem(BaseModel):
+    """
+    각 후보자별로 쿼리와 관련된 증거 항목(논문, 과제, 특허 등)의 기본 정보와 키워드 매칭 상태, 점수를 담는 모델입니다.
+    """
     item_id: str
     type: str
     title: str
@@ -38,6 +41,10 @@ class RelevantEvidenceItem(BaseModel):
 
 
 class RelevantEvidenceBundle(BaseModel):
+    """
+    특정 후보자 한 명에 대해 수집된 모든 관련 증거 항목들을 묶어서 관리하는 모델입니다.
+    논문, 과제, 특허 목록과 매칭된 속성 통계를 포함합니다.
+    """
     expert_id: str
     papers: list[RelevantEvidenceItem] = Field(default_factory=list)
     projects: list[RelevantEvidenceItem] = Field(default_factory=list)
@@ -58,6 +65,9 @@ class RelevantEvidenceBundle(BaseModel):
 
 
 class EvidenceSelector(Protocol):
+    """
+    검색 의도(PlannerOutput)에 기반하여 각 후보자에게 가장 적합한 증거 자료들을 선별하는 인터페이스입니다.
+    """
     def select(
         self,
         *,
@@ -94,6 +104,10 @@ def _build_rich_snippet(
     metadata: dict[str, str | None] | None = None,
     matched_keywords: list[str] | None = None,
 ) -> str | None:
+    """
+    문서의 본문이나 초록 등 긴 텍스트에서 매칭된 키워드가 포함된 주변 문맥을 잘라내어 요약된 스니펫(Snippet)을 생성합니다.
+    LLM이 추론 시 참고하기 좋도록 글자 수 제한을 적용합니다.
+    """
     parts: list[str] = []
     if metadata:
         meta_parts = [f"[{key}: {value}]" for key, value in metadata.items() if value]
@@ -159,6 +173,9 @@ def _sort_ranked_items(items: list[RelevantEvidenceItem]) -> list[RelevantEviden
 
 
 class KeywordEvidenceSelector:
+    """
+    키워드 매칭을 기반으로 후보자의 실적(논문, 과제, 특허) 중 사용자 쿼리와 가장 관련성 높은 증거를 선별하는 클래스입니다.
+    """
     def __init__(self, *, reference_year: int | None = None) -> None:
         self.reference_year = reference_year or date.today().year
         self.last_trace: dict[str, object] = {}
@@ -169,6 +186,10 @@ class KeywordEvidenceSelector:
         candidates: list[CandidateCard],
         plan: PlannerOutput,
     ) -> dict[str, RelevantEvidenceBundle]:
+        """
+        주어진 후보자 목록 각각에 대하여 논문, 과제, 특허 중 쿼리와 일치하는 증거 자료를 선별하고, 
+        중복을 제거한 뒤 가장 관련성이 높은 항목들만 묶어서(RelevantEvidenceBundle) 반환합니다.
+        """
         # evidence_aspects: 한국어+영어 혼합 매칭 용어 (planner v0.7.0+ 생성).
         # 없으면 한국어 must_aspects → retrieval_core 순으로 폴백.
         # evidence_aspects는 실제 논문/과제/특허 텍스트에 등장하는 표현을 포함하므로
@@ -443,6 +464,11 @@ class KeywordEvidenceSelector:
         aspects: list[str],
         generic_terms: list[str],
     ) -> tuple[float, list[str], list[str]]:
+        """
+        단일 증거 항목(논문, 특허 등)의 텍스트(제목, 본문)를 분석하여 키워드 매칭 점수와 일치한 키워드 목록을 반환합니다.
+        - 제목에서 매칭될 경우 본문 매칭보다 더 높은 점수(가중치)를 부여합니다.
+        - 최신 연도(최근 20년 이내) 실적일 경우 추가 점수를 줍니다.
+        """
         normalized_title = _normalize_text(title)
         compact_title = _compact_text(title)
         normalized_body = _normalize_text(" ".join(part or "" for part in body_parts))
@@ -521,6 +547,10 @@ class KeywordEvidenceSelector:
         items: list[RelevantEvidenceItem],
         aspects: list[str],
     ) -> list[RelevantEvidenceItem]:
+        """
+        중복이 제거된 증거 목록 중에서, 사용자 쿼리 키워드(aspect)와 직접 매칭(direct match)된 증거들만 최종 선택합니다.
+        다양한 키워드들이 고르게 선택될 수 있도록 항목 개수(MAX_SELECTED_EVIDENCE_TOTAL)를 제한합니다.
+        """
         direct_items = [item for item in items if item.direct_match]
         if not direct_items:
             return []

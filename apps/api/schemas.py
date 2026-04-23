@@ -8,6 +8,10 @@ from apps.domain.models import RecommendationDecision
 
 
 class RecommendationRequest(BaseModel):
+    """
+    [2단계 최종 추천 API]에 사용되는 클라이언트 요청(Request) 데이터 모델입니다.
+    자연어 검색어(query)와 각종 필터링/제한 조건들을 포함합니다.
+    """
     query: str = Field(..., description="Natural-language recommendation query")
     top_k: int | None = Field(
         default=None, ge=1, le=15, description="Maximum number of returned results"
@@ -26,6 +30,10 @@ class RecommendationRequest(BaseModel):
 
 
 class SearchCandidatesRequest(RecommendationRequest):
+    """
+    [1단계 단순 검색 API]에 사용되는 클라이언트 요청 데이터 모델입니다.
+    입력 구조는 RecommendationRequest와 동일합니다.
+    """
     pass
 
 
@@ -44,6 +52,10 @@ class FeedbackRequest(BaseModel):
 
 
 class RecommendationResponse(BaseModel):
+    """
+    [2단계 최종 추천 API]의 응답(Response) 데이터 모델입니다.
+    LLM 플래너가 분석한 의도(intent_summary)와 최종 추천 명세서(RecommendationDecision) 목록을 포함합니다.
+    """
     intent_summary: str = Field(..., description="Planner intent summary")
     applied_filters: dict[str, Any] = Field(
         ..., description="Filters applied to retrieval"
@@ -83,6 +95,10 @@ class SearchCandidateItem(BaseModel):
 
 
 class SearchCandidatesResponse(BaseModel):
+    """
+    [1단계 단순 검색 API]의 응답(Response) 데이터 모델입니다.
+    LLM 추론 과정 없이, Qdrant 검색 엔진에서 반환된 후보자 카드(SearchCandidateItem) 목록만 빠르게 반환합니다.
+    """
     intent_summary: str = Field(..., description="Planner intent summary")
     applied_filters: dict[str, Any] = Field(
         ..., description="Filters applied to retrieval"

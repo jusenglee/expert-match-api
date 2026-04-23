@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+import json
+from typing import Any, AsyncGenerator
 
 from apps.core.feedback_store import FeedbackStore
 from apps.core.timer import Timer
@@ -53,6 +54,11 @@ STRONG_REASON_MARKERS = (
 
 
 class RecommendationService:
+    """
+    전문가 추천의 전체 비즈니스 흐름을 관장하는 핵심 서비스 클래스입니다.
+    검색 계획(Planner) -> 검색(Retriever) -> 필터링(Gate) -> 증거 선별(EvidenceSelector) -> 추천 사유 생성(Reasoner)
+    의 파이프라인(Pipeline)을 조율합니다.
+    """
     def __init__(
         self,
         *,
@@ -82,6 +88,10 @@ class RecommendationService:
         top_k: int | None = None,
         limit_candidates: bool = True,
     ) -> dict[str, Any]:
+        """
+        1단계 추천 로직: 사용자 쿼리를 바탕으로 검색 계획(Plan)을 세우고, 검색 엔진(Retriever)을 호출하여 후보자 목록을 가져옵니다.
+        여기까지는 LLM 추론(추천 사유 생성)이 포함되지 않은 순수 검색(Search) 결과입니다.
+        """
         with Timer() as plan_timer:
             plan = await self.planner.plan(
                 query=query,
@@ -191,6 +201,10 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
+        """
+        2단계 추천 로직: `search_candidates`의 결과에 대해 엄격한 증거 필터링(Shortlist Gate)을 적용하고, 
+        살아남은 소수 정예 후보자들에 대해 LLM 기반의 추천 사유(Reasoner)를 생성하여 최종 추천 결과를 반환합니다.
+        """
         logger.info("Recommendation started: query=%r", query)
         total_timer = Timer()
         total_timer.start()
@@ -252,6 +266,7 @@ class RecommendationService:
             cards=candidate_cards,
             plan=plan,
             relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            strict_evidence_gating=self.retriever.settings.strict_evidence_gating,
         )
         shortlist = shortlist[:top_k_used]
         logger.info(
@@ -385,6 +400,96 @@ class RecommendationService:
             expanded_shadow_hits=search_result.get("expanded_shadow_hits"),
         )
 
+    async def recommend_stream(
+        self,
+        *,
+        query: str,
+        filters_override: dict[str, Any] | None = None,
+        include_orgs: list[str] | None = None,
+        exclude_orgs: list[str] | None = None,
+        top_k: int | None = None,
+    ) -> AsyncGenerator[str, None]:
+        logger.info("Recommendation stream started: query=%r", query)
+        total_timer = Timer()
+        total_timer.start()
+
+        search_result = await self.search_candidates(
+            query=query,
+            filters_override=filters_override,
+            include_orgs=include_orgs,
+            exclude_orgs=exclude_orgs,
+            top_k=top_k,
+            limit_candidates=False,
+        )
+
+        plan: PlannerOutput = search_result["planner"]
+        candidate_cards: list[CandidateCard] = search_result["candidates"]
+        top_k_used = top_k if top_k is not None else max(plan.top_k, 1)
+
+        # Yield search completed event
+        yield f"event: search_completed\ndata: {json.dumps({'retrieved_count': search_result['retrieved_count']})}\n\n"
+
+        if search_result["retrieved_count"] == 0 or not candidate_cards:
+            yield f"event: stream_completed\ndata: {json.dumps({'reason': NO_MATCHING_CANDIDATE_REASON})}\n\n"
+            return
+
+        with Timer() as evidence_selection_timer:
+            relevant_evidence_by_expert_id = self.evidence_selector.select(
+                candidates=candidate_cards,
+                plan=plan,
+            )
+        evidence_selection_trace = self._extract_component_trace(self.evidence_selector) or {}
+        shortlist, shortlist_gate_trace = self._apply_shortlist_gates(
+            cards=candidate_cards,
+            plan=plan,
+            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            strict_evidence_gating=self.retriever.settings.strict_evidence_gating,
+        )
+        shortlist = shortlist[:top_k_used]
+
+        yield f"event: shortlist_completed\ndata: {json.dumps({'shortlist_count': len(shortlist)})}\n\n"
+
+        if not shortlist:
+            yield f"event: stream_completed\ndata: {json.dumps({'reason': NO_GATE_PASSED_CANDIDATE_REASON})}\n\n"
+            return
+
+        retrieval_score_traces_by_expert_id = {
+            trace["expert_id"]: trace
+            for trace in (search_result.get("retrieval_score_traces") or [])
+            if trace.get("expert_id")
+        }
+
+        # Stream reasons
+        async for batch_output, batch_trace in self._stream_reasons_in_batches(
+            query=query,
+            plan=plan,
+            candidates=shortlist,
+            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+        ):
+            # Find the original cards for this batch
+            batch_candidate_ids = set(batch_trace["candidate_ids"])
+            batch_cards = [card for card in shortlist if card.expert_id in batch_candidate_ids]
+            
+            (
+                batch_recommendations,
+                _,
+                _,
+                _
+            ) = self._build_recommendations(
+                batch_cards,
+                batch_output,
+                plan=plan,
+                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            )
+            
+            # Serialize decisions
+            decisions = [rec.model_dump(mode="json") for rec in batch_recommendations]
+            yield f"event: reason_batch_completed\ndata: {json.dumps({'recommendations': decisions})}\n\n"
+
+        total_timer.stop()
+        yield f"event: stream_completed\ndata: {json.dumps({'status': 'success', 'total_ms': total_timer.elapsed_ms})}\n\n"
+
     def save_feedback(
         self,
         *,
@@ -435,6 +540,10 @@ class RecommendationService:
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
         retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]],
     ) -> tuple[ReasonGenerationOutput, list[dict[str, Any]]]:
+        """
+        최종 후보자 목록이 너무 많을 경우 LLM 컨텍스트 한계나 응답 누락 현상을 방지하기 위해 
+        일정 크기(REASON_GENERATION_BATCH_SIZE)로 나누어 배치(Batch) 처리로 추천 사유를 생성합니다.
+        """
         batch_outputs: list[ReasonGenerationOutput] = []
         batch_traces: list[dict[str, Any]] = []
         candidate_batches = self._chunk_candidates(
@@ -531,6 +640,47 @@ class RecommendationService:
             batch_traces,
         )
 
+    async def _stream_reasons_in_batches(
+        self,
+        *,
+        query: str,
+        plan: PlannerOutput,
+        candidates: list[CandidateCard],
+        relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]],
+    ) -> AsyncGenerator[tuple[ReasonGenerationOutput, dict[str, Any]], None]:
+        candidate_batches = self._chunk_candidates(
+            candidates, batch_size=REASON_GENERATION_BATCH_SIZE
+        )
+        for batch_index, candidate_batch in enumerate(candidate_batches, start=1):
+            batch_candidate_ids = [candidate.expert_id for candidate in candidate_batch]
+            logger.info(
+                "Reason generation stream batch started: batch=%d/%d size=%d",
+                batch_index, len(candidate_batches), len(candidate_batch)
+            )
+            batch_output = await self.reason_generator.generate(
+                query=query,
+                plan=plan,
+                candidates=candidate_batch,
+                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+                retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+            )
+            raw_trace = dict(self._extract_component_trace(self.reason_generator) or {})
+            batch_trace = {
+                "batch_index": batch_index,
+                "batch_size": len(candidate_batch),
+                "candidate_ids": batch_candidate_ids,
+                "returned_ids": list(raw_trace.get("returned_ids", [])),
+                "missing_candidate_ids": list(raw_trace.get("missing_candidate_ids", [])),
+                "empty_reason_candidate_ids": list(raw_trace.get("empty_reason_candidate_ids", [])),
+                "mode": raw_trace.get("mode", "unknown"),
+                "seed": raw_trace.get("seed"),
+                "retry_count": raw_trace.get("retry_count", 0),
+                "returned_ratio": raw_trace.get("returned_ratio", 0.0),
+                "output_count": raw_trace.get("output_count", len(batch_output.items)),
+            }
+            yield batch_output, batch_trace
+
     @staticmethod
     def _build_reason_generation_trace(
         *,
@@ -581,7 +731,14 @@ class RecommendationService:
         cards: list[CandidateCard],
         plan: PlannerOutput,
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+        strict_evidence_gating: bool = True,
     ) -> tuple[list[CandidateCard], dict[str, Any]]:
+        """
+        검색된 후보자들 중 LLM 추천 사유 생성으로 넘길 가치가 있는 우수 후보(Shortlist)만 남기는 관문(Gate) 역할을 합니다.
+        - 쿼리와 직접 매칭된 증거가 최소 1개 이상 있는지 여부
+        - 요구된 속성(aspect)들을 충분히 커버하는지 여부
+        를 평가하여 미달하는 후보를 탈락(drop)시키거나 후순위로 강등(demote)시킵니다.
+        """
         # gate diagnostic 표시용 — evidence_selector가 실제로 사용한 것과 동일한 소스 사용
         target_aspects = normalize_phrase_keywords(
             plan.evidence_aspects
@@ -603,8 +760,12 @@ class RecommendationService:
             )
             gate_status = "keep"
             if bundle.direct_match_count < 1:
-                gate_status = "drop_no_direct_evidence"
-                dropped_cards.append(card)
+                if strict_evidence_gating:
+                    gate_status = "drop_no_direct_evidence"
+                    dropped_cards.append(card)
+                else:
+                    gate_status = "demote_no_direct_evidence"
+                    low_coverage_cards.append(card)
             elif coverage_threshold and bundle.aspect_coverage < coverage_threshold:
                 gate_status = "demote_low_aspect_coverage"
                 low_coverage_cards.append(card)

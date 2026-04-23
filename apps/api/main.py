@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from qdrant_client import QdrantClient
 import uvicorn
 
@@ -94,7 +94,11 @@ async def build_app_runtime(
     settings: Settings,
 ) -> tuple[RecommendationService, LiveContractValidator]:
     """
-    애플리케이션 구동에 필요한 핵심 런타임 객체들을 초기화합니다.
+    애플리케이션 구동에 필요한 핵심 런타임 객체(의존성)들을 초기화하는 팩토리 함수입니다.
+    - 데이터베이스 클라이언트(Qdrant)
+    - 캐시 매니저(L1 플랜 캐시, L3 검색 결과 캐시)
+    - 모델 컴포넌트(Planner, Reasoner, Encoder 등)
+    - 최종 RecommendationService 조립
     """
     logger.info(
         "앱 런타임 초기화 시작: app_env=%s app_name=%r",
@@ -188,7 +192,7 @@ def create_app(
     validator: LiveContractValidator | None = None,
 ) -> FastAPI:
     """
-    FastAPI 애플리케이션 인스턴스를 생성하고 라우트를 설정합니다.
+    FastAPI 애플리케이션 인스턴스를 생성하고 생명주기(Lifespan) 및 주요 API 엔드포인트(라우트)를 설정합니다.
     """
     configure_logging()
     active_settings = settings or get_settings()
@@ -330,6 +334,11 @@ def create_app(
 
     @app.post("/recommend", response_model=RecommendationResponse)
     async def recommend(request: RecommendationRequest) -> RecommendationResponse:
+        """
+        [2단계 최종 추천 API]
+        사용자 질의를 바탕으로 전문가를 검색하고 증거를 필터링한 뒤, 
+        LLM을 사용하여 전문가별 맞춤형 추천 사유(Reasoning)가 포함된 최종 추천 결과를 반환합니다.
+        """
         service = get_service()
         normalized_query = _normalize_query_text(request.query)
         result = await service.recommend(
@@ -346,10 +355,41 @@ def create_app(
 
         return RecommendationResponse.model_validate(result)
 
+    @app.post("/recommend/stream")
+    async def recommend_stream(request: RecommendationRequest) -> StreamingResponse:
+        """
+        [2단계 최종 추천 스트리밍 API]
+        SSE(Server-Sent Events)를 통해 추천 생성 과정을 실시간으로 클라이언트에게 전송합니다.
+        """
+        service = get_service()
+        normalized_query = _normalize_query_text(request.query)
+
+        async def event_generator():
+            try:
+                async for event_chunk in service.recommend_stream(
+                    query=normalized_query,
+                    filters_override=request.filters_override,
+                    include_orgs=request.include_orgs,
+                    exclude_orgs=request.exclude_orgs,
+                    top_k=request.top_k,
+                ):
+                    yield event_chunk
+            except Exception as e:
+                import json
+                logger.exception("Error during recommendation stream")
+                yield f"event: error\ndata: {json.dumps({'detail': str(e)})}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
     @app.post("/search/candidates", response_model=SearchCandidatesResponse)
     async def search_candidates(
         request: SearchCandidatesRequest,
     ) -> SearchCandidatesResponse:
+        """
+        [1단계 단순 검색 API]
+        LLM 추천 사유 생성 및 엄격한 증거 필터링 관문을 거치지 않고, 
+        Qdrant 벡터 데이터베이스의 순수 하이브리드 검색 후보군(Candidates) 목록을 빠르게 반환합니다.
+        """
         service = get_service()
         normalized_query = _normalize_query_text(request.query)
         result = await service.search_candidates(
