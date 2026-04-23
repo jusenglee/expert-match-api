@@ -42,8 +42,9 @@ class SparseEncoder(Protocol):
 @dataclass(slots=True)
 class SpladeSparseEncoder:
     """
-    Transformers를 사용하여 SPLADE(Sparse Lexical and Semantic) 희소 벡터를 생성합니다.
-    fastembed가 지원하지 않는 모델(예: PIXIE-Splade)을 로컬에서 실행하기 위해 사용합니다.
+    Transformers 라이브러리를 사용하여 SPLADE(Sparse Lexical and Semantic) 기반 희소 벡터(Sparse Vector)를 생성합니다.
+    fastembed 등 외부 라이브러리에서 공식 지원하지 않는 커스텀 모델(예: PIXIE-Splade)을 로컬 환경에서 구동하기 위해 작성되었습니다.
+    문맥을 고려한 키워드 확장 및 가중치 계산을 수행합니다.
     """
     model_name: str
     local_files_only: bool = False
@@ -73,7 +74,10 @@ class SpladeSparseEncoder:
             raise
 
     def embed(self, text: str) -> dict[int, float]:
-        """텍스트를 SPLADE 희소 벡터(가중치 맵)로 변환합니다."""
+        """
+        입력된 텍스트를 모델에 통과시켜 SPLADE 희소 벡터 가중치 맵(dictionary 형태)으로 변환합니다.
+        가중치가 0이 아닌 유효한 토큰(Token) ID와 그에 해당하는 점수를 반환합니다.
+        """
         if not text or not text.strip():
             return {}
 
@@ -107,7 +111,10 @@ class HashingDenseEncoder:
 
 @dataclass(slots=True)
 class OpenAIEmbeddingEncoder:
-    """OpenAI API를 사용하는 임베딩 인코더입니다."""
+    """
+    OpenAI 호환 API(vLLM, TGI 등)를 사용하여 텍스트를 밀집 벡터(Dense Vector)로 임베딩하는 인코더입니다.
+    원격 서버로 API 요청을 보내 임베딩 결과를 받아옵니다.
+    """
     model_name: str
     vector_size: int
     base_url: str
@@ -127,7 +134,11 @@ class OpenAIEmbeddingEncoder:
 
 @dataclass(slots=True)
 class LocalSentenceTransformerEncoder:
-    """SentenceTransformer를 사용하는 로컬 인코더입니다."""
+    """
+    HuggingFace SentenceTransformer 라이브러리를 사용하여 로컬 환경(GPU/CPU)에서 
+    직접 텍스트를 밀집 벡터(Dense Vector)로 변환하는 인코더입니다.
+    네트워크 지연 없이 빠른 로컬 임베딩이 필요할 때 사용됩니다.
+    """
     model_name: str
     vector_size: int
     _model: object = field(init=False, repr=False)

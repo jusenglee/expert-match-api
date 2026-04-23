@@ -11,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class CompiledBranchQueries:
-    """Compiled per-branch query texts for stable and expanded paths."""
+    """
+    특정 브랜치(논문, 특허, 과제 등)에 대해 최종 조립된 쿼리 문자열들을 담는 데이터 구조입니다.
+    안정적 쿼리(stable)와 확장 키워드가 포함된 쿼리(expanded), 그리고 각각의 Dense/Sparse 엔진용 텍스트를 포괄합니다.
+    """
 
     stable: str
     expanded: str
@@ -30,6 +33,10 @@ class CompiledBranchQueries:
 
 
 class QueryTextBuilder:
+    """
+    LLM 플래너가 추출한 검색 조건(PlannerOutput)과 원본 사용자 쿼리를 조합하여, 
+    Qdrant 검색 엔진(Retriever)에 던질 최적의 쿼리 텍스트(Dense/Sparse 용)를 동적으로 생성하는 빌더 클래스입니다.
+    """
     # Branch hints are now handled as instruct prefixes in the retriever.
     # They are kept here only for reference / future use.
     BRANCH_HINTS: dict[str, str] = {}
@@ -40,7 +47,10 @@ class QueryTextBuilder:
 
     @classmethod
     def _stable_sparse_base(cls, *, query: str, plan: PlannerOutput) -> tuple[str, str]:
-        """Sparse(BM25) 쿼리 베이스: 키워드 조인이 TF-IDF 계열에 최적."""
+        """
+        Sparse(BM25) 검색에 최적화된 기본 쿼리 텍스트를 생성합니다.
+        키워드 단어들의 단순 나열이 TF-IDF 계열 검색(BM25)에 유리하므로, 플래너가 추출한 핵심 키워드(retrieval_core)를 최우선으로 조합합니다.
+        """
         planner_keywords = cls._planner_keywords(plan)
         if planner_keywords:
             return " ".join(planner_keywords), "retrieval_core"
@@ -55,19 +65,31 @@ class QueryTextBuilder:
         plan: PlannerOutput,
         stable_sparse_base: str,
     ) -> tuple[str, str]:
-        """Dense(e5-instruct) 쿼리 베이스: 자연어 문장이 임베딩 품질에 최적.
-
-        우선순위: semantic_query(LLM 생성 자연어 문장) > retrieval_core 조인 > raw_query
         """
+        Dense(의미 기반) 검색에 최적화된 기본 쿼리 텍스트를 생성합니다.
+        E5-Instruct와 같은 Dense 임베딩 모델은 자연어 문장 형태일 때 가장 품질이 좋으므로,
+        플래너가 생성한 가상 문서(HyDE)나 자연어 쿼리(semantic_query)를 최우선으로 사용합니다.
+        우선순위: bounded_hyde_document(가상 문서) > semantic_query(자연어 문장) > retrieval_core 키워드 나열 > raw_query(원본 쿼리)
+        """
+        bounded_hyde_document = " ".join((getattr(plan, "bounded_hyde_document", "") or "").split())
+        if bounded_hyde_document:
+            return bounded_hyde_document, "bounded_hyde_document"
+
         semantic_query = " ".join((plan.semantic_query or "").split())
         if semantic_query:
             return semantic_query, "semantic_query"
+            
         if stable_sparse_base:
             return stable_sparse_base, "retrieval_core"
+            
         normalized_query = " ".join(query.split()) or plan.intent_summary
         return normalized_query, "raw_query"
 
     def build_branch_queries(self, query: str, plan: PlannerOutput) -> dict[str, CompiledBranchQueries]:
+        """
+        기본 쿼리, 논문(art), 특허(pat), 과제(pjt) 브랜치별로 수행할 실제 Qdrant 검색 쿼리 세트를 조립합니다.
+        필요한 경우 해당 도메인에 맞는 확장 키워드(expanded_keywords)를 Sparse 쿼리에 덧붙입니다.
+        """
         stable_sparse_base, sparse_base_source = self._stable_sparse_base(query=query, plan=plan)
         stable_dense_base, dense_base_source = self._stable_dense_base(
             query=query,
