@@ -104,12 +104,21 @@ class RecommendationService:
         planner_trace = self._extract_component_trace(self.planner)
         retrieval_keywords = QueryTextBuilder.normalize_keywords(plan.core_keywords)
         logger.info(
-            "Planner completed: elapsed_ms=%.2f intent=%r filters=%r retrieval_core=%s must_aspects=%s removed_meta_terms=%s",
+            "Planner completed (elapsed: %.2fms):\n"
+            "  - Intent: %s\n"
+            "  - Reasoning: %s\n"
+            "  - Retrieval Core: %s\n"
+            "  - Evidence Aspects: %s\n"
+            "  - Semantic Query: %s\n"
+            "  - HyDE Document: %s\n"
+            "  - Removed Meta Terms: %s",
             plan_timer.elapsed_ms,
             plan.intent_summary,
-            plan.hard_filters,
+            getattr(plan, "reasoning", "N/A"),
             plan.retrieval_core,
-            getattr(plan, "must_aspects", []),
+            getattr(plan, "evidence_aspects", []),
+            plan.semantic_query,
+            getattr(plan, "bounded_hyde_document", "N/A"),
             (planner_trace or {}).get("removed_meta_terms", []),
         )
 

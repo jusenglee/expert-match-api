@@ -560,9 +560,12 @@ class OpenAICompatPlanner:
                 if term.lower() not in {"평가", "evaluation"}
             ]
 
-        # 4. 도메인 검색어로 사용해서는 안 될 '금지된 용어(메타/일반 용어)' 목록을 생성합니다.
+        # 4. 도메인 검색어로 사용해서는 안 될 '금지된 용어(메타/일반 용어)' 목록을 생성합니다. (동질코퍼스 고려)
         forbidden_terms = _normalize_string_list(
-            output.role_terms + output.action_terms + output.generic_terms
+            output.noise_terms
+            + output.role_terms
+            + output.action_terms
+            + output.generic_terms
         )
 
         # 5. 핵심 검색어(retrieval_core)에서 금지된 용어들을 필터링하여 순수 도메인 용어만 남깁니다.
@@ -619,12 +622,20 @@ class OpenAICompatPlanner:
             if bundle_id in EXPANSION_LEXICON
         ]
 
-        # 9. 밀집 검색(Dense Retrieval)용 의미론적 쿼리(semantic_query)가 없다면 핵심 검색어 또는 의도 요약으로 자동 생성합니다.
-        if not output.semantic_query:
+        # 9. 밀집 검색(Dense Retrieval)용 의미론적 쿼리(semantic_query) 및 HyDE 가상 문서 정제
+        # 동질코퍼스에서는 "평가위원", "전문가" 등의 단어가 구분력을 잃고 노이즈가 되므로, 생성된 질의에서도 이를 제거합니다.
+        if output.semantic_query:
+            output.semantic_query = _strip_terms(output.semantic_query, forbidden_terms)
+        else:
             output.semantic_query = (
                 " ".join(output.retrieval_core)
                 if output.retrieval_core
                 else output.intent_summary
+            )
+
+        if output.bounded_hyde_document:
+            output.bounded_hyde_document = _strip_terms(
+                output.bounded_hyde_document, forbidden_terms
             )
 
         # 10. 증거 속성(evidence_aspects) 정제:
@@ -677,7 +688,15 @@ class OpenAICompatPlanner:
         """
         LLM에게 JSON 형태의 출력을 요청하고, 결과를 파싱하여 PlannerOutput 객체로 변환합니다.
         """
-        invoke_kwargs = build_consistency_invoke_kwargs(seed=seed)
+        # invoke_kwargs = build_consistency_invoke_kwargs(seed=seed)
+        # 플래너의 동작에서 LLM이 검색쿼리를 '생성' 해야하므로 reasoning_effort를 high
+        invoke_kwargs = {
+            "temperature": 0,
+            "top_p": 0.2,
+            "reasoning_effort": "high",
+            "include_reasoning": True,
+            "disable_thinking": False,
+        }
         result = await self.model.ainvoke_non_stream(
             [
                 SystemMessage(content=self._build_system_prompt()),
