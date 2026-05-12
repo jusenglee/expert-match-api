@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from langchain_core.messages import AIMessage
 
@@ -19,7 +20,8 @@ class FakePlannerModel:
         return AIMessage(content=self.contents[index])
 
 
-def test_openai_compat_planner_extracts_pure_keywords_and_request_terms():
+def test_openai_compat_planner_extracts_pure_keywords_and_request_terms(caplog):
+    caplog.set_level(logging.INFO)
     planner = OpenAICompatPlanner(
         Settings(app_env="test", strict_runtime_validation=False)
     )
@@ -48,6 +50,13 @@ def test_openai_compat_planner_extracts_pure_keywords_and_request_terms():
     assert planner.last_trace["retrieval_keywords"] == ["난접근성 화재 진압", "드론"]
     assert planner.last_trace["planner_retry_count"] == 0
     assert planner.model.call_count == 1
+    assert "플래너 내부 시작" in caplog.text
+    assert "플래너 LLM 시도 완료" in caplog.text
+    assert "플래너 내부 완료" in caplog.text
+    assert "retrieval_core=['난접근성 화재 진압', '드론']" in caplog.text
+    assert "role_terms=['전문가']" in caplog.text
+    assert "action_terms=['추천']" in caplog.text
+    assert "semantic_query='난접근성 화재 현장 드론 전문가'" in caplog.text
 
 
 def test_openai_compat_planner_retries_when_keywords_are_empty():
@@ -126,6 +135,37 @@ def test_openai_compat_planner_falls_back_after_retry_exhaustion():
     assert planner.last_trace["mode"] == "fallback_broad_search"
     assert planner.last_trace["planner_retry_count"] == 1
     assert planner.model.call_count == 2
+
+
+def test_openai_compat_planner_strips_role_and_action_terms_from_retrieval_core():
+    """LLM 이 역할/행위어를 retrieval_core 에 중복으로 넣으면 후처리 단계에서 제거되어야 한다."""
+    planner = OpenAICompatPlanner(
+        Settings(app_env="test", strict_runtime_validation=False)
+    )
+    planner.model = FakePlannerModel(
+        """{
+          "intent_summary": "KISTI 과제 심사 평가위원 탐색",
+          "retrieval_core": ["과제 심사", "평가위원"],
+          "semantic_query": "한국과학기술정보연구원 과제 심사 평가위원",
+          "role_terms": ["평가위원"],
+          "action_terms": ["심사", "추천"],
+          "hard_filters": {},
+          "include_orgs": [],
+          "exclude_orgs": [],
+          "top_k": 5
+        }"""
+    )
+
+    result = asyncio.run(
+        planner.plan(query="한국과학기술정보연구원 과제를 심사할 평가위원 추천")
+    )
+
+    assert "평가위원" not in result.retrieval_core
+    assert "평가위원" not in result.core_keywords
+    assert result.role_terms == ["평가위원"]
+    assert result.action_terms == ["심사", "추천"]
+    assert planner.last_trace["retrieval_keywords"] == result.retrieval_core
+    assert "평가위원" in planner.last_trace["removed_role_terms"]
 
 
 def test_openai_compat_planner_selects_expansion_bundles():
