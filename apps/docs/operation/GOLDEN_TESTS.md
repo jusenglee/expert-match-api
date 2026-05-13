@@ -130,9 +130,11 @@
 
 - Input: a normal `/recommend` or `/search/candidates` request
 - Expected:
-  - `trace.server_logs` includes user-query receipt, planner start/completion, retrieval start/completion, and candidate card build logs
-  - retriever logs include 1st-stage keyword search start/completion and 2nd-stage hybrid search start/completion
-  - `trace.query_payload` exposes branch/path counts and support pass/filter counts without logging vectors or full payloads
+  - `trace.server_logs` uses the readable one-line format with `trace=<id>` and `[METHOD /path]`
+  - `trace.server_logs` includes request start, user-query receipt, planner start/completion, retrieval start/completion, candidate card build, and response-ready summary logs
+  - planner logs include the actual `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, and `bundle_ids`, not only their counts
+  - retriever logs include actual `retrieval_keywords`, 1st-stage keyword query text, 2nd-stage hybrid query text, candidate previews, and branch/path counts
+  - `trace.query_payload` exposes retrieval keywords, semantic query, branch query text, branch/path counts, and support pass/filter counts without logging vectors or full payloads
 
 ## Acceptance Criteria
 
@@ -147,6 +149,6 @@
 - `/recommend` uses tool calling first, then one compact JSON retry, then deterministic server fallback.
 - `/recommend` resolves final `recommendation.evidence` from the LLM-selected relevant evidence ids.
 - `/recommend` generates a conservative fallback reason when the LLM omits a candidate or returns an empty reason.
-- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.batches`, `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`, and candidate-level evidence resolution details needed to explain fallback.
-- Server logs must summarize user query, planner, 1st-stage keyword retrieval, and 2nd-stage hybrid retrieval without printing LLM raw responses, dense vectors, or full Qdrant payloads.
+- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.retrieval_keywords`, `query_payload.semantic_query`, `query_payload.keyword_stage_queries`, `query_payload.hybrid_stage_queries`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.batches`, `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`, and candidate-level evidence resolution details needed to explain fallback.
+- Server logs must show request context, user query, extracted planner keywords, actual retrieval query text, 1st-stage keyword retrieval, 2nd-stage hybrid retrieval, evidence selection, reason generation, and response preparation without printing LLM raw responses, dense vectors, or full Qdrant payloads.
 - Legacy verifier, multi-view retrieval, judge, and evidence-resolver traces are no longer part of the active contract.

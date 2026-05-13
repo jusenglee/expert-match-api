@@ -44,6 +44,7 @@
 - 2단계는 후보 풀을 `basic_info.researcher_id MatchAny` payload 필터로 제한한 뒤 Dense + Sparse 하이브리드 RRF를 실행합니다.
 - 1단계에서 유효한 후보 ID가 없으면 2단계 하이브리드는 실행하지 않고 빈 결과와 `keyword_stage_candidate_count=0` trace를 반환합니다.
 - `trace.query_payload`는 1차 후보 수, 1차 branch/path별 count, 2차 branch/path별 raw count, 집계 후보 수, support rule 통과/탈락 수를 포함합니다.
+- `trace.query_payload.retrieval_keywords`, `semantic_query`, `keyword_stage_queries`, `hybrid_stage_queries`는 플래너가 만든 키워드와 실제 1차/2차 검색 텍스트를 노출합니다. 이 필드는 운영 디버깅용이며 dense vector, sparse vector 값, 전체 Qdrant payload는 포함하지 않습니다.
 - Dense 검색: 브랜치별 밀집 벡터 공간에서 수행
 - Sparse 검색: BM25 알고리즘을 사용하여 희소 벡터 공간에서 수행
 - RRF 결합: 브랜치 내에서 Dense와 Sparse 결과를 통합

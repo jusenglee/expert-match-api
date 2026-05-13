@@ -11,16 +11,31 @@ from typing import Optional
 
 # 비동기 컨텍스트에서 고유 요청 ID를 저장하기 위한 ContextVar
 request_id_ctx: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+request_method_ctx: ContextVar[Optional[str]] = ContextVar(
+    "request_method", default=None
+)
+request_path_ctx: ContextVar[Optional[str]] = ContextVar("request_path", default=None)
 
 # 현재 요청의 로그 메시지들을 캡처하기 위한 ContextVar
 captured_logs_ctx: ContextVar[Optional[list[str]]] = ContextVar("captured_logs", default=None)
 
 
+def _build_request_context() -> str:
+    method = request_method_ctx.get()
+    path = request_path_ctx.get()
+    if method and path:
+        return f"{method} {path}"
+    if path:
+        return path
+    return "-"
+
+
 class RequestIdFilter(logging.Filter):
-    """로그 레코드에 현재 컨텍스트의 request_id를 주입하는 필터입니다."""
+    """로그 레코드에 현재 요청 추적 컨텍스트를 주입하는 필터입니다."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.request_id = request_id_ctx.get() or "-"
+        record.request_context = _build_request_context()
         return True
 
 
@@ -40,29 +55,28 @@ class ContextLogHandler(logging.Handler):
 class ColorFormatter(logging.Formatter):
     """터미널 출력을 보기 좋게 색상화하는 포맷터입니다."""
     COLORS = {
-        'DEBUG': '\033[36m',     # Cyan
-        'INFO': '\033[32m',      # Green
-        'WARNING': '\033[33m',   # Yellow
-        'ERROR': '\033[31m',     # Red
-        'CRITICAL': '\033[1m\033[31m', # Bold Red
+        "DEBUG": "\033[36m",  # Cyan
+        "INFO": "\033[32m",  # Green
+        "WARNING": "\033[33m",  # Yellow
+        "ERROR": "\033[31m",  # Red
+        "CRITICAL": "\033[1m\033[31m",  # Bold Red
     }
-    RESET = '\033[0m'
+    RESET = "\033[0m"
 
     def format(self, record: logging.LogRecord) -> str:
-        color = self.COLORS.get(record.levelname, '')
-        # 레벨 이름의 길이를 8자리로 고정하고 중앙 정렬
-        levelname_color = f"{color}{record.levelname:^8}{self.RESET}"
-        
+        color = self.COLORS.get(record.levelname, "")
+        levelname_color = f"{color}{record.levelname:<8}{self.RESET}"
+
         # 원본 값을 잠시 백업
         orig_levelname = record.levelname
         orig_name = record.name
-        
+
         # 색상 적용
         record.levelname = levelname_color
         record.name = f"\033[35m{record.name}\033[0m"
-        
+
         formatted = super().format(record)
-        
+
         # 복구
         record.levelname = orig_levelname
         record.name = orig_name
@@ -72,9 +86,12 @@ class ColorFormatter(logging.Formatter):
 def configure_logging() -> None:
     """로그 출력 레벨과 포맷을 설정합니다. Trace ID([요청ID])가 포함됩니다."""
     # 파일/DB 저장용 일반 포맷터
-    base_format = "[%(asctime)s] [%(levelname)s] [ID:%(request_id)s] [%(name)s] %(message)s"
-    date_format = "%Y-%m-%d %H:%M:%S"
-    
+    base_format = (
+        "[%(asctime)s.%(msecs)03d] [%(levelname)-8s] "
+        "[trace=%(request_id)s] [%(request_context)s] [%(name)s] %(message)s"
+    )
+    date_format = "%H:%M:%S"
+
     plain_formatter = logging.Formatter(fmt=base_format, datefmt=date_format)
     # 터미널용 컬러 포맷터
     color_formatter = ColorFormatter(fmt=base_format, datefmt=date_format)
@@ -91,11 +108,14 @@ def configure_logging() -> None:
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    
+
     # 기존 핸들러 제거 후 새 핸들러 등록 (중복 방지)
     for h in root_logger.handlers[:]:
         root_logger.removeHandler(h)
-        
+
     root_logger.addHandler(stdout_handler)
     root_logger.addHandler(capture_handler)
 
+    # 운영자가 보는 로그에서 외부 라이브러리의 반복적인 INFO 로그를 줄입니다.
+    for noisy_logger_name in ("httpx", "httpcore", "qdrant_client", "uvicorn.access"):
+        logging.getLogger(noisy_logger_name).setLevel(logging.WARNING)

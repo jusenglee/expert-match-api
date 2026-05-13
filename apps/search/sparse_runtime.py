@@ -1,3 +1,15 @@
+"""
+희소 벡터(Sparse Vector) 모델 환경을 구성하고 관리하는 런타임 모듈입니다.
+
+[Architecture Overview]
+Qdrant의 Sparse 벡터 검색을 지원하기 위해, 어떤 인코더를 사용할지 런타임에 결정합니다.
+1. Custom SPLADE (PIXIE-Splade-v1.0): 
+   - 한국어 도메인에 특화된 모델로, 단어의 문맥적 중요도를 가중치로 추출합니다.
+   - 로컬 모델 캐시 경로를 최우선으로 시도하며, 실패 시 HuggingFace Hub 다운로드를 시도합니다.
+2. FastEmbed BM25 (Fallback):
+   - SPLADE 로드에 최종 실패하거나, 오프라인 환경에서 로컬 파일이 없을 경우
+   - 시스템이 중단되지 않고 Qdrant 내장 BM25 혹은 FastEmbed BM25로 안전하게 Fallback 하도록 보장합니다.
+"""
 from __future__ import annotations
 
 import logging
@@ -18,11 +30,14 @@ QDRANT_BM25_MODEL = "Qdrant/bm25"
 
 @dataclass(slots=True, frozen=True)
 class SparseRuntimeConfig:
-    backend: Literal["custom_splade", "fastembed_builtin"]
-    active_model_name: str
-    requires_idf_modifier: bool
-    used_fallback: bool = False
-    attempt_log: tuple[str, ...] = field(default_factory=tuple)
+    """
+    현재 런타임에 활성화된 희소 벡터(Sparse) 인코더의 상태 정보입니다.
+    """
+    backend: Literal["custom_splade", "fastembed_builtin"]  # 활성화된 백엔드 종류
+    active_model_name: str                                  # 실제로 로드된 모델의 이름 또는 경로
+    requires_idf_modifier: bool                             # BM25 Fallback 시 IDF 수정자 필요 여부
+    used_fallback: bool = False                             # 최우선 모델(SPLADE) 로드 실패로 Fallback을 사용했는지 여부
+    attempt_log: tuple[str, ...] = field(default_factory=tuple) # 로드 시도 및 실패 내역(로깅용)
 
     @property
     def uses_custom_encoder(self) -> bool:
@@ -52,6 +67,17 @@ def resolve_sparse_runtime(
     cache_dir: Path,
     sparse_encoder_factory: SparseEncoderFactory,
 ) -> tuple[SparseRuntimeConfig, Any | None]:
+    """
+    시스템 시작 시 Sparse 인코더를 결정하고 로드하는 핵심 함수입니다.
+    
+    [Fallback 순서]
+    1. 로컬 경로 (settings.sparse_model_name) 의 SPLADE 모델 로드 시도
+    2. (허용 시) 온라인 HuggingFace Hub의 "telepix/PIXIE-Splade-v1.0" 로드 시도
+    3. (허용 시) FastEmbed BM25 ("Qdrant/bm25") 로드 시도 (최후의 수단)
+    
+    Returns:
+        현재 런타임 구성 객체(SparseRuntimeConfig)와 실제 로드된 Encoder 인스턴스
+    """
     attempt_log: list[str] = []
     primary_model_name = settings.sparse_model_name
     bm25_local_files_only = settings.sparse_local_files_only or settings.hf_hub_offline

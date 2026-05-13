@@ -131,6 +131,15 @@ class FakeRecommendationService:
             "timers": {},
         }
 
+    async def search_weighted_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
+        return await self.search_candidates(
+            query=query,
+            filters_override=filters_override,
+            include_orgs=include_orgs,
+            exclude_orgs=exclude_orgs,
+            top_k=top_k,
+        )
+
     def save_feedback(self, *, query, selected_expert_ids, rejected_expert_ids, notes, metadata):
         return 1
 
@@ -177,6 +186,10 @@ def test_recommend_endpoint_contract():
     assert response.json()["recommendations"][0]["reasons"] == [
         "Publication evidence is available."
     ]
+    server_logs = response.json()["trace"]["server_logs"]
+    assert any("사용자 질의 수신: endpoint=/recommend" in line for line in server_logs)
+    assert any("[trace=" in line and "[POST /recommend]" in line for line in server_logs)
+    assert any("추천 응답 준비 완료" in line for line in server_logs)
 
 
 def test_recommend_endpoint_normalizes_multiline_query_with_commas():
@@ -231,6 +244,13 @@ def test_search_candidates_endpoint_includes_retrieval_score_trace():
 
     assert response.status_code == 200
     assert response.json()["trace"]["retrieval_score_traces"][0]["primary_branch"] == "basic"
+    server_logs = response.json()["trace"]["server_logs"]
+    assert any("사용자 질의 수신: endpoint=/search/candidates" in line for line in server_logs)
+    assert any(
+        "[trace=" in line and "[POST /search/candidates]" in line
+        for line in server_logs
+    )
+    assert any("후보자 검색 응답 준비 완료" in line for line in server_logs)
 
 
 def test_search_candidates_endpoint_normalizes_multiline_query_with_commas():

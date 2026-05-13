@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 from apps.domain.models import (
     CandidateCard,
@@ -18,6 +18,7 @@ from apps.recommendation.service import (
     NO_MATCHING_CANDIDATE_REASON,
     RecommendationService,
 )
+from apps.search.retriever import RetrievalResult
 
 
 class DummyPlanner:
@@ -43,6 +44,58 @@ class DummyFeedbackStore:
 class DummyCardBuilder:
     def build_small_cards(self, hits, plan):
         raise AssertionError("build_small_cards should not be called in this unit test")
+
+
+class LoggingPlanner:
+    last_trace = {
+        "mode": "test_planner",
+        "planner_retry_count": 0,
+        "planner_keywords": ["semiconductor"],
+        "retrieval_keywords": ["semiconductor"],
+    }
+
+    async def plan(self, **kwargs):
+        _ = kwargs
+        return PlannerOutput(
+            intent_summary="semiconductor experts",
+            retrieval_core=["semiconductor"],
+            core_keywords=["semiconductor"],
+            semantic_query="semiconductor research expert",
+            bundle_ids=["semiconductor"],
+            hard_filters={"degree_slct_nm": "PhD"},
+            top_k=2,
+        )
+
+
+class LoggingFilterCompiler:
+    def compile(self, *args, **kwargs):
+        _ = (args, kwargs)
+        return None
+
+
+class LoggingRetriever:
+    async def search(self, **kwargs):
+        _ = kwargs
+        return RetrievalResult(
+            hits=[SimpleNamespace(expert_id="1")],
+            query_payload={
+                "retrieval_mode": "keyword_pool_then_hybrid",
+                "keyword_stage_candidate_count": 3,
+                "hybrid_stage_candidate_filter_count": 3,
+                "aggregated_candidate_count": 2,
+                "support_pass_count": 1,
+                "support_filtered_count": 1,
+            },
+            branch_queries={},
+            retrieval_keywords=["semiconductor"],
+            retrieval_score_traces=[],
+        )
+
+
+class LoggingCardBuilder:
+    def build_small_cards(self, hits, plan):
+        _ = (hits, plan)
+        return [_candidate_card("1", "Alpha", 1.0)]
 
 
 class DummyEvidenceSelector:
@@ -182,6 +235,33 @@ def _build_service(
         feedback_store=DummyFeedbackStore(),
     )
     return service, reason_generator, evidence_selector
+
+
+def test_search_candidates_logs_pipeline_stages(caplog):
+    caplog.set_level(logging.INFO)
+    service = RecommendationService(
+        planner=LoggingPlanner(),
+        retriever=LoggingRetriever(),
+        filter_compiler=LoggingFilterCompiler(),
+        card_builder=LoggingCardBuilder(),
+        evidence_selector=DummyEvidenceSelector(),
+        reason_generator=RecordingReasonGenerator(ReasonGenerationOutput()),
+        feedback_store=DummyFeedbackStore(),
+    )
+
+    result = asyncio.run(service.search_candidates(query="Recommend reviewers"))
+
+    assert result["retrieved_count"] == 1
+    assert "검색 파이프라인 시작" in caplog.text
+    assert "플래너 단계 시작" in caplog.text
+    assert "플래너 단계 완료" in caplog.text
+    assert "retrieval_core=['semiconductor']" in caplog.text
+    assert "retrieval_keywords=['semiconductor']" in caplog.text
+    assert "semantic_query='semiconductor research expert'" in caplog.text
+    assert "검색 필터 컴파일 완료" in caplog.text
+    assert "검색 단계 시작" in caplog.text
+    assert "검색 단계 완료" in caplog.text
+    assert "후보 카드 생성 완료" in caplog.text
 
 
 def _bind_search_result(

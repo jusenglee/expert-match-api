@@ -1,3 +1,13 @@
+"""
+사용자의 자연어 질의와 LLM이 파악한 의도(PlannerOutput)를 바탕으로,
+실제 검색 엔진(Qdrant)에 전달될 최종 텍스트 쿼리를 생성하고 조립하는 모듈입니다.
+
+[Architecture Overview]
+사용자의 질의는 단순히 하나의 문자열로 검색되지 않고, 검색 정확도를 높이기 위해 다음과 같이 분할/확장됩니다.
+1. Stable Query: 원본 질의나 핵심 키워드로만 구성되어, 정확한(Exact) 매칭을 노리는 쿼리입니다.
+2. Expanded Query: 핵심 키워드 외에 관련된 동의어(Synonyms)나 사전 정의된 확장 어휘(Bundle)를 덧붙여, 
+                   유의어 누락을 방지(Recall 향상)하는 넓은 범위의 쿼리입니다.
+"""
 from __future__ import annotations
 
 import logging
@@ -36,11 +46,13 @@ class QueryTextBuilder:
     def build_keyword_branch_queries(
         self, query: str, plan: PlannerOutput
     ) -> dict[str, CompiledBranchQueries]:
-        """Sparse keyword-first stage에서 사용할 브랜치별 쿼리를 생성합니다."""
-        return self._build_queries_from_base(
-            self.build_keyword_query_text(query, plan),
-            plan,
-        )
+        """
+        [1차 키워드 검색용 Sparse 전용 쿼리 생성]
+        하이브리드 모드보다 앞서 초고속 풀링(Pooling)을 수행할 때 사용됩니다.
+        복잡한 문장보다는 철저히 핵심 명사(Keyword) 위주로 구성되어야 검색 성능이 높습니다.
+        """
+        base_text = self.build_keyword_query_text(query, plan)
+        return self._build_queries_from_base(base_text, plan)
 
     def build_keyword_query_text(self, query: str, plan: PlannerOutput) -> str:
         keywords = plan.retrieval_core or plan.core_keywords
@@ -57,16 +69,14 @@ class QueryTextBuilder:
         branches = ["basic", "art", "pat", "pjt"]
 
         for branch in branches:
-            # 1. Stable Path 구축
-            stable_text = self._compose_stable(stable_base, branch)
+            # 1. Stable Path 구축 (힌트 단어 없이 순수 쿼리 사용)
+            stable_text = stable_base.strip()
 
-            # 2. Expanded Path 구축 (Shadow Mode용)
+            # 2. Expanded Path 구축 (Shadow Mode용, 힌트 없이 번들 확장어만 추가)
             expanded_keywords = get_expanded_keywords(plan.bundle_ids, branch)
-            expanded_base = stable_base
+            expanded_text = stable_text
             if expanded_keywords:
-                expanded_base = stable_base + " " + " ".join(expanded_keywords)
-
-            expanded_text = self._compose_expanded(expanded_base, branch)
+                expanded_text = f"{stable_text} {' '.join(expanded_keywords)}"
 
             results[branch] = CompiledBranchQueries(
                 stable=stable_text,
@@ -99,16 +109,3 @@ class QueryTextBuilder:
                 if clean and clean not in normalized:
                     normalized.append(clean)
         return normalized
-
-    def _compose_stable(self, base_text: str, branch: str) -> str:
-        hints = {
-            "basic": "전공 학위 소속유형 직위 기술분류 전문가 프로필",
-            "art": "논문명 키워드 초록 학술지 최근 연구실적",
-            "pat": "특허 발명명 출원 등록 사업화 지식재산",
-            "pjt": "과제명 연구목표 연구내용 전문기관 연구수행 경험",
-        }
-        return f"{base_text.strip()}\n{hints.get(branch, '')}"
-
-    def _compose_expanded(self, base_text: str, branch: str) -> str:
-        # 현재는 stable과 같은 hint를 사용하되, base_text에 번들 확장어가 포함됨
-        return self._compose_stable(base_text, branch)

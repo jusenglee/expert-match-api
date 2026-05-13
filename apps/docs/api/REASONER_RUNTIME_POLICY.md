@@ -1,6 +1,6 @@
 # Reasoner Runtime Policy
 
-Last updated: 2026-04-15
+Last updated: 2026-04-23
 
 ## Scope
 
@@ -27,6 +27,9 @@ This document records the active runtime behavior of recommendation reason gener
   - technical classifications
   - evaluation activity summaries
 - Supporting context is trimmed aggressively to keep structured output stable.
+- Each reason-generation LLM attempt uses an `8192` completion-token hint,
+  forwarded as both `max_tokens` and `max_completion_tokens` by the OpenAI
+  compatibility wrapper.
 
 ## Output Contract
 

@@ -90,6 +90,10 @@ class SearchCandidatesResponse(BaseModel):
     searched_branches: list[str] = Field(
         ..., description="Branches used during retrieval"
     )
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="Core keywords used for retrieval (Stage 2 키워드 포함 필터 기준)",
+    )
     retrieved_count: int = Field(..., description="Total retrieved candidate count")
     candidates: list[SearchCandidateItem] = Field(
         ..., description="Retrieved candidate cards"

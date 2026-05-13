@@ -80,9 +80,12 @@
 - `branch_queries`: 브랜치별 쿼리 내역
 - `retrieval_score_traces`: 검색 점수 근거
 - `query_payload.retrieval_mode`: 고정 2단계 검색 모드
+- `query_payload.retrieval_keywords` / `semantic_query`: 플래너 결과에서 실제 검색으로 전달된 키워드와 의미 검색 문장
+- `query_payload.keyword_stage_queries`: 1차 sparse 키워드 검색에 사용한 branch/path별 실제 텍스트
+- `query_payload.hybrid_stage_queries`: 2차 hybrid 검색에 사용한 branch/path별 실제 텍스트
 - `query_payload.keyword_stage_candidate_count`: 1차 sparse 키워드 검색에서 수집한 후보 ID 수
 - `query_payload.hybrid_stage_raw_branch_counts`: 2차 hybrid 검색의 branch/path별 raw hit 수
 - `query_payload.aggregated_candidate_count`: 최종 support rule 적용 전 집계 후보 수
 - `query_payload.support_pass_count` / `support_filtered_count`: support rule 통과/탈락 수
-- `server_logs`: Trace ID로 캡처된 사용자 질의, 플래너, 1차 검색, 2차 검색 단계별 운영 로그
+- `server_logs`: Trace ID와 `METHOD /path` 컨텍스트로 캡처된 사용자 질의, 플래너, 1차 검색, 2차 검색, 응답 준비 단계별 운영 로그
 - `timers`: 구간별 실행 시간

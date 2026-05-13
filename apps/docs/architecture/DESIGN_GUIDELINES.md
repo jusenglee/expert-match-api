@@ -128,7 +128,7 @@
 | Qdrant | 후보 생성, fusion, 필터 적용 | 최종 추천 판단은 담당하지 않음 |
 | Candidate Card Builder | LLM 입력용 증거 요약 | 토큰 비용과 잡음을 줄이는 단계 |
 | LLM Judge / Recommender | Map-Reduce 2단계 심사: Map(경량 병렬 예비 심사) → Reduce(상세 최종 추천) | 최종 의사결정의 핵심 |
-| Visibility Layer | Trace ID 부여 및 실시간 한글 로깅 | **(v1.1 추가)** 전 과정 추적성 보장 |
+| Visibility Layer | Trace ID, HTTP method/path 컨텍스트 부여 및 실시간 한글 로깅 | **(v1.1 추가)** 전 과정 추적성 보장 |
 | Audit Logger | 질의, 필터, 후보, 추천 결과 저장 | 운영 개선과 평가셋 구축에 필수 |
 
 ---
@@ -293,7 +293,7 @@ I/O 필드 규격은 [`CONTRACT.md`](CONTRACT.md)를 참조한다.
 
 ### 8.4 권장 운영 로그 (Trace ID 기반)
 
-모든 로그는 **Trace ID(Request ID)**를 포함하며, 운영자가 즉시 이해할 수 있는 **한글 기반 메시지**로 기록한다. Planner/Retriever/Judge(Map·Reduce 라운드 별) 단계의 주요 로깅 포인트, 로그 형식, 실제 예시는 [`RUNBOOK.md §7`](RUNBOOK.md)를 참조한다.
+모든 로그는 **Trace ID(Request ID)**와 요청 컨텍스트(`METHOD /path`)를 포함하며, 운영자가 즉시 이해할 수 있는 **한글 기반 메시지**로 기록한다. Planner/Retriever/Judge(Map·Reduce 라운드 별) 단계의 주요 로깅 포인트, 로그 형식, 실제 예시는 [`RUNBOOK.md §7`](RUNBOOK.md)를 참조한다.
 
 ---
 

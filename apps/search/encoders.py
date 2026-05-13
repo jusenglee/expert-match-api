@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 
 class DenseEncoder(Protocol):
     """텍스트 임베딩을 위한 인코더 인터페이스 정의입니다."""
-    model_name: str     # 사용할 모델의 이름 또는 경로
-    vector_size: int    # 생성될 벡터의 차원 수
+
+    model_name: str  # 사용할 모델의 이름 또는 경로
+    vector_size: int  # 생성될 벡터의 차원 수
 
     def embed(self, text: str) -> list[float]:
         """텍스트를 입력받아 숫자 리스트(벡터)로 변환합니다."""
@@ -32,6 +33,7 @@ class DenseEncoder(Protocol):
 
 class SparseEncoder(Protocol):
     """희소 벡터(Sparse Vector) 생성을 위한 인코더 인터페이스 정의입니다."""
+
     model_name: str
 
     def embed(self, text: str) -> dict[int, float]:
@@ -45,6 +47,7 @@ class SpladeSparseEncoder:
     Transformers를 사용하여 SPLADE(Sparse Lexical and Semantic) 희소 벡터를 생성합니다.
     fastembed가 지원하지 않는 모델(예: PIXIE-Splade)을 로컬에서 실행하기 위해 사용합니다.
     """
+
     model_name: str
     local_files_only: bool = False
     _tokenizer: Any = field(init=False, repr=False)
@@ -67,7 +70,11 @@ class SpladeSparseEncoder:
             )
             self._model.to(self._device)
             self._model.eval()
-            logger.info("SpladeSparseEncoder initialized on %s: %s", self._device, self.model_name)
+            logger.info(
+                "SpladeSparseEncoder initialized on %s: %s",
+                self._device,
+                self.model_name,
+            )
         except Exception as exc:
             logger.error("Failed to initialize SpladeSparseEncoder: %s", exc)
             raise
@@ -77,27 +84,30 @@ class SpladeSparseEncoder:
         if not text or not text.strip():
             return {}
 
-        inputs = self._tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(self._device)
-        
+        inputs = self._tokenizer(
+            text, return_tensors="pt", truncation=True, padding=True
+        ).to(self._device)
+
         with torch.no_grad():
             logits = self._model(**inputs).logits
-            
+
         # SPLADE log(1 + ReLU(logits)) * attention_mask
         weights = torch.log(1 + torch.relu(logits))
         # Max pooling across tokens
         input_mask = inputs.attention_mask.unsqueeze(-1).expand_as(weights)
         sparse_vector = torch.max(weights * input_mask, dim=1).values[0]
-        
+
         # 0이 아닌 가중치만 추출
         indices = torch.nonzero(sparse_vector).flatten()
         values = sparse_vector[indices]
-        
+
         return {int(idx): float(val) for idx, val in zip(indices, values)}
 
 
 @dataclass(slots=True)
 class HashingDenseEncoder:
     """테스트용 해싱 기반 인코더입니다."""
+
     model_name: str
     vector_size: int
 
@@ -108,6 +118,7 @@ class HashingDenseEncoder:
 @dataclass(slots=True)
 class OpenAIEmbeddingEncoder:
     """OpenAI API를 사용하는 임베딩 인코더입니다."""
+
     model_name: str
     vector_size: int
     base_url: str
@@ -121,13 +132,16 @@ class OpenAIEmbeddingEncoder:
         response = self._client.embeddings.create(model=self.model_name, input=text)
         vector = list(response.data[0].embedding)
         if len(vector) != self.vector_size:
-            raise ValueError(f"Embedding dimension mismatch: expected {self.vector_size}, got {len(vector)}")
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {self.vector_size}, got {len(vector)}"
+            )
         return vector
 
 
 @dataclass(slots=True)
 class LocalSentenceTransformerEncoder:
     """SentenceTransformer를 사용하는 로컬 인코더입니다."""
+
     model_name: str
     vector_size: int
     _model: object = field(init=False, repr=False)
@@ -145,7 +159,9 @@ class LocalSentenceTransformerEncoder:
     def embed(self, text: str) -> list[float]:
         vector = self._model.encode(text).tolist()
         if len(vector) != self.vector_size:
-            raise ValueError(f"Embedding dimension mismatch: expected {self.vector_size}, got {len(vector)}")
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {self.vector_size}, got {len(vector)}"
+            )
         return vector
 
 
