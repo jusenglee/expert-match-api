@@ -1,94 +1,92 @@
 # Reasoner Runtime Policy
 
-Last updated: 2026-04-17
+Last updated: 2026-04-23
 
 ## Scope
 
-This document describes the active runtime policy for recommendation reason generation.
+This document records the active runtime behavior of recommendation reason generation after the tool-calling stabilization update.
 
 ## Active Policy
 
-- evidence selection is server-owned
-- the LLM is summary-only
-- generation runs in batches of `5`
-- the primary attempt uses tool calling
-- one compact retry is allowed for partial batch output
-- unresolved candidates fall back to server-generated reasons
+- Reason generation runs in sequential batches of up to `5` candidates.
+- Evidence selection builds a per-candidate relevant pool capped at:
+  - papers: `10`
+  - projects: `10`
+  - patents: `10`
+- The reasoner uses a staged execution model:
+  1. primary attempt with tool calling
+  2. one retry with a smaller JSON-only payload
+  3. deterministic server-side fallback if both attempts fail
 
-## Input Contract
+## Prompt Budgeting
 
-Top-level inputs include:
-
-- `query`
-- `must_aspects`
-- `generic_terms`
-
-Per-candidate inputs include:
-
-- `expert_id`
-- `candidate_name`
-- `selected_evidence`
-- `selected_evidence_summary`
-- `retrieval_grounding`
-- `do_not_mention`
-
-`do_not_mention` contains:
-
-- other candidate names
-- internal evidence ids
+- `relevant_*` evidence is the direct grounding set for `recommendation_reason`.
+- Compact supporting context may also be included:
+  - compact `all_*` previews
+  - compact retrieval grounding
+  - technical classifications
+  - evaluation activity summaries
+- Supporting context is trimmed aggressively to keep structured output stable.
+- Each reason-generation LLM attempt uses an `8192` completion-token hint,
+  forwarded as both `max_tokens` and `max_completion_tokens` by the OpenAI
+  compatibility wrapper.
 
 ## Output Contract
 
-The LLM returns only:
+The public recommendation response schema is unchanged. Internally, the LLM is expected to produce this structured payload:
 
-- `expert_id`
-- `fit`
-- `recommendation_reason`
-- `risks`
+```json
+{
+  "items": [
+    {
+      "expert_id": "12345678",
+      "fit": "높음",
+      "recommendation_reason": "짧고 근거 기반인 추천 사유",
+      "selected_evidence_ids": ["paper:0", "project:1"],
+      "risks": []
+    }
+  ],
+  "data_gaps": []
+}
+```
 
-The LLM does not return or choose `selected_evidence_ids`.
+Evidence ID policy:
 
-## Retry Policy
+- `selected_evidence_ids` must copy provided evidence ids exactly.
+- Valid id format is limited to:
+  - `paper:<number>`
+  - `project:<number>`
+  - `patent:<number>`
+- If no direct evidence can be selected for a candidate, the model should return an empty `selected_evidence_ids` array instead of inventing ids.
 
-Compact retry is triggered when any of these occur:
+## Trace Signals
 
-- `missing_candidate_ids` is non-empty
-- `returned_ratio < 1.0`
-- empty recommendation reasons are returned
-
-Retry keeps the same server-selected evidence set and only reduces prompt budget.
-
-## Validator Policy
-
-After reason generation, the deterministic validator checks:
-
-- other candidate name leakage
-- internal evidence id leakage
-- aspect/evidence consistency
-- strong claims without direct evidence
-
-Aspect checks use the selector-equivalent evidence scope:
-
-- `title`
-- `detail`
-- `snippet`
-
-## Trace Fields
-
-Batch trace fields:
+Batch-level trace fields:
 
 - `mode`
 - `retry_count`
 - `returned_ratio`
 - `prompt_budget_mode`
-- `selected_evidence_count`
-- `retry_triggered`
-- `retry_trigger`
-- `retry_reason`
+- `trim_applied`
+- `payload_token_estimate`
+- `attempts`
 
 Top-level trace fields:
 
-- `reason_generation_trace.batches`
-- `reason_generation_trace.selected_evidence`
+- `reason_generation_trace.reason_generation_failed`
 - `reason_generation_trace.server_fallback_reasons`
-- `reason_generation_trace.reason_sync_validator`
+
+Per-candidate evidence-resolution trace fields:
+
+- `selected_evidence_ids`
+- `resolver_available_evidence_ids`
+- `invalid_selected_evidence_ids`
+- `unresolved_selected_evidence_ids`
+- `resolved_evidence_ids`
+- `relevant_bundle_empty`
+- `fallback`
+
+## Notes
+
+- This update does not add any new environment variables.
+- This update does not require new runbook steps.

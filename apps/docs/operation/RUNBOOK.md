@@ -82,9 +82,11 @@ curl -X POST http://127.0.0.1:8011/recommend `
 본 시스템은 모든 요청에 대해 **Trace ID**를 부여하여 추적성을 보장합니다.
 
 ### 주요 추적 로그 포인트 (한글 로그)
+- **요청 컨텍스트**: Trace ID, HTTP method/path, client, content type/length, user agent, 처리 시간
 - **사용자 질의**: endpoint, 정규화 전/후 길이, `top_k`, include/exclude 기관 수, filter override key, 정규화된 질의
-- **Planner**: 사용자 질의 분석 결과, 하드 필터 추출 정보, LLM 응답 소요시간 및 토큰 수
-- **Retriever**: 1차 sparse 키워드 후보 풀, 2차 하이브리드 검색 범위, branch/path별 hit count, support rule 통과/탈락 수
+- **Planner**: 사용자 질의 분석 결과, `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, `bundle_ids`, 하드 필터 값
+- **Retriever**: 실제 `retrieval_keywords`, 1차 sparse 키워드 검색 쿼리, 2차 hybrid 검색 쿼리, 후보 ID 미리보기, branch/path별 hit count, support rule 통과/탈락 수
+- **Recommendation**: Top-k 후보 확정, 증거 선별 건수, 사유 생성 배치 수, 최종 추천/데이터 공백 수
 - **Judge Map 라운드**: 배치 분할 정보(라운드 번호, 배치 수, 배치 크기), 후보별 예상 토큰 크기, `max_tokens=3000` 제한 적용, LLM 호출 슬롯 획득(세마포어), 경량 응답 수신 시간, 생존자(survivors) 수
 - **Judge Reduce 라운드**: 생존 후보의 전체 직렬화 토큰 추정, `max_tokens=unlimited` 적용, 상세 응답 수신 시간
 - **Judge JSON 추출**: 3단계 방어 JSON 추출 결과 (추출된 텍스트 로깅)
@@ -93,27 +95,30 @@ curl -X POST http://127.0.0.1:8011/recommend `
 - **Data Gap**: 특정 전문가의 데이터 누락(논문 없음 등)에 대한 경고
 
 로그 형식은 다음과 같으며, Playground UI의 콘솔에서 레벨별 색상과 함께 확인할 수 있습니다.
-`[시간] [레벨] [ID:TraceID] [모듈명] 메시지`
+`[HH:MM:SS.mmm] [레벨] [trace=TraceID] [METHOD /path] [모듈명] 메시지`
 
 ### 로그 예시 (질의 → 플래너 → 1차 검색 → 2차 검색)
 ```
-[09:45:51] [INFO] [ID:abc123] [apps.api.main] 사용자 질의 수신: endpoint=/recommend raw_chars=42 normalized_chars=42 top_k=5 include_orgs=0 exclude_orgs=1 filter_keys=[] query='드론 화재 진압 전문가 추천'
-[09:45:51] [INFO] [ID:abc123] [apps.recommendation.service] 플래너 단계 시작: query='드론 화재 진압 전문가 추천'
-[09:45:52] [INFO] [ID:abc123] [apps.recommendation.planner] 플래너 내부 완료: mode=openai_compat intent='드론 화재 진압 전문가 탐색' keywords=2 semantic_query=True include_orgs=0 exclude_orgs=1 filters=[] top_k=5
-[09:45:52] [INFO] [ID:abc123] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.14 unique_candidates=37 branch_counts={'basic:stable': 8, 'art:stable': 15, 'art:expanded': 4, 'pat:stable': 2, 'pjt:stable': 6, 'pjt:expanded': 2}
-[09:45:52] [INFO] [ID:abc123] [apps.search.retriever] 2차 하이브리드 검색 시작: paths=6 candidate_filter_count=37 query_filter=True semantic_query=True
-[09:45:52] [INFO] [ID:abc123] [apps.search.retriever] 검색 집계 완료: raw_branch_counts={'basic:stable': 20, 'art:stable': 20, 'art:expanded': 12, 'pat:stable': 5, 'pjt:stable': 18, 'pjt:expanded': 9} aggregated_candidates=24 support_pass=15 support_filtered=9 final_hits=15
+[09:45:51.120] [INFO    ] [trace=abc123] [POST /recommend] [apps.api.main] 요청 시작: method=POST path=/recommend client=127.0.0.1 query_params=0 content_type=application/json content_length=180 user_agent='Mozilla/5.0'
+[09:45:51.125] [INFO    ] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend raw_chars=42 raw_lines=1 normalized_chars=42 top_k=5 include_orgs=0 exclude_orgs=1 filter_keys=[] include_preview=[] exclude_preview=['A기관'] query='드론 화재 진압 전문가 추천'
+[09:45:51.130] [INFO    ] [trace=abc123] [POST /recommend] [apps.recommendation.service] 플래너 단계 시작: query='드론 화재 진압 전문가 추천'
+[09:45:52.010] [INFO    ] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 내부 완료: mode=openai_compat intent='드론 화재 진압 전문가 탐색' retrieval_core=['드론', '화재 진압'] core_keywords=['드론', '화재 진압'] role_terms=['전문가'] action_terms=['추천'] semantic_query='드론 화재 진압 기술 전문가' bundle_ids=['uav', 'fire_response'] include_orgs=[] exclude_orgs=['A기관'] hard_filters={} top_k=5
+[09:45:52.080] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 쿼리 컴파일 완료: mode=keyword_pool_then_hybrid retrieval_keywords=['드론', '화재', '진압'] semantic_query='드론 화재 진압 기술 전문가' bundle_ids=['uav', 'fire_response'] keyword_queries={'basic': {'stable': '드론 화재 진압', 'expanded': '드론 화재 진압'}, 'art': {'stable': '드론 화재 진압', 'expanded': '드론 무인기 UAV 화재 진압'}} hybrid_queries={'basic': {'stable': '드론 화재 진압 기술 전문가', 'expanded': '드론 화재 진압 기술 전문가'}} keyword_paths=6 hybrid_paths=6 limits={prefetch:100, hybrid:40, retrieval:80}
+[09:45:52.095] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.14 unique_candidates=37 branch_counts={'basic:stable': 8, 'art:stable': 15, 'art:expanded': 4, 'pat:stable': 2, 'pjt:stable': 6, 'pjt:expanded': 2} candidate_preview=['1001', '1002', '1003']
+[09:45:52.100] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 2차 하이브리드 검색 시작: paths=6 candidate_filter_count=37 query_filter=True semantic_query='드론 화재 진압 기술 전문가' hybrid_queries={'basic': {'stable': '드론 화재 진압 기술 전문가', 'expanded': '드론 화재 진압 기술 전문가'}} candidate_preview=['1001', '1002', '1003']
+[09:45:52.220] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 집계 완료: raw_branch_counts={'basic:stable': 20, 'art:stable': 20, 'art:expanded': 12, 'pat:stable': 5, 'pjt:stable': 18, 'pjt:expanded': 9} aggregated_candidates=24 support_pass=15 support_filtered=9 final_hits=15 filtered_preview=[]
+[09:45:54.330] [INFO    ] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비 완료: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms': 880.4, 'search_ms': 210.1, 'total_ms': 3205.7}
 ```
 
-`trace.query_payload`에서도 `retrieval_mode`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다.
+`trace.query_payload`에서도 `retrieval_mode`, `retrieval_keywords`, `semantic_query`, `keyword_stage_queries`, `hybrid_stage_queries`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다.
 
 ### 로그 예시 (Map-Reduce 심사)
 ```
-[09:45:54] [INFO] [ID:abc123] [Judge] Map-Reduce 분할 시작: 총 후보=37 배치크기=10 배치수=4
-[09:45:54] [INFO] [ID:abc123] [Judge] 데이터당 예상 토큰 크기: context=map 총 추정=1200 토큰 후보 수=10
-[09:45:54] [INFO] [ID:abc123] [Judge] LLM 호출 슬롯 획득: context=map round=1 batch=1/4 max_concurrency=10 max_tokens=3000
-[09:45:56] [INFO] [ID:abc123] [Judge] LLM 응답 수신 완료: context=map round=1 batch=1/4 소요시간=1823.45ms
-[09:45:58] [INFO] [ID:abc123] [Judge] Map 라운드 완료: 생존 후보=15
-[09:45:58] [INFO] [ID:abc123] [Judge] LLM 판정 시작: context=reduce round=2 batch=1/1 후보 수=15 max_tokens=unlimited
-[09:46:09] [INFO] [ID:abc123] [Judge] LLM 응답 수신 완료: context=reduce round=2 batch=1/1 소요시간=10894.23ms
+[09:45:54.000] [INFO    ] [trace=abc123] [POST /recommend] [Judge] Map-Reduce 분할 시작: 총 후보=37 배치크기=10 배치수=4
+[09:45:54.020] [INFO    ] [trace=abc123] [POST /recommend] [Judge] 데이터당 예상 토큰 크기: context=map 총 추정=1200 토큰 후보 수=10
+[09:45:54.050] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 호출 슬롯 획득: context=map round=1 batch=1/4 max_concurrency=10 max_tokens=3000
+[09:45:56.240] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 응답 수신 완료: context=map round=1 batch=1/4 소요시간=1823.45ms
+[09:45:58.100] [INFO    ] [trace=abc123] [POST /recommend] [Judge] Map 라운드 완료: 생존 후보=15
+[09:45:58.140] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 판정 시작: context=reduce round=2 batch=1/1 후보 수=15 max_tokens=unlimited
+[09:46:09.010] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 응답 수신 완료: context=reduce round=2 batch=1/1 소요시간=10894.23ms
 ```

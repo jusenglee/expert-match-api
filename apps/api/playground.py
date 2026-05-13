@@ -676,11 +676,8 @@ PLAYGROUND_HTML = dedent(
                 line.className = 'log-line';
                 
                 // 레벨에 따른 색상 결정
-                if (msg.includes('[INFO]')) line.classList.add('log-INFO');
-                else if (msg.includes('[DEBUG]')) line.classList.add('log-DEBUG');
-                else if (msg.includes('[WARNING]')) line.classList.add('log-WARNING');
-                else if (msg.includes('[ERROR]')) line.classList.add('log-ERROR');
-                else if (msg.includes('[CRITICAL]')) line.classList.add('log-CRITICAL');
+                const levelMatch = msg.match(/\\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\\s*\\]/);
+                if (levelMatch) line.classList.add(`log-${levelMatch[1]}`);
                 
                 line.textContent = msg;
                 logContent.appendChild(line);

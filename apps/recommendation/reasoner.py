@@ -1,3 +1,17 @@
+"""
+최종 선별된 전문가 후보군을 LLM이 심사하여, 사용자의 질의에 가장 적합한 '추천 사유(Reason)'를 생성하는 모듈입니다.
+
+[Architecture Overview]
+1. Map-Reduce (Batch Processing): 
+   수십 명의 후보를 한 번에 심사하면 컨텍스트 윈도우 한계나 환각(Hallucination)이 발생할 수 있습니다. 
+   따라서 5명 단위(REASON_GENERATION_BATCH_SIZE)로 묶어서 병렬(비동기)로 LLM에 심사를 요청합니다.
+2. Evidence-Based Judging:
+   단순한 메타데이터가 아니라, 논문/특허/과제 등 명확한 실적(Evidence)을 LLM에게 프롬프트로 제공하여
+   '근거 없는 추천(Hallucination)'을 원천 차단합니다.
+3. Fit Evaluation:
+   LLM은 각 후보자의 적합도를 높음(FIT_HIGH), 중간(FIT_MEDIUM), 보통(FIT_NORMAL)으로 분류하며,
+   이 적합도 점수는 이후 최종 정렬에 반영될 수 있습니다.
+"""
 from __future__ import annotations
 
 import json
@@ -26,7 +40,7 @@ FIT_VALUES = {FIT_HIGH, FIT_MEDIUM, FIT_NORMAL}
 
 MAX_SELECTED_EVIDENCE_IDS = 4
 REASON_TOOL_NAME = "submit_recommendation_batch"
-REASON_GENERATION_MAX_TOKENS = 1600
+REASON_GENERATION_MAX_TOKENS = 8192
 VALID_EVIDENCE_ID_PATTERN = re.compile(r"^(paper|project|patent):\d+$")
 
 PRIMARY_PAYLOAD_PROFILE: dict[str, Any] = {
@@ -134,6 +148,9 @@ class ReasonGenerator(Protocol):
 
 
 class PassThroughReasonGenerator:
+    """
+    LLM 사유 생성을 건너뛰고 기본 정보만 반환하는 폴백(Fallback) 생성기입니다.
+    """
     def __init__(self) -> None:
         self.last_trace: dict[str, Any] = {}
 
@@ -146,6 +163,18 @@ class PassThroughReasonGenerator:
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle] | None = None,
         retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]] | None = None,
     ) -> ReasonGenerationOutput:
+        """
+        [LLM 심사 폴백]
+        LLM 호출이 불가능하거나 실패했을 때, 최소한의 정보(Expert ID)만 담긴 응답을 생성합니다.
+        """
+        _ = (
+            query,
+            plan,
+            relevant_evidence_by_expert_id,
+            retrieval_score_traces_by_expert_id,
+        )
+        from tenacity import retry
+        payload_profile = RETRY_PAYLOAD_PROFILE if retry > 0 else PRIMARY_PAYLOAD_PROFILE
         _ = (
             query,
             plan,
@@ -183,6 +212,9 @@ class PassThroughReasonGenerator:
 
 
 class OpenAICompatReasonGenerator:
+    """
+    OpenAI 호환 API를 사용하여 병렬(Batch)로 추천 사유를 생성하는 Reasoner입니다.
+    """
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.fallback = PassThroughReasonGenerator()
@@ -316,10 +348,16 @@ class OpenAICompatReasonGenerator:
     ) -> list[dict[str, Any]]:
         return [
             {
-                "title": _truncate_text(item.publication_title, profile["detail_char_limit"]),
-                "journal_name": _truncate_text(item.journal_name, profile["detail_char_limit"]),
+                "title": _truncate_text(
+                    item.publication_title, profile["detail_char_limit"]
+                ),
+                "journal_name": _truncate_text(
+                    item.journal_name, profile["detail_char_limit"]
+                ),
                 "date": item.publication_year_month,
-                "abstract": _truncate_text(item.abstract, profile["abstract_char_limit"]),
+                "abstract": _truncate_text(
+                    item.abstract, profile["abstract_char_limit"]
+                ),
                 "korean_keywords": list(item.korean_keywords)[
                     : profile["matched_keywords_limit"]
                 ],
@@ -340,7 +378,9 @@ class OpenAICompatReasonGenerator:
     ) -> list[dict[str, Any]]:
         return [
             {
-                "title": _truncate_text(item.display_title, profile["detail_char_limit"]),
+                "title": _truncate_text(
+                    item.display_title, profile["detail_char_limit"]
+                ),
                 "start_date": item.project_start_date,
                 "end_date": item.project_end_date,
                 "reference_year": item.reference_year,
@@ -351,7 +391,8 @@ class OpenAICompatReasonGenerator:
                     item.managing_agency, profile["detail_char_limit"]
                 ),
                 "research_objective_summary": _truncate_text(
-                    item.research_objective_summary, profile["project_summary_char_limit"]
+                    item.research_objective_summary,
+                    profile["project_summary_char_limit"],
                 ),
                 "research_content_summary": _truncate_text(
                     item.research_content_summary, profile["project_summary_char_limit"]
@@ -448,15 +489,21 @@ class OpenAICompatReasonGenerator:
             serialized.append(
                 {
                     "expert_id": candidate.expert_id,
-                    "name": _truncate_text(candidate.name, profile["detail_char_limit"]),
+                    "name": _truncate_text(
+                        candidate.name, profile["detail_char_limit"]
+                    ),
                     "organization": _truncate_text(
                         candidate.organization, profile["detail_char_limit"]
                     ),
                     "position": _truncate_text(
                         candidate.position, profile["detail_char_limit"]
                     ),
-                    "degree": _truncate_text(candidate.degree, profile["detail_char_limit"]),
-                    "major": _truncate_text(candidate.major, profile["detail_char_limit"]),
+                    "degree": _truncate_text(
+                        candidate.degree, profile["detail_char_limit"]
+                    ),
+                    "major": _truncate_text(
+                        candidate.major, profile["detail_char_limit"]
+                    ),
                     "rank_score": candidate.rank_score,
                     "shortlist_score": candidate.shortlist_score,
                     "branch_presence_flags": dict(candidate.branch_presence_flags),
@@ -552,8 +599,7 @@ class OpenAICompatReasonGenerator:
             invalid_selected_evidence_ids = [
                 evidence_id
                 for evidence_id in raw_selected_evidence_ids
-                if evidence_id
-                and not VALID_EVIDENCE_ID_PATTERN.fullmatch(evidence_id)
+                if evidence_id and not VALID_EVIDENCE_ID_PATTERN.fullmatch(evidence_id)
             ]
             normalized_selected_evidence_ids: list[str] = []
             for evidence_id in raw_selected_evidence_ids:
@@ -722,7 +768,9 @@ class OpenAICompatReasonGenerator:
             raise ValueError("Reason generator returned no matching candidate ids")
 
         candidate_count = len(candidates)
-        returned_ratio = round(len(returned_ids) / candidate_count, 3) if candidate_count else 0.0
+        returned_ratio = (
+            round(len(returned_ids) / candidate_count, 3) if candidate_count else 0.0
+        )
         trace = {
             "mode": parse_mode,
             "candidate_count": candidate_count,
@@ -830,7 +878,9 @@ class OpenAICompatReasonGenerator:
             "prompt_budget_mode": "fallback",
             "trim_applied": True,
             "reason": "; ".join(
-                attempt.get("reason", "") for attempt in attempt_history if attempt.get("reason")
+                attempt.get("reason", "")
+                for attempt in attempt_history
+                if attempt.get("reason")
             ),
             "returned_ids": list(fallback_trace.get("returned_ids", [])),
             "missing_candidate_ids": list(

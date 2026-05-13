@@ -1,3 +1,13 @@
+"""
+사용자의 요청(추천 질의)을 받아 전체 RAG(Retrieval-Augmented Generation) 기반 추천 파이프라인을 지휘하는 오케스트레이터입니다.
+
+[Architecture Overview]
+1. Planner (의도 분석): 사용자의 자연어 질의를 분석하여 검색 키워드, 동의어 확장 번들, 사전 필터 등을 추출합니다.
+2. Retriever (검색): Qdrant 하이브리드 엔진을 통해 수만 명의 후보자 중 가장 관련성 높은 후보자 풀을 확보합니다.
+3. Card Builder (정보 수합): 검색된 후보자의 논문, 특허, 과제 실적을 모아 '후보자 카드(CandidateCard)'를 만듭니다.
+4. Evidence Selector (증거 선별): 후보자의 수많은 실적 중, 사용자 질의와 가장 매칭되는 실적 상위 N개를 추려냅니다.
+5. Reasoner (추천 사유 및 심사): 추려진 핵심 증거를 바탕으로 LLM이 "왜 이 사람이 전문가인지" 심사하고 추천 사유를 작성합니다.
+"""
 from __future__ import annotations
 
 import logging
@@ -21,7 +31,7 @@ from apps.recommendation.reasoner import (
 )
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.query_builder import QueryTextBuilder
-from apps.search.retriever import QdrantHybridRetriever
+from apps.search.retriever import QdrantHybridRetriever, SearchHit
 from apps.search.schema_registry import BRANCHES
 
 logger = logging.getLogger(__name__)
@@ -38,7 +48,21 @@ def _sorted_filter_keys(filters: dict[str, Any] | None) -> list[str]:
     return sorted((filters or {}).keys())
 
 
+def _filter_summary(filters: dict[str, Any] | None) -> dict[str, Any]:
+    return {key: (filters or {}).get(key) for key in _sorted_filter_keys(filters)}
+
+
+def _count_relevant_evidence_items(
+    bundles: dict[str, RelevantEvidenceBundle],
+) -> int:
+    return sum(len(bundle.all_items()) for bundle in bundles.values())
+
+
 class RecommendationService:
+    """
+    모든 하위 컴포넌트(Planner, Retriever, Reasoner 등)를 연결하여 
+    단일 엔드포인트에서 추천 프로세스를 수행하도록 돕는 파사드(Facade) 클래스입니다.
+    """
     def __init__(
         self,
         *,
@@ -67,6 +91,53 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
+        """
+        [/recommend 내부용] RRF 기반 후보자 검색 파이프라인.
+        """
+        return await self._run_search_pipeline(
+            query=query,
+            filters_override=filters_override,
+            include_orgs=include_orgs,
+            exclude_orgs=exclude_orgs,
+            top_k=top_k,
+            retrieve=self.retriever.search,
+            mode_label="keyword_pool_then_hybrid",
+        )
+
+    async def search_weighted_candidates(
+        self,
+        *,
+        query: str,
+        filters_override: dict[str, Any] | None = None,
+        include_orgs: list[str] | None = None,
+        exclude_orgs: list[str] | None = None,
+        top_k: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        [/search/candidates 전용] 순수 가중치 하이브리드 검색 파이프라인.
+        dense * 0.6 + sparse * 0.4 점수 융합 + 핵심 키워드 포함 별도 필터.
+        """
+        return await self._run_search_pipeline(
+            query=query,
+            filters_override=filters_override,
+            include_orgs=include_orgs,
+            exclude_orgs=exclude_orgs,
+            top_k=top_k,
+            retrieve=self.retriever.search_weighted,
+            mode_label="keyword_pool_then_weighted_hybrid",
+        )
+
+    async def _run_search_pipeline(
+        self,
+        *,
+        query: str,
+        filters_override: dict[str, Any] | None,
+        include_orgs: list[str] | None,
+        exclude_orgs: list[str] | None,
+        top_k: int | None,
+        retrieve: Any,
+        mode_label: str,
+    ) -> dict[str, Any]:
         logger.info(
             "검색 파이프라인 시작: query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d override_filter_keys=%s",
             len(query),
@@ -90,16 +161,20 @@ class RecommendationService:
             plan.retrieval_core or plan.core_keywords
         )
         logger.info(
-            "플래너 단계 완료: elapsed_ms=%.2f mode=%s intent=%r retrieval_keywords=%d semantic_query=%s bundles=%d include_orgs=%d exclude_orgs=%d hard_filter_keys=%s",
+            "플래너 단계 완료: elapsed_ms=%.2f mode=%s intent=%r retrieval_core=%s core_keywords=%s retrieval_keywords=%s role_terms=%s action_terms=%s semantic_query=%r bundle_ids=%s include_orgs=%s exclude_orgs=%s hard_filters=%s",
             plan_timer.elapsed_ms,
             (planner_trace or {}).get("mode", "unknown"),
             plan.intent_summary,
-            len(retrieval_keywords),
-            bool(plan.semantic_query),
-            len(plan.bundle_ids),
-            len(plan.include_orgs),
-            len(plan.exclude_orgs),
-            _sorted_filter_keys(plan.hard_filters),
+            plan.retrieval_core,
+            plan.core_keywords,
+            retrieval_keywords,
+            plan.role_terms,
+            plan.action_terms,
+            plan.semantic_query,
+            plan.bundle_ids,
+            plan.include_orgs,
+            plan.exclude_orgs,
+            _filter_summary(plan.hard_filters),
         )
 
         query_filter = self.filter_compiler.compile(
@@ -108,11 +183,11 @@ class RecommendationService:
             include_orgs=plan.include_orgs,
         )
         logger.info(
-            "검색 필터 컴파일 완료: has_filter=%s include_orgs=%d exclude_orgs=%d hard_filter_keys=%s",
+            "검색 필터 컴파일 완료: has_filter=%s include_orgs=%s exclude_orgs=%s hard_filters=%s",
             query_filter is not None,
-            len(plan.include_orgs),
-            len(plan.exclude_orgs),
-            _sorted_filter_keys(plan.hard_filters),
+            plan.include_orgs,
+            plan.exclude_orgs,
+            _filter_summary(plan.hard_filters),
         )
 
         if not retrieval_keywords:
@@ -144,12 +219,14 @@ class RecommendationService:
             }
 
         logger.info(
-            "검색 단계 시작: mode=keyword_pool_then_hybrid retrieval_keywords=%d query_filter=%s",
-            len(retrieval_keywords),
+            "검색 단계 시작: mode=%s retrieval_keywords=%s semantic_query=%r query_filter=%s",
+            mode_label,
+            retrieval_keywords,
+            plan.semantic_query,
             query_filter is not None,
         )
         with Timer() as search_timer:
-            retrieval = await self.retriever.search(
+            retrieval = await retrieve(
                 query=query,
                 plan=plan,
                 query_filter=query_filter,
@@ -157,11 +234,12 @@ class RecommendationService:
 
         retrieval_payload = retrieval.query_payload or {}
         logger.info(
-            "검색 단계 완료: elapsed_ms=%.2f hits=%d cache_hit=%s mode=%s keyword_candidates=%s hybrid_filter_candidates=%s aggregated_candidates=%s support_pass=%s support_filtered=%s",
+            "검색 단계 완료: elapsed_ms=%.2f hits=%d cache_hit=%s mode=%s retrieval_keywords=%s keyword_candidates=%s hybrid_filter_candidates=%s aggregated_candidates=%s support_pass=%s support_filtered=%s",
             search_timer.elapsed_ms,
             len(retrieval.hits),
             retrieval.cache_hit,
             retrieval_payload.get("retrieval_mode"),
+            retrieval.retrieval_keywords,
             retrieval_payload.get("keyword_stage_candidate_count"),
             retrieval_payload.get("hybrid_stage_candidate_filter_count"),
             retrieval_payload.get("aggregated_candidate_count"),
@@ -184,7 +262,7 @@ class RecommendationService:
             "query_filter": query_filter,
             "retrieved_count": len(retrieval.hits),
             "candidates": cards,
-            "hits_with_support": display_hits, # Support 정보 포함된 원본 히트
+            "hits_with_support": display_hits,
             "support_rule_applied": True,
             "cache_hit": retrieval.cache_hit,
             "filtered_out_candidates": retrieval.filtered_out_candidates,
@@ -211,7 +289,18 @@ class RecommendationService:
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
     ) -> dict[str, Any]:
-        logger.info("Recommendation started: query=%r", query)
+        """
+        사용자의 질의를 바탕으로 전체 추천 프로세스(검색 + 심사)를 수행합니다.
+        """
+        logger.info(
+            "추천 파이프라인 시작: query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d override_filter_keys=%s query=%r",
+            len(query),
+            top_k,
+            len(include_orgs or []),
+            len(exclude_orgs or []),
+            _sorted_filter_keys(filters_override),
+            query,
+        )
         total_timer = Timer()
         total_timer.start()
 
@@ -229,15 +318,17 @@ class RecommendationService:
         shortlist = candidate_cards[:top_k_used]
 
         logger.info(
-            "Top-k selected for reason generation: candidates=%d top_k=%d selected=%d",
+            "추천 후보 확정: retrieved_count=%d candidate_cards=%d top_k_used=%d selected=%d shortlist_ids=%s",
+            search_result["retrieved_count"],
             len(candidate_cards),
             top_k_used,
             len(shortlist),
+            [candidate.expert_id for candidate in shortlist],
         )
 
         if search_result["retrieved_count"] == 0 or not shortlist:
             logger.info(
-                "Recommendation finished with no shortlist: query=%r retrieved=%d shortlist=%d",
+                "추천 파이프라인 종료: reason=no_shortlist query=%r retrieved=%d shortlist=%d",
                 query,
                 search_result["retrieved_count"],
                 len(shortlist),
@@ -266,17 +357,49 @@ class RecommendationService:
                 timers=search_result.get("timers"),
             )
 
+        logger.info(
+            "증거 선별 시작: candidates=%d candidate_ids=%s",
+            len(shortlist),
+            [candidate.expert_id for candidate in shortlist],
+        )
         with Timer() as evidence_selection_timer:
             relevant_evidence_by_expert_id = self.evidence_selector.select(
                 candidates=shortlist,
                 plan=plan,
             )
+        evidence_item_count = _count_relevant_evidence_items(
+            relevant_evidence_by_expert_id
+        )
+        empty_evidence_count = sum(
+            1
+            for bundle in relevant_evidence_by_expert_id.values()
+            if not bundle.all_items()
+        )
+        logger.info(
+            "증거 선별 완료: elapsed_ms=%.2f candidates=%d evidence_items=%d empty_candidates=%d",
+            evidence_selection_timer.elapsed_ms,
+            len(relevant_evidence_by_expert_id),
+            evidence_item_count,
+            empty_evidence_count,
+        )
         retrieval_score_traces_by_expert_id = {
             trace["expert_id"]: trace
             for trace in (search_result.get("retrieval_score_traces") or [])
             if trace.get("expert_id")
         }
 
+        reason_batch_count = len(
+            self._chunk_candidates(
+                shortlist,
+                batch_size=REASON_GENERATION_BATCH_SIZE,
+            )
+        )
+        logger.info(
+            "추천 사유 생성 시작: candidates=%d batches=%d batch_size=%d",
+            len(shortlist),
+            reason_batch_count,
+            REASON_GENERATION_BATCH_SIZE,
+        )
         with Timer() as reason_timer:
             reason_output, reason_batch_traces = await self._generate_reasons_in_batches(
                 query=query,
@@ -285,6 +408,13 @@ class RecommendationService:
                 relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
                 retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
             )
+        logger.info(
+            "추천 사유 생성 완료: elapsed_ms=%.2f batches=%d output_items=%d data_gaps=%d",
+            reason_timer.elapsed_ms,
+            len(reason_batch_traces),
+            len(reason_output.items),
+            len(reason_output.data_gaps),
+        )
 
         reason_generation_trace = self._build_reason_generation_trace(
             candidates=shortlist,
@@ -315,9 +445,11 @@ class RecommendationService:
         timers["total_ms"] = total_timer.elapsed_ms
 
         logger.info(
-            "Recommendation finished: query=%r recommended=%d total_ms=%.2f",
+            "추천 파이프라인 완료: query=%r retrieved=%d recommended=%d data_gaps=%d total_ms=%.2f",
             query,
+            search_result["retrieved_count"],
             len(recommendations),
+            len(reason_output.data_gaps),
             total_timer.elapsed_ms,
         )
 
@@ -350,6 +482,9 @@ class RecommendationService:
         notes: str | None,
         metadata: dict[str, Any],
     ) -> int:
+        """
+        추천 결과에 대한 사용자의 피드백을 저장합니다.
+        """
         logger.info(
             "Feedback saved: query=%r selected=%d rejected=%d",
             query,

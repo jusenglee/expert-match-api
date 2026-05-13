@@ -1,6 +1,11 @@
 """
 Qdrant 컬렉션의 데이터 무결성과 시스템 의존성(LLM, Embedding)의 연결 상태를 실시간으로 점검하는 모듈입니다.
-단순한 서버 연결 확인을 넘어, 실제 데이터의 스키마와 필드 존재 여부까지 샘플링을 통해 검증합니다.
+
+[Architecture Overview]
+본 애플리케이션은 시작(Startup) 시 단순히 Qdrant 서버가 떠있는지(`ping`)만 확인하는 것이 아니라,
+실제 추천 서비스가 의존하는 데이터 스키마가 완벽히 구성되어 있는지를 무작위 샘플링 검증을 통해 확인합니다.
+(예: 특정 페이로드 필드가 존재하는지, Dense/Sparse 벡터가 명세대로 생성되어 있는지 등)
+이를 통해 런타임에 발생할 수 있는 뜬금없는 키 에러(KeyError)나 검색 실패를 방지합니다.
 """
 
 from __future__ import annotations
@@ -19,28 +24,36 @@ from apps.search.sparse_runtime import SparseRuntimeConfig, model_requires_idf_m
 logger = logging.getLogger(__name__)
 
 
-# 샘플 데이터 점검을 위한 설정
-SAMPLE_SCAN_BATCH_SIZE = 32
-SAMPLE_SCAN_LIMIT = 256
-# 필수적인 데이터 완성도 체크 항목
+# =========================================================================
+# 무결성 검증을 위한 샘플링 설정
+# =========================================================================
+SAMPLE_SCAN_BATCH_SIZE = 32  # Qdrant에서 한 번에 가져올 포인트 수
+SAMPLE_SCAN_LIMIT = 256      # 최대 탐색할 포인트 수 (이 안에 유효 데이터가 없으면 실패 간주)
+
+# =========================================================================
+# 데이터 구조 완성도 필수/선택 체크 항목
+# =========================================================================
+# 아래 항목들은 전부 'True'여야만 서버가 정상 작동하는 것으로 판단됩니다.
 SAMPLE_COMPLETENESS_CHECKS = (
-    "sample_root_fields",
-    "sample_art_present",
-    "sample_pjt_present",
-    "sample_project_dates_valid",
+    "sample_root_fields",         # 연구자 기본 정보 필드가 존재하는가
+    "sample_art_present",         # 논문(Article) 데이터가 존재하는가
+    "sample_pjt_present",         # 과제(Project) 데이터가 존재하는가
+    "sample_project_dates_valid", # 과제 날짜 데이터가 날짜 형식으로 올바른가
 )
-# 있으면 좋지만 없어도 전체 'Ready' 상태에는 영향을 주지 않는 항목
-OPTIONAL_CHECKS = {"sample_pat_present"}
+# 있으면 좋지만, 테스트 환경 등에서는 없어도 시스템 동작을 막지 않는 선택 항목
+OPTIONAL_CHECKS = {"sample_pat_present"}  # 특허(Patent) 데이터 존재 여부
 
 
 @dataclass(slots=True)
 class LiveValidationReport:
-    """검증 결과를 상세히 담고 있는 보고서 클래스입니다."""
-    ready: bool                        # 시스템이 즉시 사용 가능한 상태인지 여부
-    checks: dict[str, bool]            # 각 개별 점검 항목별 통과 여부
-    issues: list[str]                  # 발견된 문제점들의 목록
-    collection_name: str               # 점검 대상 컬렉션 이름
-    sample_point_id: str | None = None # 점검에 사용된 대표 샘플의 ID
+    """
+    시작 시 헬스체크(Health Check) 엔드포인트나 시작 로그에 출력될 검증 보고서 객체입니다.
+    """
+    ready: bool                        # [필수] 시스템이 즉시 트래픽을 받을 수 있는 준비 상태인가
+    checks: dict[str, bool]            # 각 개별 점검 항목별 통과 여부 내역
+    issues: list[str]                  # 발견된 문제점들의 목록 (오류 추적용)
+    collection_name: str               # 검증 대상 Qdrant 컬렉션 이름
+    sample_point_id: str | None = None # 검증에 사용된 대표 무작위 샘플 포인트의 ID
 
     def to_dict(self) -> dict[str, Any]:
         """보고서 내용을 딕셔너리 형태로 변환합니다."""

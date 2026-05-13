@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -30,7 +31,13 @@ from apps.api.schemas import (
 from apps.core.cache import PlanCache, RetrievalResultCache
 from apps.core.config import Settings, get_settings
 from apps.core.feedback_store import FeedbackStore
-from apps.core.logging import configure_logging, request_id_ctx, captured_logs_ctx
+from apps.core.logging import (
+    captured_logs_ctx,
+    configure_logging,
+    request_id_ctx,
+    request_method_ctx,
+    request_path_ctx,
+)
 from apps.core.runtime_validation import (
     RuntimeDependencyValidator,
     validate_runtime_settings,
@@ -66,22 +73,29 @@ def _normalize_query_text(query: str) -> str:
     return ", ".join(line.strip() for line in query.splitlines() if line.strip())
 
 
+def _preview_items(items: list[str], *, limit: int = 3) -> list[str]:
+    return [item for item in items[:limit]]
+
+
 def _log_api_query_received(
     *,
     endpoint: str,
     raw_query: str,
     normalized_query: str,
-    request: RecommendationRequest,
+    request: Any,
 ) -> None:
     logger.info(
-        "사용자 질의 수신: endpoint=%s raw_chars=%d normalized_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d filter_keys=%s query=%r",
+        "사용자 질의 수신: endpoint=%s raw_chars=%d raw_lines=%d normalized_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d filter_keys=%s include_preview=%s exclude_preview=%s query=%r",
         endpoint,
         len(raw_query),
+        len([line for line in raw_query.splitlines() if line.strip()]),
         len(normalized_query),
         request.top_k,
         len(request.include_orgs),
         len(request.exclude_orgs),
         sorted(request.filters_override.keys()),
+        _preview_items(request.include_orgs),
+        _preview_items(request.exclude_orgs),
         normalized_query,
     )
 
@@ -245,28 +259,52 @@ def create_app(
         """요청마다 고유 ID를 부여하고 처리 시간과 상태를 로그로 남깁니다."""
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
         token = request_id_ctx.set(request_id)
+        method_token = request_method_ctx.set(request.method)
+        path_token = request_path_ctx.set(request.url.path)
         # 로그 캡처 버퍼 초기화
         log_token = captured_logs_ctx.set([])
 
         t0 = time.monotonic()
+        client_host = request.client.host if request.client else "-"
         try:
-            logger.info("--> 요청 시작: [%s] %s", request.method, request.url.path)
+            logger.info(
+                "요청 시작: method=%s path=%s client=%s query_params=%d content_type=%s content_length=%s user_agent=%r",
+                request.method,
+                request.url.path,
+                client_host,
+                len(request.query_params),
+                request.headers.get("content-type", "-"),
+                request.headers.get("content-length", "-"),
+                request.headers.get("user-agent", "-"),
+            )
             response = await call_next(request)
             dt_ms = (time.monotonic() - t0) * 1000
 
             response.headers["X-Request-ID"] = request_id
 
             logger.info(
-                "<-- 요청 완료: [%s] %s | 상태 코드: %d | 소요 시간: %.2fms",
+                "요청 완료: method=%s path=%s status=%d elapsed_ms=%.2f response_content_length=%s",
                 request.method,
                 request.url.path,
                 response.status_code,
                 dt_ms,
+                response.headers.get("content-length", "-"),
             )
             return response
+        except Exception:
+            dt_ms = (time.monotonic() - t0) * 1000
+            logger.exception(
+                "요청 처리 중 예외 발생: method=%s path=%s elapsed_ms=%.2f",
+                request.method,
+                request.url.path,
+                dt_ms,
+            )
+            raise
         finally:
-            request_id_ctx.reset(token)
             captured_logs_ctx.reset(log_token)
+            request_path_ctx.reset(path_token)
+            request_method_ctx.reset(method_token)
+            request_id_ctx.reset(token)
 
     def get_startup_error() -> str | None:
         return getattr(app.state, "startup_error", None)
@@ -374,6 +412,17 @@ def create_app(
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
         )
+        trace = result.get("trace") or {}
+        logger.info(
+            "추천 응답 준비 완료: retrieved_count=%d recommendations=%d data_gaps=%d top_k_used=%s planner_keywords=%s retrieval_keywords=%s timers=%s",
+            result.get("retrieved_count", 0),
+            len(result.get("recommendations") or []),
+            len(result.get("data_gaps") or []),
+            trace.get("top_k_used"),
+            trace.get("planner_keywords") or [],
+            trace.get("retrieval_keywords") or [],
+            trace.get("timers") or {},
+        )
         # 캡처된 로그 주입
         logs = captured_logs_ctx.get()
         if logs is not None and "trace" in result:
@@ -424,7 +473,7 @@ def create_app(
             normalized_query=normalized_query,
             request=request,
         )
-        result = await service.search_candidates(
+        result = await service.search_weighted_candidates(
             query=normalized_query,
             filters_override=request.filters_override,
             include_orgs=request.include_orgs,
@@ -456,6 +505,14 @@ def create_app(
             candidate_items.append(item)
 
         planner_payload = result["planner"].model_dump(mode="json")
+        logger.info(
+            "후보자 검색 응답 준비 완료: retrieved_count=%d candidates=%d planner_keywords=%s retrieval_keywords=%s timers=%s",
+            result["retrieved_count"],
+            len(candidate_items),
+            (result.get("planner_trace") or {}).get("planner_keywords") or [],
+            result.get("retrieval_keywords") or [],
+            result.get("timers") or {},
+        )
 
         trace = {
             "planner": planner_payload,
@@ -497,6 +554,11 @@ def create_app(
             "retrieval_score_traces": result.get("retrieval_score_traces") or [],
             "final_sort_policy": result.get("final_sort_policy"),
             "query_payload": service._serialize_query_payload(result["query_payload"]),
+            "retrieval_mode": (result.get("query_payload") or {}).get("retrieval_mode"),
+            "weights": (result.get("query_payload") or {}).get("weights"),
+            "keyword_inclusion_dropped_count": (
+                (result.get("query_payload") or {}).get("keyword_inclusion_dropped_count", 0)
+            ),
             "timers": result.get("timers") or {},
         }
         if logs is not None:
@@ -506,6 +568,7 @@ def create_app(
             intent_summary=result["planner"].intent_summary,
             applied_filters=result["planner"].hard_filters,
             searched_branches=list(BRANCHES),
+            keywords=result.get("retrieval_keywords") or [],
             retrieved_count=result["retrieved_count"],
             candidates=candidate_items,
             trace=trace,
