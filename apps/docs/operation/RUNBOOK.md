@@ -31,6 +31,27 @@ python -m pip install -e .[dev]
 - dense/sparse가 동일 `chunk_text`에서 생성.
 - `chunk_text`에 요청 어투(role/action 불용어) 미포함.
 
+### 2.2 컬렉션 부트스트랩 CLI (WO-B, VPN 필요)
+
+`apps/tools/bootstrap_chunks.py` — `ntis_researcher_chunks` 컬렉션 생성·점검·스모크.
+
+```bash
+# 컬렉션 생성(단일 dense_e5i + sparse_splade + payload 인덱스)
+NTIS_QDRANT_COLLECTION_NAME=ntis_researcher_chunks python -m apps.tools.bootstrap_chunks ensure
+# 스키마/인덱스 확인 + 레거시 컬렉션 Point 수(보존) 확인
+... python -m apps.tools.bootstrap_chunks inspect
+# 표본 chunk upsert + query_points(dense/sparse/doc_type 필터/OR recency) + 멱등 확인
+... python -m apps.tools.bootstrap_chunks smoke
+```
+
+- **blue/green 가드:** 부트스트래퍼는 레거시 `researcher_recommend_proto`를 **절대 재생성/삭제하지 않는다**(`recreate=True`라도 no-op). v2.0 컬렉션만 단일 벡터 스키마로 생성·재생성.
+- **스모크 벡터:** 임베딩 서버 없이 스키마·필터 동작만 검증하도록 pseudo 벡터를 쓴다(실제 임베딩 적재는 WO-A/WO-D). Point ID는 WO-0 `chunk_id` 코덱 그대로 → 동일 chunk_id 재upsert 시 Point 수 불변(멱등) 확인.
+
+#### sparse modifier 정합 — PATCH vs drop&recreate (B-5)
+
+- **권고:** 신규 v2.0 컬렉션은 **처음부터 올바른 modifier로 생성**(SPLADE=none / `Qdrant/bm25` fallback=IDF)해 PATCH 의존을 회피한다. 운영 중 backend가 바뀌어(예: 로컬 PIXIE 실패 → bm25 fallback) modifier 기대값이 달라지면 `update_collection`(PATCH) 시도 → readiness가 `sparse_vectors_idf` 불일치로 잡으면 **drop&recreate**(blue/green이라 구 컬렉션 무영향).
+- **실측 (TODO, VPN 필요):** 현 환경 Qdrant 버전에서 sparse modifier PATCH가 실시간 교정되는지는 **아직 미측정**(VPN 미연결). `bootstrap_chunks smoke` 1회 실행 후 결과를 이 줄에 기록할 것.
+
 ## 3. 준비 상태 점검 (Readiness)
 
 추천 호출 전 순서:
