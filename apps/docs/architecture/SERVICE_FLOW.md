@@ -1,91 +1,96 @@
-# 서비스 동작 흐름 (Service Flow)
+# 서비스 동작 흐름 (Service Flow) — chunk 파이프라인
 
-## 런타임 흐름 (Runtime Flow)
+**문서 버전:** v2.0 (chunk 재설계, 2026-05-28)
+**데이터 전제:** [`DATA_MODEL.md`](DATA_MODEL.md) / **설계 원칙:** [`DESIGN_GUIDELINES.md`](DESIGN_GUIDELINES.md)
 
-### 1. 플래너 (Planner)
+런타임 파이프라인은 `planner → retrieval(chunk 검색 → 연구자 집계) → evidence_selector → reasoner` 4단계다. `RecommendationService.search_candidates()`가 진입점이며, `/recommend`는 여기에 evidence 선별 + 사유 생성을 더한다.
 
-`RecommendationService.search_candidates()`는 플래너 실행과 함께 시작됩니다.
+---
 
-**플래너의 역할:**
-- 입력된 자연어 질의 정규화
-- 순수 도메인 명사인 `core_keywords` 추출
-- 요청의 목적(역할) 언어를 `task_terms`로 분리
-- 명시적 필터, 포함/제외 기관, `top_k` 설정 보존
+## 1. 플래너 (Planner)
 
-**플래너가 하지 않는 것:**
-- 검색용 재작성 문장 생성
-- 검색 뷰(View) 생성
-- 브랜치 힌트 생성
+**역할:**
+- 자연어 질의 정규화 (여러 줄은 `, `로 합쳐 단일 질의)
+- 순수 도메인 명사 `core_keywords` / `retrieval_core` 추출
+- 의미 검색 문장 `semantic_query` 생성
+- 요청의 목적·역할 언어를 `task_terms`/`role_terms`/`action_terms`로 분리(검색 텍스트에서 제외)
+- 명시 필터, include/exclude 기관, `top_k` 보존
+- (선택) intent flags: 최근성 강조, 평가이력 강조 등 — 집계 prior 힌트로만 사용
 
-### 2. 검색 및 추출 (Retrieval)
+**하지 않는 것:** doc_type on/off 결정, 검색 재작성 문장 임의 생성, 후보 판단.
 
-`QueryTextBuilder`는 1단계 sparse 키워드 검색에는 `retrieval_core`/`core_keywords` 기반 쿼리를, 2단계 hybrid 검색에는 `semantic_query` 기반 쿼리를 생성합니다.
+> doc_type을 planner가 켜고 끄지 않는다. 모든 doc_type은 항상 검색 가능하며, 중요도는 prior(기본 equal)와 LLM 비교로 반영한다. ([`ADR/0003-all-doc-types-searchable.md`](ADR/0003-all-doc-types-searchable.md))
 
-`QdrantHybridRetriever`의 동작:
-- 검색 모드는 `keyword_pool_then_hybrid`로 고정
-- 1단계에서 각 브랜치/경로별 sparse 키워드 검색을 수행하고 `basic_info.researcher_id` 후보 풀 수집
-- 2단계에서 후보 풀을 `basic_info.researcher_id MatchAny` 필터로 제한한 뒤 각 브랜치(기본, 논문, 특허, 과제)별 Dense + Sparse 검색 수행
-- RRF(Reciprocal Rank Fusion) 알고리즘을 통해 브랜치 내 결과 통합
-- 모든 브랜치의 결과를 다시 RRF로 최종 통합
-- 각 결과 항목에 브랜치별 매칭 근거(`retrieval_score_traces`) 기록
-- **결정론적 최종 정렬 적용:**
-  1. 점수(Score) 내림차순
-  2. 성명(Name) 오름차순 (점수 동점 시)
-  3. 전문가 ID(Expert ID) 오름차순 (최종 순위 고정)
+---
 
-### 3. 후보자 반환 (Candidate Return)
+## 2. 검색 및 집계 (Retrieval & Aggregation)
 
-`/search/candidates` 엔드포인트는 정렬된 후보자 목록을 즉시 반환합니다.
+`QueryTextBuilder`는 1단계 sparse 키워드 검색에 `retrieval_core`/`core_keywords` 텍스트를, 2단계 하이브리드에 `semantic_query`(없으면 동일 키워드 텍스트)를 만든다. role/action 용어와 원본 질의는 검색 텍스트로 쓰지 않는다.
 
-**동작 특징:**
-- 요청 시 `top_k`가 명시된 경우 해당 수만큼 제한하여 반환
-- 명시되지 않은 경우 전체 검색 결과 반환
+`QdrantHybridRetriever` 동작 (모드 `keyword_pool_then_hybrid` 고정):
 
-### 4. 추천 결과 생성 (Recommendation Return)
+1. **1단계 — 키워드 풀:** `sparse_splade`로 sparse 키워드 검색 → `researcher_id` 후보 풀을 중복 없이 수집. 풀이 비면 2단계 생략, 빈 결과 + `keyword_stage_candidate_count=0`.
+2. **2단계 — 하이브리드:** 후보 풀을 `researcher_id MatchAny` 필터로 제한. doc_type(또는 family) 경로별로 dense+sparse `prefetch` 조립 → `FusionQuery(RRF)`로 chunk hit 산출.
+3. **3단계 — 연구자 집계:** chunk hit을 `researcher_id`로 묶고 RRF 누적으로 연구자 점수 산출. doc_type별 상위 N개 chunk만 기여(캡), 집계 prior 적용(기본 equal), 연구자당 1건으로 dedupe.
+4. **4단계 — hard filter:** `event_year` 최근성(여러 doc_type은 OR/min_should), `researcher_meta.*_count` 최소 실적, 학위, 제외 기관(meta + 매칭 chunk 기관 필드)을 deterministic 적용.
+5. **5단계 — 결정론적 정렬:** score 내림차순 → `researcher_name` 오름차순 → `researcher_id` 오름차순.
 
-`/recommend` 엔드포인트는 검색 과정을 거친 후 다음 단계를 추가로 수행합니다.
+각 후보에는 어떤 doc_type/chunk이 어떤 순위로 매칭됐는지 `retrieval_score_traces`로 기록한다.
 
-**추천 파이프라인:**
-- 정렬된 상위 K명의 후보자 선택
-- 플래너의 `core_keywords`를 기준으로 각 후보자의 내부 증빙 자료(논문, 과제, 특허) 재랭킹
-- 후보자당 최대 논문 4건, 과제 4건, 특허 4건으로 구성된 **LLM 증빙 풀(Pool)** 구축
-- 최대 5명의 후보자를 한 배치로 묶어 순차적으로 LLM에 전달
-- LLM에 후보자의 기본 맥락(검색 근거, 평가 활동, 기술 분류 등)과 요약 정보 전달
-- LLM으로부터 적합도(`fit`), 추천 사유(`recommendation_reason`), 선택된 증빙 ID를 수신
-- **검색 시의 원본 순서 유지**
-- LLM이 선택한 증빙 ID를 바탕으로 최종 `recommendation.evidence` 구성
-- LLM이 응답을 누락하거나 사유가 없는 경우, 서버 측에서 증빙 기반의 보수적 사유(Fallback) 자동 생성
+---
 
-**LLM이 하지 않는 것:**
-- 후보자 재정렬 (Reranking)
-- 후보자 탈락 시키기 (Filtering)
-- 새로운 전문가 ID 생성
+## 3. 후보자 반환 (Candidate Return)
 
-### 5. 검색 결과 없음 또는 실패 처리
+`/search/candidates`는 정렬된 후보 목록을 즉시 반환한다.
+- `top_k` 명시 시 그 수만큼 제한, 아니면 전체 반환.
+- 각 후보는 family별 보유 여부(`doc_type_coverage`)와 `researcher_meta` 기반 카운트를 함께 노출.
 
-플래너가 재시도 후에도 빈 `core_keywords`를 반환하는 경우:
-- 검색 단계를 건너跳
-- `/search/candidates`는 빈 목록 반환
-- `/recommend`는 구조화된 사유와 함께 빈 추천 목록 반환
+---
 
-## 추적 기록 (Trace Behavior)
+## 4. 추천 결과 생성 (Recommendation Return)
 
-현재 활성화된 추적 필드 목록:
-- `planner`: 플래너 출력물
-- `planner_trace`: 플래너 실행 상세
-- `reason_generation_trace`: 추천 사유 생성 상세
-- `raw_query`: 원본 사용자 질의
-- `planner_keywords`: 플래너 추출 키워드
-- `retrieval_keywords`: 실제 검색에 사용된 키워드
-- `branch_queries`: 브랜치별 쿼리 내역
-- `retrieval_score_traces`: 검색 점수 근거
-- `query_payload.retrieval_mode`: 고정 2단계 검색 모드
-- `query_payload.retrieval_keywords` / `semantic_query`: 플래너 결과에서 실제 검색으로 전달된 키워드와 의미 검색 문장
-- `query_payload.keyword_stage_queries`: 1차 sparse 키워드 검색에 사용한 branch/path별 실제 텍스트
-- `query_payload.hybrid_stage_queries`: 2차 hybrid 검색에 사용한 branch/path별 실제 텍스트
-- `query_payload.keyword_stage_candidate_count`: 1차 sparse 키워드 검색에서 수집한 후보 ID 수
-- `query_payload.hybrid_stage_raw_branch_counts`: 2차 hybrid 검색의 branch/path별 raw hit 수
-- `query_payload.aggregated_candidate_count`: 최종 support rule 적용 전 집계 후보 수
-- `query_payload.support_pass_count` / `support_filtered_count`: support rule 통과/탈락 수
-- `server_logs`: Trace ID와 `METHOD /path` 컨텍스트로 캡처된 사용자 질의, 플래너, 1차 검색, 2차 검색, 응답 준비 단계별 운영 로그
-- `timers`: 구간별 실행 시간
+`/recommend`는 검색 후 다음을 추가 수행한다.
+
+1. 정렬된 상위 K명 선택 (검색 순서 유지).
+2. **evidence 선별:** 후보별 매칭 chunk을 family별로 모아 `core_keywords`/query 관련도로 재랭크(cross-encoder → 모델 부재 시 lexical 강등). family별 top-N chunk만 LLM 입력 풀로 구성. 각 chunk은 `chunk_id`를 그대로 보존.
+3. 최대 5명 단위 배치로 LLM에 전달. 입력 = 후보 머리(profile/meta/평가이력 요약) + 선별 chunk 풀.
+4. LLM은 후보별 `fit`, `recommendation_reason`, `selected_evidence_ids`(=고른 `chunk_id`), `risks`를 반환.
+5. **검색 시 원본 순서 유지.** `selected_evidence_ids`로 최종 `recommendation.evidence`를 조립.
+6. LLM이 사유를 누락/공란으로 두면 서버가 chunk 근거 기반 보수적 fallback 사유를 결정론적으로 생성.
+
+**LLM이 하지 않는 것:** 후보 재정렬, 후보 탈락, 새 ID(연구자/chunk) 생성.
+
+---
+
+## 5. 빈 결과 / 실패 처리
+
+플래너가 재시도 후에도 빈 `core_keywords`를 내면:
+- 검색 단계 생략, `retrieval_skipped_reason`을 trace에 기록
+- `/search/candidates`는 빈 목록, `/recommend`는 구조화된 사유와 함께 빈 추천 목록 반환
+
+---
+
+## 6. 추적 기록 (Trace Behavior)
+
+활성 trace 필드:
+- `planner` / `planner_trace` — 플래너 출력·실행 상세
+- `raw_query`, `planner_keywords`, `retrieval_keywords` — 원본 질의/추출/실제 검색 키워드
+- `reason_generation_trace` — 사유 생성 상세
+- `retrieval_score_traces` — 후보별 매칭 doc_type/chunk과 순위 근거
+- `query_payload.retrieval_mode` — `keyword_pool_then_hybrid` 고정
+- `query_payload.retrieval_keywords` / `semantic_query` — 실제 검색 키워드/의미 문장
+- `query_payload.keyword_stage_queries` / `hybrid_stage_queries` — doc_type 경로별 1·2차 실제 검색 텍스트
+- `query_payload.keyword_stage_candidate_count` — 1차 sparse가 수집한 `researcher_id` 풀 크기
+- `query_payload.hybrid_stage_raw_doc_type_counts` — 2차 doc_type 경로별 raw chunk hit 수
+- `query_payload.aggregated_candidate_count` — 연구자 집계 후 후보 수
+- `query_payload.support_pass_count` / `support_filtered_count` — hard filter 통과/탈락 수
+- `server_logs` — Trace ID + `METHOD /path` 컨텍스트의 단계별 한글 로그
+- `timers` — 구간별 실행 시간
+
+> v1.x 대비 변경: `query_payload.keyword_stage_branch_counts`/`hybrid_stage_raw_branch_counts`의 "branch"가 "doc_type"으로 바뀐다(`*_doc_type_counts`). 외부 trace 변경은 [`../api/EXTERNAL_API_CHANGELOG.md`](../api/EXTERNAL_API_CHANGELOG.md) 참조.
+
+---
+
+## 7. 현재 active path에서 제거된 항목 (역사)
+
+다음은 v1.x 반복에서 제거됐고 v2.0에서도 도입하지 않는다: verifier stage, retrieval views, branch query hints, judge map-reduce를 후보 판단 핵심으로 두는 구조, evidence resolver alignment stage. 사유 생성의 Map-Reduce는 토큰 절감 옵션으로만 존재하며 후보 순위를 바꾸지 않는다.

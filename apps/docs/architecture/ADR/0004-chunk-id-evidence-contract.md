@@ -1,0 +1,21 @@
+# ADR 0004: evidence 참조를 `chunk_id`로 통일
+
+## 상태
+
+승인 (2026-05-28).
+
+## 맥락
+
+v1.x는 LLM이 고른 근거를 `paper:0`/`project:1`/`patent:2` 같은 **배열 인덱스 기반 id**로 참조했다. 이 형식은 직렬화 순서·캡이 바뀌면 의미가 달라지고, 무효/미해결 id를 구분하는 별도 로직이 필요했다. chunk 모델에서는 모든 근거가 이미 불변 식별자 `chunk_id`를 갖는다.
+
+## 결정
+
+- LLM 입력 evidence 풀의 각 항목과 출력 `selected_evidence_ids`는 **`chunk_id`** 를 그대로 사용한다.
+- 위치 기반 형식(`paper:N` 등)은 폐기한다.
+- 서버는 선택된 `chunk_id`로 최종 `recommendation.evidence`를 resolve하고, 풀에 없는/형식 무효 id는 trace에 기록한 뒤 **결정론적 chunk fallback**(후보 최상위 chunk)으로 대체한다.
+- 외부 응답 `recommendation.evidence[*]`에 `chunk_id`와 doc_type 문자열 `type`을 노출한다.
+
+## 결과
+
+- 근거 식별·dedupe·운영 추적이 단순·안정적이 된다(Qdrant에서 `chunk_id`로 직접 조회 가능).
+- 외부 계약 변경(BREAKING): [`../../api/EXTERNAL_API_CHANGELOG.md`](../../api/EXTERNAL_API_CHANGELOG.md) B항. 런타임 정책: [`../../api/REASONER_RUNTIME_POLICY.md`](../../api/REASONER_RUNTIME_POLICY.md).

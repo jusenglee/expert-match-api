@@ -1,124 +1,105 @@
-# 운영 매뉴얼 (RUNBOOK)
+# 운영 매뉴얼 (RUNBOOK) — chunk 재설계
 
-이 문서는 전문가 추천 시스템의 설치, 실행, 상태 점검 및 실시간 모니터링을 위한 운영 지침을 담고 있습니다.
+**문서 버전:** v2.0 (2026-05-28)
+
+전문가 추천 시스템의 설치·실행·점검·모니터링 지침. 데이터 모델은 [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md), 환경 변수는 [`ENVIRONMENT.md`](ENVIRONMENT.md).
 
 ## 1. 패키지 설치
 
-최신 Python 3.12 이상의 환경에서 다음 명령어를 실행하여 필요한 패키지를 설치합니다.
-
+Python 3.12+ 환경에서:
 ```powershell
 python -m pip install -e .[dev]
 ```
 
-## 2. Qdrant 및 데이터 준비
+## 2. Qdrant 및 데이터 준비 (chunk 컬렉션)
 
-- Qdrant 서버가 구동 중인지, 설정된 URL에 접근 가능한지 확인합니다.
-- 기본 컬렉션 이름은 `researcher_recommend_proto`이며, 필요 시 환경 변수 `NTIS_QDRANT_COLLECTION_NAME`으로 덮어쓸 수 있습니다.
-- 애플리케이션 시작 시, 실제로 선택된 sparse backend 에 맞춰 컬렉션의 Sparse Vector 수정자(`IDF` 또는 없음)를 자동으로 확인하고 필요 시 복구를 시도합니다.
+- Qdrant 서버 구동 및 `NTIS_QDRANT_URL` 접근 확인.
+- 기본 컬렉션 이름은 `ntis_researcher_chunks`(`NTIS_QDRANT_COLLECTION_NAME`으로 override).
+- 컬렉션 스키마(필수):
+  - Point ID = `chunk_id` 문자열
+  - named vector: `dense_e5i`(1024, Cosine) + `sparse_splade`
+  - payload 인덱스: `researcher_id`, `doc_type`, `tags`, `event_year`, `researcher_meta.*_count`(8종), 주요 기관/구분 keyword 필드 ([`DATA_MODEL.md §5`](../architecture/DATA_MODEL.md))
+- 시작 시, 실제 선택된 sparse backend에 맞춰 sparse vector modifier(`IDF` 또는 없음)를 자동 확인·복구한다.
 
-## 3. 시스템 준비 상태 점검 (Readiness)
+### 2.1 적재(ingestion) 불변식 점검
 
-추천 API를 호출하기 전, 다음 순서대로 시스템 상태를 점검하십시오.
+적재 데이터는 [`DATA_MODEL.md §6`](../architecture/DATA_MODEL.md)의 불변식을 만족해야 한다. 운영 표본 점검 항목:
+- Point ID == `chunk_id`, 전역 유일.
+- 한 `researcher_id`의 모든 chunk에서 `researcher_meta`/`researcher_name` 동일.
+- `doc_type` ∈ 정의된 11종.
+- `event_year` == `event_date`의 연도(둘 다 null 허용).
+- dense/sparse가 동일 `chunk_text`에서 생성.
+- `chunk_text`에 요청 어투(role/action 불용어) 미포함.
 
-1. `ntis-validate-live` 명령 실행 (CLI 도구)
-2. `GET /health` 호출 (기본 헬스체크)
-3. `GET /health/ready` 호출 (상세 준비 상태 확인)
+## 3. 준비 상태 점검 (Readiness)
 
-`ntis-validate-live` 는 앱 startup 과 동일한 sparse backend 선택 로직을 사용합니다. 따라서 local/online PIXIE 가 모두 실패해 `Qdrant/bm25` fallback 이 선택되면 sparse vector modifier 기대값은 `None` 이 아니라 `IDF` 입니다.
+추천 호출 전 순서:
+1. `ntis-validate-live` (CLI)
+2. `GET /health`
+3. `GET /health/ready`
 
-만약 `/health/ready` 결과가 `503` 에러 또는 `ready: false`를 반환한다면 다음 항목을 점검하십시오:
-- Qdrant 컬렉션 존재 여부
-- 필수 Named Vector(Dense/Sparse) 존재 여부
-- Sparse Vector의 IDF 설정 값
-- 필수 Payload 인덱스 생성 여부
-- 유효한 샘플 데이터(Point) 존재 여부 및 데이터 구조(`publications[]`, `research_projects[]` 등)
+`ntis-validate-live`는 앱 startup과 동일한 sparse backend 선택 로직을 쓴다. local/online PIXIE가 모두 실패해 `Qdrant/bm25` fallback이면 sparse modifier 기대값은 `IDF`다.
+
+`/health/ready`가 `503`/`ready:false`면 점검:
+- 컬렉션 존재 여부
+- named vector `dense_e5i`/`sparse_splade` 존재 여부
+- sparse vector modifier 값(IDF/none)
+- 필수 payload 인덱스(`researcher_id`, `doc_type`, `event_year`, `researcher_meta.*_count` 등) 생성 여부
+- 유효 샘플 Point 존재 및 구조(`chunk_id`, `doc_type`, `researcher_meta`, `domain_attrs`)
 
 ## 4. 서버 실행
-
-다음 명령어를 통해 API 서버를 실행합니다.
 
 ```powershell
 uvicorn apps.api.main:app --host 0.0.0.0 --port 8011 --reload
 ```
 
-- **LLM 일관성 모드**: Planner와 Reasoner는 환경변수로 노출하지 않은 고정 저변동 샘플링(`temperature=0.0`, `top_p=0.2`, `reasoning_effort=low`, `include_reasoning=false`, `disable_thinking=true`)을 사용합니다. 운영 중 튜닝이 필요하면 코드 변경이 필요합니다.
-- **참고**: `NTIS_EMBEDDING_BACKEND=local` 모드 사용 시, 루트의 `multilingual-e5-large-instruct` 폴더 내에 모델 파일들이 온전히 존재해야 합니다.
-- **참고**: sparse backend 는 `로컬 PIXIE -> online PIXIE -> Qdrant/bm25` 순서로 선택됩니다. online PIXIE 는 `telepix/PIXIE-Splade-v1.0` 를 사용합니다.
-- **참고**: `NTIS_HF_HUB_OFFLINE=true` 또는 `NTIS_SPARSE_LOCAL_FILES_ONLY=true` 이면 online PIXIE 단계는 건너뛰고 `Qdrant/bm25` fallback 을 시도합니다.
-- **참고**: `Qdrant/bm25` fallback 은 FastEmbed/Qdrant builtin sparse 경로를 사용하므로 startup 성공 시 서비스는 계속 기동됩니다. 이때 sparse vector modifier 는 `IDF` 여야 하고, PIXIE/SPLADE 가 선택된 경우에는 modifier 가 없어야 합니다.
-- **추천 사유 생성**: `/recommend` 요청 시 LLM이 전문가별 추천 사유를 생성하며, 이는 검색 결과의 숏리스트(Top-k)를 대상으로 합니다.
+- **LLM 일관성 모드:** 플래너/리즈너는 고정 저변동 샘플링(`temperature=0.0`, `top_p=0.2`, `reasoning_effort=low`, `include_reasoning=false`, `disable_thinking=true`)을 사용. 튜닝은 코드 변경 필요.
+- **임베딩:** `NTIS_EMBEDDING_BACKEND=local`이면 `multilingual-e5-large-instruct` 폴더가 온전해야 함. chunk dense 입력은 `chunk_text` 단일 필드.
+- **Sparse:** `로컬 PIXIE → online PIXIE(telepix/PIXIE-Splade-v1.0) → Qdrant/bm25` 순. SPLADE면 modifier 없음, bm25 fallback이면 `IDF`.
+- **추천 사유:** `/recommend` 시 LLM이 숏리스트(Top-k) 대상으로 chunk 근거 기반 사유를 생성.
 
-## 5. 브라우저 플레이그라운드 (Playground) 활용
-
-웹 브라우저에서 다음 주소로 접속하여 대화형 테스트를 수행할 수 있습니다.
+## 5. 브라우저 플레이그라운드
 
 ```text
 http://127.0.0.1:8011/
 ```
+상태 배지(녹색=정상), 분석 결과 창, 실시간 Trace ID 기반 한글 로그 콘솔.
 
-**플레이그라운드 주요 기능:**
-1. **상태 배지 확인**: 페이지 상단의 배지가 녹색(시스템 정상)인지 확인합니다.
-2. **분석 결과 창**: 자연어 질의를 입력하여 실제 추천 결과와 선정 사유를 확인합니다.
-3. **실시간 서버 로그 콘솔**: **(신규)** 결과창 하단의 콘솔을 통해 서버 내부에서 발생하는 **Trace ID 기반 한글 로그**를 즉시 모니터링합니다. AI의 사고 과정을 투명하게 확인할 수 있습니다.
+## 6. API 테스트 (curl)
 
-## 6. API 테스트 (curl 예시)
-
-**전문가 후보 목록 조회 (`/search/candidates`)**
 ```powershell
 curl -X POST http://127.0.0.1:8011/search/candidates `
      -H "Content-Type: application/json" `
-     -d "{\"query\":\"AI 반도체 분야의 SCIE 논문 실적이 우수한 전문가 후보를 찾아줘\"}"
+     -d "{\"query\":\"AI 반도체 분야 SCIE 논문 실적이 우수한 평가위원 후보를 찾아줘\"}"
 ```
-
-**최종 전문가 추천 (`/recommend`)**
 ```powershell
 curl -X POST http://127.0.0.1:8011/recommend `
      -H "Content-Type: application/json" `
-     -d "{\"query\":\"AI 반도체 설계 과제 경험이 있는 전문가를 추천해주고 특정 기관은 제외해줘\", \"exclude_orgs\":[\"A기관\"]}"
+     -d "{\"query\":\"AI 반도체 설계 과제 경험과 평가위원 활동 이력이 있는 전문가를 추천하고 특정 기관은 제외해줘\", \"exclude_orgs\":[\"A기관\"]}"
 ```
 
-## 7. 가시성 및 로깅 시스템 (중요)
+## 7. 가시성 및 로깅
 
-본 시스템은 모든 요청에 대해 **Trace ID**를 부여하여 추적성을 보장합니다.
-
-### 주요 추적 로그 포인트 (한글 로그)
-- **요청 컨텍스트**: Trace ID, HTTP method/path, client, content type/length, user agent, 처리 시간
-- **사용자 질의**: endpoint, 정규화 전/후 길이, `top_k`, include/exclude 기관 수, filter override key, 정규화된 질의
-- **Planner**: 사용자 질의 분석 결과, `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, `bundle_ids`, 하드 필터 값
-- **Retriever**: 실제 `retrieval_keywords`, 1차 sparse 키워드 검색 쿼리, 2차 hybrid 검색 쿼리, 후보 ID 미리보기, branch/path별 hit count, support rule 통과/탈락 수
-- **Recommendation**: Top-k 후보 확정, 증거 선별 건수, 사유 생성 배치 수, 최종 추천/데이터 공백 수
-- **Judge Map 라운드**: 배치 분할 정보(라운드 번호, 배치 수, 배치 크기), 후보별 예상 토큰 크기, `max_tokens=3000` 제한 적용, LLM 호출 슬롯 획득(세마포어), 경량 응답 수신 시간, 생존자(survivors) 수
-- **Judge Reduce 라운드**: 생존 후보의 전체 직렬화 토큰 추정, `max_tokens=unlimited` 적용, 상세 응답 수신 시간
-- **Judge JSON 추출**: 3단계 방어 JSON 추출 결과 (추출된 텍스트 로깅)
-- **Judge 정규화**: 문자열/리스트 불일치 자동 교정 횟수
-- **Fallback**: LLM 오류 또는 JSON 파싱 실패 시 휴리스틱 모드로의 전환 안내 (Planner/Judge 각각)
-- **Data Gap**: 특정 전문가의 데이터 누락(논문 없음 등)에 대한 경고
-
-로그 형식은 다음과 같으며, Playground UI의 콘솔에서 레벨별 색상과 함께 확인할 수 있습니다.
+모든 요청에 Trace ID를 부여한다. 로그 형식:
 `[HH:MM:SS.mmm] [레벨] [trace=TraceID] [METHOD /path] [모듈명] 메시지`
 
-### 로그 예시 (질의 → 플래너 → 1차 검색 → 2차 검색)
+주요 로그 포인트:
+- **요청 컨텍스트:** Trace ID, method/path, client, content type/length, user agent, 처리 시간
+- **사용자 질의:** endpoint, 정규화 전/후 길이, `top_k`, include/exclude 기관 수, filter override key
+- **Planner:** `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, hard filter 값
+- **Retriever:** 실제 `retrieval_keywords`, 1차 sparse 키워드 쿼리, 2차 하이브리드 쿼리, `researcher_id` 풀 미리보기, doc_type 경로별 hit count, hard filter 통과/탈락 수, 연구자 집계 후보 수
+- **Recommendation:** Top-k 확정, evidence 선별 chunk 수, 사유 생성 배치 수, 최종 추천/데이터 공백 수
+- **Fallback:** LLM 오류/JSON 파싱 실패 시 휴리스틱·결정론적 전환 안내
+- **Data Gap:** 특정 연구자의 데이터 누락 경고
+
+### 로그 예시 (질의 → 플래너 → 1차 → 2차 → 집계)
 ```
-[09:45:51.120] [INFO    ] [trace=abc123] [POST /recommend] [apps.api.main] 요청 시작: method=POST path=/recommend client=127.0.0.1 query_params=0 content_type=application/json content_length=180 user_agent='Mozilla/5.0'
-[09:45:51.125] [INFO    ] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend raw_chars=42 raw_lines=1 normalized_chars=42 top_k=5 include_orgs=0 exclude_orgs=1 filter_keys=[] include_preview=[] exclude_preview=['A기관'] query='드론 화재 진압 전문가 추천'
-[09:45:51.130] [INFO    ] [trace=abc123] [POST /recommend] [apps.recommendation.service] 플래너 단계 시작: query='드론 화재 진압 전문가 추천'
-[09:45:52.010] [INFO    ] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 내부 완료: mode=openai_compat intent='드론 화재 진압 전문가 탐색' retrieval_core=['드론', '화재 진압'] core_keywords=['드론', '화재 진압'] role_terms=['전문가'] action_terms=['추천'] semantic_query='드론 화재 진압 기술 전문가' bundle_ids=['uav', 'fire_response'] include_orgs=[] exclude_orgs=['A기관'] hard_filters={} top_k=5
-[09:45:52.080] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 쿼리 컴파일 완료: mode=keyword_pool_then_hybrid retrieval_keywords=['드론', '화재', '진압'] semantic_query='드론 화재 진압 기술 전문가' bundle_ids=['uav', 'fire_response'] keyword_queries={'basic': {'stable': '드론 화재 진압', 'expanded': '드론 화재 진압'}, 'art': {'stable': '드론 화재 진압', 'expanded': '드론 무인기 UAV 화재 진압'}} hybrid_queries={'basic': {'stable': '드론 화재 진압 기술 전문가', 'expanded': '드론 화재 진압 기술 전문가'}} keyword_paths=6 hybrid_paths=6 limits={prefetch:100, hybrid:40, retrieval:80}
-[09:45:52.095] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.14 unique_candidates=37 branch_counts={'basic:stable': 8, 'art:stable': 15, 'art:expanded': 4, 'pat:stable': 2, 'pjt:stable': 6, 'pjt:expanded': 2} candidate_preview=['1001', '1002', '1003']
-[09:45:52.100] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 2차 하이브리드 검색 시작: paths=6 candidate_filter_count=37 query_filter=True semantic_query='드론 화재 진압 기술 전문가' hybrid_queries={'basic': {'stable': '드론 화재 진압 기술 전문가', 'expanded': '드론 화재 진압 기술 전문가'}} candidate_preview=['1001', '1002', '1003']
-[09:45:52.220] [INFO    ] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 집계 완료: raw_branch_counts={'basic:stable': 20, 'art:stable': 20, 'art:expanded': 12, 'pat:stable': 5, 'pjt:stable': 18, 'pjt:expanded': 9} aggregated_candidates=24 support_pass=15 support_filtered=9 final_hits=15 filtered_preview=[]
-[09:45:54.330] [INFO    ] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비 완료: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms': 880.4, 'search_ms': 210.1, 'total_ms': 3205.7}
+[09:45:51.125] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend top_k=5 exclude_orgs=1 query='드론 화재 진압 평가위원 추천'
+[09:45:52.010] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 완료: retrieval_core=['드론','화재 진압'] core_keywords=['드론','화재 진압'] role_terms=['평가위원'] action_terms=['추천'] semantic_query='드론 기반 화재 진압 기술 전문가' exclude_orgs=['A기관'] hard_filters={} top_k=5
+[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 컴파일: mode=keyword_pool_then_hybrid retrieval_keywords=['드론','화재','진압'] doc_types=11 limits={prefetch:100, output:50, chunk_cap:3, retrieval:80}
+[09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.1 researcher_pool=37 doc_type_counts={'publication':15,'research_project':9,'researcher_assessor':6,'intellectual_property':2}
+[09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 2차 하이브리드+집계 완료: raw_doc_type_counts={...} aggregated_candidates=24 support_pass=15 support_filtered=9 final=15
+[09:45:54.330] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms':880,'search_ms':210,'total_ms':3205}
 ```
 
-`trace.query_payload`에서도 `retrieval_mode`, `retrieval_keywords`, `semantic_query`, `keyword_stage_queries`, `hybrid_stage_queries`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다.
-
-### 로그 예시 (Map-Reduce 심사)
-```
-[09:45:54.000] [INFO    ] [trace=abc123] [POST /recommend] [Judge] Map-Reduce 분할 시작: 총 후보=37 배치크기=10 배치수=4
-[09:45:54.020] [INFO    ] [trace=abc123] [POST /recommend] [Judge] 데이터당 예상 토큰 크기: context=map 총 추정=1200 토큰 후보 수=10
-[09:45:54.050] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 호출 슬롯 획득: context=map round=1 batch=1/4 max_concurrency=10 max_tokens=3000
-[09:45:56.240] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 응답 수신 완료: context=map round=1 batch=1/4 소요시간=1823.45ms
-[09:45:58.100] [INFO    ] [trace=abc123] [POST /recommend] [Judge] Map 라운드 완료: 생존 후보=15
-[09:45:58.140] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 판정 시작: context=reduce round=2 batch=1/1 후보 수=15 max_tokens=unlimited
-[09:46:09.010] [INFO    ] [trace=abc123] [POST /recommend] [Judge] LLM 응답 수신 완료: context=reduce round=2 batch=1/1 소요시간=10894.23ms
-```
+`trace.query_payload`에서 `retrieval_mode`, `retrieval_keywords`, `semantic_query`, `keyword_stage_queries`, `hybrid_stage_queries`, `keyword_stage_candidate_count`, `keyword_stage_doc_type_counts`, `hybrid_stage_raw_doc_type_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있다(벡터 값·전체 payload는 미노출).

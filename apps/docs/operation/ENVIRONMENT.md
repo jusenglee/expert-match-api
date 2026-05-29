@@ -1,98 +1,120 @@
-# 환경 변수 (Environment Variables)
+# 환경 변수 (Environment Variables) — chunk 재설계
 
-모든 환경 변수는 `NTIS_` 접두사를 사용합니다.
+**문서 버전:** v2.0 (2026-05-28)
+
+모든 환경 변수는 `NTIS_` 접두사를 사용한다. 데이터 모델은 [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md) 참조.
 
 ## 핵심 설정 (Core)
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
 | `NTIS_APP_NAME` | `NTIS 전문가 추천 API` | FastAPI 앱 제목 |
-| `NTIS_APP_ENV` | `prod` | 런타임 환경 (prod, dev 등) |
-| `NTIS_APP_HOST` | `0.0.0.0` | FastAPI 서비스 바인딩 주소 |
-| `NTIS_APP_PORT` | `8011` | FastAPI 수신 포트 |
-| `NTIS_API_PREFIX` | `""` | 예약된 API 접두사 설정 |
-| `NTIS_STRICT_RUNTIME_VALIDATION` | `true` | 운영 환경에서 필요한 설정들이 충족되지 않으면 추천 서비스를 비활성화함 |
-| `NTIS_RUNTIME_DIR` | `runtime` | 런타임 출력물 저장 디렉토리 |
-| `NTIS_FEEDBACK_DB_PATH` | `runtime/feedback.db` | 피드백 저장용 SQLite 경로 |
-| `NTIS_FEEDBACK_TABLE` | `feedback_events` | 피드백 테이블 이름 |
+| `NTIS_APP_ENV` | `prod` | 런타임 환경 |
+| `NTIS_APP_HOST` | `0.0.0.0` | 바인딩 주소 |
+| `NTIS_APP_PORT` | `8011` | 수신 포트 |
+| `NTIS_API_PREFIX` | `""` | API 접두사 |
+| `NTIS_STRICT_RUNTIME_VALIDATION` | `true` | 필수 설정 미충족 시 추천 서비스 비활성화 |
+| `NTIS_RUNTIME_DIR` | `runtime` | 런타임 출력 디렉터리 |
+| `NTIS_FEEDBACK_DB_PATH` | `runtime/feedback.db` | 피드백 SQLite 경로 |
+| `NTIS_FEEDBACK_TABLE` | `feedback_events` | 피드백 테이블 |
 
 ## Qdrant 설정
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_QDRANT_URL` | `http://203.250.234.159:8005` | Qdrant 기본 URL |
-| `NTIS_QDRANT_API_KEY` | (설정 안 됨) | Qdrant API 키 |
-| `NTIS_QDRANT_COLLECTION_NAME` | `researcher_recommend_proto` | 사용할 컬렉션 이름 |
-| `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | Qdrant 클라우드 추론 활성화 여부 |
+| `NTIS_QDRANT_URL` | `http://203.250.234.159:8005` | Qdrant URL |
+| `NTIS_QDRANT_API_KEY` | (없음) | API 키 |
+| `NTIS_QDRANT_COLLECTION_NAME` | `ntis_researcher_chunks` | **chunk 컬렉션** (구 `researcher_recommend_proto` 폐기) |
+| `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | 클라우드 추론 활성화 |
 
-## LLM 백엔드 (LLM Backend)
+> chunk 컬렉션은 Point 1개 = chunk 1개, ID=`chunk_id`, named vector는 `dense_e5i`(dense) + `sparse_splade`(sparse) 단일 쌍이다.
 
-| 환경 변수 | 기본값 | 설명 |
-|---|---|---|
-| `NTIS_LLM_BACKEND` | `openai_compat` | 플래너/판정기용 LLM 백엔드 종류 |
-| `NTIS_LLM_BASE_URL` | `http://203.250.234.159:8010/v1` | OpenAI 호환 LLM 서버 URL |
-| `NTIS_LLM_API_KEY` | `EMPTY` | OpenAI 호환 API 키 |
-| `NTIS_LLM_MODEL_NAME` | `/model` | 플래너/판정기용 모델 이름 |
-| `NTIS_USE_MAP_REDUCE_JUDGING` | `true` | OpenAICompatJudge가 shortlist를 내부 배치 라운드로 심사할지 여부 |
-| `NTIS_LLM_JUDGE_BATCH_SIZE` | `10` | Judge 내부 병렬 심사 배치 크기 |
-| `NTIS_LLM_JUDGE_MAX_CONCURRENCY` | `10` | Judge 내부 LLM 동시 호출 상한 |
-
-## 임베딩 백엔드 (Embedding Backend)
+## LLM 백엔드
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_EMBEDDING_BACKEND` | `local` | 임베딩 추출용 백엔드 종류 |
-| `NTIS_EMBEDDING_BASE_URL` | `http://203.250.234.159:8011/v1` | OpenAI 호환 임베딩 서버 URL |
-| `NTIS_EMBEDDING_API_KEY` | `EMPTY` | OpenAI 호환 API 키 |
-| `NTIS_EMBEDDING_MODEL_NAME` | `<repo>/multilingual-e5-large-instruct` | 로컬 번들 경로 또는 원격 모델 이름 |
-| `NTIS_EMBEDDING_VECTOR_SIZE` | `1024` | Dense 벡터 크기 |
+| `NTIS_LLM_BACKEND` | `openai_compat` | 플래너/리즈너 LLM 백엔드 |
+| `NTIS_LLM_BASE_URL` | `http://203.250.234.159:8010/v1` | OpenAI 호환 URL |
+| `NTIS_LLM_API_KEY` | `EMPTY` | API 키 |
+| `NTIS_LLM_MODEL_NAME` | `/model` | 모델 이름 |
+| `NTIS_USE_MAP_REDUCE_JUDGING` | `true` | 사유 생성 시 내부 배치 라운드 사용 여부(후보 순위에 영향 없음) |
+| `NTIS_LLM_JUDGE_BATCH_SIZE` | `10` | 내부 병렬 심사 배치 크기 |
+| `NTIS_LLM_JUDGE_MAX_CONCURRENCY` | `10` | LLM 동시 호출 상한 |
 
-로컬 임베딩 번들 경로는 기본적으로 리포지토리 번들인 `multilingual-e5-large-instruct`를 가리킵니다. 해당 번들을 교체할 때 `modules.json`, `1_Pooling/config.json`, `2_Normalize/` 구조를 그대로 유지해야 서버 시작 시 오류가 발생하지 않습니다.
-
-## Sparse 및 오프라인 설정 (Sparse & Offline)
-
-| 환경 변수 | 기본값 | 설명 |
-|---|---|---|
-| `NTIS_SPARSE_MODEL_NAME` | `<repo>/models/PIXIE-Splade-v1.0` | Sparse 벡터 생성용 모델 이름 (로컬 번들 경로 또는 Hugging Face repo id) |
-| `NTIS_SPARSE_CACHE_DIR` | `<repo>/models` | Sparse 모델 캐시 디렉토리 |
-| `NTIS_SPARSE_LOCAL_FILES_ONLY` | `false` | Sparse 모델 로드 시 로컬 파일만 사용 여부 |
-| `NTIS_HF_HUB_OFFLINE` | `false` | HuggingFace Hub 오프라인 모드 강제 여부 |
-
-기본 sparse fallback 체인은 `로컬 PIXIE-Splade-v1.0 -> online telepix/PIXIE-Splade-v1.0 -> Qdrant/bm25` 순서입니다. 로컬 또는 online PIXIE 가 성공하면 커스텀 `SpladeSparseEncoder` 를 사용하고, 둘 다 실패하면 `Qdrant/bm25` 를 FastEmbed/Qdrant builtin sparse 모델로 로드합니다.
-
-기본 `NTIS_SPARSE_MODEL_NAME` 은 저장소 내부의 `models/PIXIE-Splade-v1.0` 로컬 번들을 가리킵니다. 경로가 실제로 존재하면 tokenizer/model 을 `local_files_only=True` 로 로드하고, 경로가 없으면 local PIXIE 시도가 실패한 것으로 기록한 뒤 다음 fallback 단계로 넘어갑니다. `NTIS_HF_HUB_OFFLINE=true` 또는 `NTIS_SPARSE_LOCAL_FILES_ONLY=true` 이면 online PIXIE 단계는 건너뛰고 바로 `Qdrant/bm25` fallback 을 시도합니다.
-
-`Qdrant/bm25` 는 커스텀 SPLADE 인코더가 아니라 FastEmbed builtin sparse 경로로 초기화됩니다. 이 모드에서는 Qdrant sparse vector modifier 가 `IDF` 여야 하며, PIXIE/SPLADE 모드에서는 modifier 가 없어야 합니다.
-
-`ntis-validate-live` 와 `/health/ready` 도 동일한 sparse runtime resolver 를 사용하므로, 실제 active backend 가 `Qdrant/bm25` 로 선택된 경우 sparse vector modifier 기대값은 항상 `IDF` 입니다.
-
-## 검색 제어 (Retrieval Controls)
+## 임베딩 백엔드 (Dense)
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_BRANCH_PREFETCH_LIMIT` | `100` | 각 데이터 브랜치별 프리페치(Prefetch) 제한 |
-| `NTIS_BRANCH_OUTPUT_LIMIT` | `50` | 브랜치 통합(Fusion) 출력 제한 |
-| `NTIS_RETRIEVAL_LIMIT` | `80` | 최종 검색 결과 통합 제한 |
-| `NTIS_SHORTLIST_LIMIT` | `40` | 판정(Judge) 단계로 넘길 숏리스트 크기 |
-| `NTIS_FINAL_RECOMMENDATION_MIN` | `1` | 최소 요구 최종 추천 수 |
-| `NTIS_FINAL_RECOMMENDATION_MAX` | `20` | 최대 허용 최종 추천 수 |
+| `NTIS_EMBEDDING_BACKEND` | `local` | 임베딩 백엔드 |
+| `NTIS_EMBEDDING_BASE_URL` | `http://203.250.234.159:8011/v1` | OpenAI 호환 URL |
+| `NTIS_EMBEDDING_API_KEY` | `EMPTY` | API 키 |
+| `NTIS_EMBEDDING_MODEL_NAME` | `<repo>/multilingual-e5-large-instruct` | 로컬 번들/원격 모델 |
+| `NTIS_EMBEDDING_VECTOR_SIZE` | `1024` | Dense 벡터 크기(`dense_e5i`) |
 
-## 시드 설정 (Seed Controls)
+로컬 번들 교체 시 `modules.json`, `1_Pooling/config.json`, `2_Normalize/` 구조를 유지해야 한다. chunk 모델에서 dense 입력은 `chunk_text` 단일 필드다.
+
+## Sparse 및 오프라인 설정
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_SEED_ON_STARTUP` | `false` | 서버 시작 시 개발용 시드 데이터를 컬렉션에 로드할지 여부 |
-| `NTIS_SEED_ALLOW_RECREATE_COLLECTION` | `false` | 시드 수행 시 기존 컬렉션을 삭제 후 재생성할지 여부 |
+| `NTIS_SPARSE_MODEL_NAME` | `<repo>/models/PIXIE-Splade-v1.0` | Sparse 모델(`sparse_splade`) |
+| `NTIS_SPARSE_CACHE_DIR` | `<repo>/models` | 캐시 디렉터리 |
+| `NTIS_SPARSE_LOCAL_FILES_ONLY` | `false` | 로컬 파일만 사용 |
+| `NTIS_HF_HUB_OFFLINE` | `false` | HF Hub 오프라인 강제 |
 
-## 운영 참고 사항 (Operational Notes)
+Sparse fallback 체인: `로컬 PIXIE-Splade-v1.0 → online telepix/PIXIE-Splade-v1.0 → Qdrant/bm25`. PIXIE/SPLADE면 sparse vector modifier가 없어야 하고, `Qdrant/bm25` fallback이면 modifier가 `IDF`여야 한다. `NTIS_HF_HUB_OFFLINE=true` 또는 `NTIS_SPARSE_LOCAL_FILES_ONLY=true`면 online PIXIE를 건너뛴다. `ntis-validate-live`/`/health/ready`도 동일 resolver를 사용한다.
 
-- 권장되는 라이브 설정:
-  - `NTIS_STRICT_RUNTIME_VALIDATION=true`
-  - `NTIS_LLM_BACKEND=openai_compat`
-  - `NTIS_USE_MAP_REDUCE_JUDGING=true`
-  - `NTIS_LLM_JUDGE_BATCH_SIZE=10`
-  - `NTIS_LLM_JUDGE_MAX_CONCURRENCY=10`
-  - `NTIS_EMBEDDING_BACKEND=openai` 또는 `local`
-  - `NTIS_SEED_ON_STARTUP=false`
-- 엄격한 런타임 검증이 활성화된 경우 라이브 설정은 위와 같이 구성되어야 하며, `NTIS_SEED_ON_STARTUP=false`여야 합니다. 그럼에도 불구하고 플래너와 판정기는 실제 실행 중에 AI 모델 호출이 실패하면 내부적으로 휴리스틱 폴백을 수행합니다.
-- 엄격한 검증이나 의존성 초기화에 실패하더라도 프로세스는 시작될 수 있으나, 실제 추천 트래픽을 보내기 전에 반드시 `GET /health/ready` 엔드포인트의 응답을 확인하시기 바랍니다.
+## 검색·집계 제어 (Retrieval & Aggregation)
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `NTIS_RETRIEVAL_DOC_TYPES` | (전체) | 검색 대상 doc_type 화이트리스트(미설정=11종 전체). 운영 축소용 |
+| `NTIS_DOC_TYPE_PREFETCH_LIMIT` | `100` | doc_type 경로별 prefetch(1차/2차) 제한 |
+| `NTIS_DOC_TYPE_OUTPUT_LIMIT` | `50` | doc_type 경로별 융합 출력 제한 |
+| `NTIS_DOC_TYPE_CHUNK_CAP` | `3` | 연구자 집계 시 doc_type별 기여 chunk 상한(다작 독식 방지) |
+| `NTIS_RETRIEVAL_LIMIT` | `80` | 연구자 집계 후 후보 상한 |
+| `NTIS_SHORTLIST_LIMIT` | `40` | 사유 생성 단계로 넘길 숏리스트 크기 |
+| `NTIS_DOC_TYPE_PRIORS` | (미설정=equal) | family/doc_type 집계 가중. 예: `assessment:1.3,achievement:1.0`. **앱단 랭크 누적 가중**이며 Qdrant weighted RRF가 아님 |
+| `NTIS_FINAL_RECOMMENDATION_MIN` | `1` | 최소 최종 추천 수 |
+| `NTIS_FINAL_RECOMMENDATION_MAX` | `20` | 최대 최종 추천 수 |
+
+> `NTIS_DOC_TYPE_PRIORS`는 [`../architecture/DESIGN_GUIDELINES.md §6.2`](../architecture/DESIGN_GUIDELINES.md)의 옵트인 레버다. 기본 equal을 권장하며, intent가 명확할 때만 조정한다.
+
+## Evidence 리랭커 (chunk 근거 선별)
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `NTIS_EVIDENCE_RERANKER_BACKEND` | `cross_encoder` | `cross_encoder` / `lexical`. 모델 로드 실패 시 자동 `lexical` 강등 |
+| `NTIS_CROSS_ENCODER_MODEL` | `Dongjin-kr/ko-reranker` | evidence 재랭크용 cross-encoder(로컬 번들 권장) |
+| `NTIS_EVIDENCE_FAMILY_CAP` | `achievement:10,assessment:6,expertise:6,identity:1` | family별 LLM 입력 chunk 상한 |
+
+> evidence 리랭커는 **후보(연구자) 순위에 영향을 주지 않는다**. 목적은 토큰 절감·grounding 품질·정규화. [`../api/REASONER_RUNTIME_POLICY.md`](../api/REASONER_RUNTIME_POLICY.md).
+
+## 후보 리랭커 (기본 OFF, 옵트인 실험)
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `NTIS_CANDIDATE_RERANKER` | `off` | `off` / `band`. `band`는 score 동률 밴드 내 재배열만 허용(탈락·생성 금지) |
+
+> 기본 추천 순위 척추는 RRF다. [`../architecture/DESIGN_GUIDELINES.md §6.3`](../architecture/DESIGN_GUIDELINES.md) 결정 참조.
+
+## 시드 설정
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `NTIS_SEED_ON_STARTUP` | `false` | 시작 시 개발용 시드 적재 |
+| `NTIS_SEED_ALLOW_RECREATE_COLLECTION` | `false` | 시드 시 기존 컬렉션 삭제 후 재생성 |
+
+## 운영 참고
+
+- 권장 라이브 설정: `NTIS_STRICT_RUNTIME_VALIDATION=true`, `NTIS_LLM_BACKEND=openai_compat`, `NTIS_EMBEDDING_BACKEND=local`(또는 `openai`), `NTIS_EVIDENCE_RERANKER_BACKEND=cross_encoder`, `NTIS_CANDIDATE_RERANKER=off`, `NTIS_SEED_ON_STARTUP=false`.
+- 엄격 검증이 켜진 경우에도 플래너/리즈너는 LLM 호출 실패 시 휴리스틱·결정론적 fallback으로 동작한다.
+- 트래픽 전 반드시 `GET /health/ready`로 컬렉션·벡터·인덱스 준비를 확인한다.
+
+## v1.x 대비 폐기/변경된 환경 변수
+
+| 구 변수 | 처리 |
+|---|---|
+| `NTIS_BRANCH_PREFETCH_LIMIT` / `NTIS_BRANCH_OUTPUT_LIMIT` | → `NTIS_DOC_TYPE_PREFETCH_LIMIT` / `NTIS_DOC_TYPE_OUTPUT_LIMIT` |
+| branch별 벡터명 상수(`*_vector_e5i`, `*_vector_splade`) | 단일 `dense_e5i`/`sparse_splade`로 대체(코드 상수) |
+| `NTIS_QDRANT_COLLECTION_NAME` 기본값 `researcher_recommend_proto` | `ntis_researcher_chunks` |

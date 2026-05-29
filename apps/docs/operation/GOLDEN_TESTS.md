@@ -1,154 +1,96 @@
-# Golden Tests
+# Golden Tests (chunk 재설계)
+
+**문서 버전:** v2.0 (2026-05-28)
+
+데이터 모델: [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md) · 흐름: [`../architecture/SERVICE_FLOW.md`](../architecture/SERVICE_FLOW.md) · 계약: [`../api/DATA_CONTRACT.md`](../api/DATA_CONTRACT.md).
 
 ## Scenarios
 
-### 1. Pure keyword extraction
+### 1. 순수 키워드 추출
+- Input: 요청 어투가 섞인 자연어 추천 질의
+- Expected: planner가 도메인 `core_keywords`만 추출, role/action 어투는 검색 텍스트에서 제외.
 
-- Input: a natural-language recommendation query with request-role wording
-- Expected:
-  - planner extracts only domain `core_keywords`
-  - request-role wording stays out of retrieval text
+### 2. 명시 Top-k 우선
+- Input: 질의 + 명시 `top_k`
+- Expected: 명시 `top_k`가 자연어 함의보다 우선, `/recommend`는 정확히 그 수만 반환.
 
-### 2. Explicit Top-k priority
+### 3. 정렬 안정성
+- Input: 동률 RRF 집계 점수가 둘 이상 나오는 질의
+- Expected: 최종 순서 `score desc → researcher_name asc → researcher_id asc`.
 
-- Input: a query plus explicit `top_k`
-- Expected:
-  - explicit `top_k` wins over any count implied in natural language
-  - `/recommend` returns exactly that Top-k count
+### 4. search vs recommend 분리
+- Input: 명시 한도 없는 질의
+- Expected: `/search/candidates`는 집계·정렬된 전체 후보, `/recommend`는 정렬된 Top-k만.
 
-### 3. Search ordering stability
+### 5. 사유 생성은 재정렬하지 않음
+- Input: 강한 후보가 여럿인 질의
+- Expected: 정렬된 Top-k만 LLM에 전달, 반환 추천은 검색 순서 유지.
 
-- Input: a query that produces equal RRF scores for at least two hits
-- Expected:
-  - final order uses `score desc`
-  - score ties are broken by `name asc`
+### 6. 빈 키워드 시 검색 생략
+- Input: 안전한 `core_keywords`를 못 만드는 질의
+- Expected: Qdrant 검색 생략, `retrieval_skipped_reason` trace 존재, `recommendations=[]`.
 
-### 4. Search vs recommend split
+### 7. chunk = 1 Point 적재 (NEW)
+- Input: 한 연구자에 publication 3건 + research_project 2건이 적재됨
+- Expected: Qdrant에 5개 Point(각 ID=`chunk_id`)가 존재, 모두 동일 `researcher_id`/`researcher_meta`.
 
-- Input: a query without explicit candidate limit
-- Expected:
-  - `/search/candidates` returns the full retrieval-ordered candidate set
-  - `/recommend` returns only ordered Top-k
+### 8. 연구자 집계와 dedupe (NEW)
+- Input: 한 연구자의 여러 doc_type chunk이 동시에 hit
+- Expected: 결과에 연구자당 **1건**만 등장, 점수는 그 연구자 chunk hit들의 RRF 누적, `matched_doc_types`에 hit한 doc_type 나열.
 
-### 5. Reason generation does not rerank
+### 9. doc_type별 chunk 캡 (NEW)
+- Input: publication chunk을 매우 많이 가진 다작 연구자 vs 소수지만 고관련 연구자
+- Expected: doc_type별 상위 `chunk_cap`(기본 3)개만 집계에 기여, 다작이 chunk 수만으로 순위를 독식하지 않음.
 
-- Input: a query with several strong candidates
-- Expected:
-  - only ordered Top-k candidates are sent to the LLM
-  - returned recommendations keep the exact retrieval order
+### 10. 통합 recency는 OR 결합 (NEW, 과거 장애 회귀 방지)
+- Input: "최근 3년 활동" 의도(여러 doc_type 대상)
+- Expected: `event_year >= 올해-3` 조건이 doc_type들에 대해 **OR(min_should, min_count=1)** 로 결합, 세 영역 모두 동시 충족하는 극소수만 남는 AND 회귀가 발생하지 않음.
 
-### 6. Retrieval skipped on empty planner keywords
+### 11. researcher_meta 기반 hard filter (NEW)
+- Input: `publication_count_min` / `highest_degree` 필터
+- Expected: `researcher_meta.publication_count`/`highest_degree`로 chunk 단계에서 deterministic 필터, 위반 후보 0건.
 
-- Input: a query whose planner cannot produce safe `core_keywords`
-- Expected:
-  - Qdrant retrieval is skipped
-  - `retrieval_skipped_reason` is present in trace
-  - `recommendations=[]`
+### 12. 제외 기관 (cross-chunk)
+- Input: `exclude_orgs` 지정
+- Expected: `researcher_meta.affiliated_organization` + 매칭 chunk의 `performing_organization`/`managing_agency`/`appointing_organization`/`evaluation_agency_name` 어디에도 해당 기관이 없는 후보만 반환.
 
-### 7. Payload-backed evidence
+### 13. 평가이력 신호 (NEW)
+- Input: "평가위원 경험이 풍부한" 의도
+- Expected: `researcher_assessor`/`expert_assessor` chunk이 검색·evidence에 1급으로 포함, (옵트인 시) assessment family prior가 집계에 반영.
 
-- Input: a query whose recommended candidate has publications or projects
-- Expected:
-  - final evidence comes from payload-backed preview data
-  - evidence is deterministic and does not depend on LLM post-selection
+### 14. chunk_id 기반 evidence (NEW)
+- Input: 추천 후보가 다수 관련 chunk 보유
+- Expected: LLM에 family별 캡이 적용된 chunk 풀 전달, LLM은 풀의 `chunk_id`만 `selected_evidence_ids`로 복사, 최종 `recommendation.evidence`가 그 `chunk_id`로 resolve.
 
-### 8. Relevant evidence selection for reasons
+### 15. evidence id 계약과 fallback
+- Input: LLM이 풀에 없는/형식이 깨진 id 반환
+- Expected: 무효 id는 별도 기록(`invalid_selected_evidence_ids`), trace에 제공 id(`resolver_available_evidence_ids`)와 반환 id 동시 노출, 결정론적 chunk fallback으로 evidence 조립.
 
-- Input: a query whose recommended candidate has both newer irrelevant evidence and older relevant evidence
-- Expected:
-  - `/recommend` still preserves candidate retrieval order
-  - reason generation receives only query-relevant evidence
-  - newer but irrelevant evidence is not used as direct grounding for `recommendation_reason`
+### 16. evidence 선별 캡
+- Input: 매칭 chunk이 매우 많은 후보
+- Expected: family별 캡(`achievement:10` 등) 적용, 후보 **순위는 변하지 않음**(evidence 선별은 grounding 한정).
 
-### 9. LLM-selected evidence alignment
+### 17. keyword_pool_then_hybrid 고정
+- Input: sparse 키워드 단계가 직접 하이브리드보다 좁은 풀을 내는 질의
+- Expected: 1차 sparse 풀 수집이 항상 먼저, 2차 하이브리드는 `researcher_id MatchAny` 풀 내부로 제한, 풀 밖 연구자는 하이브리드에 떠도 최종 제외, trace에 `retrieval_mode="keyword_pool_then_hybrid"`와 `keyword_stage_candidate_count`.
 
-- Input: a query whose recommended candidate has multiple relevant evidence items
-- Expected:
-  - the LLM receives a bounded per-candidate evidence pool
-  - the LLM returns `selected_evidence_ids` from that pool
-  - final `recommendation.evidence` resolves from those selected ids instead of latest preview data
-  - invalid or empty evidence selections fall back deterministically
+### 18. 배치 사유 생성 + 서버 fallback
+- Input: Top-k>5이고 LLM이 일부 후보를 누락/공란
+- Expected: 5명 단위 순차 배치, 검색 순서 유지, 누락·공란 후보는 보수적 서버 fallback 사유, trace에 배치별 후보 id와 fallback 대상 노출.
 
-### 10. Batched reason generation and server fallback
-
-- Input: a query whose `/recommend` Top-k is larger than 5 and whose LLM output omits or empties some candidates
-- Expected:
-  - reason generation runs in sequential batches of up to 5 candidates
-  - returned recommendations still preserve the original retrieval order
-  - omitted or empty reason candidates receive a conservative server fallback reason
-  - trace exposes per-batch candidate ids and server fallback targets
-
-### 11. Broad raw candidate context in LLM prompt
-
-- Input: a query with returned recommendation candidates
-- Expected:
-  - the LLM payload includes the bounded relevant evidence pool
-  - the same payload also includes broad raw candidate context such as retrieval grounding, evaluation activities, and full paper/project/patent summaries for the Top-k candidates
-  - external API response shape remains unchanged
-
-### 12. Retrieval score provenance trace
-
-- Input: a query with returned candidates
-- Expected:
-  - trace exposes `retrieval_score_traces`
-  - each trace item identifies the returned expert and matched branch list
-  - playground can display the primary retrieval branch and branch-local match ranks
-
-### 13. Tool-calling reason generation with retry
-
-- Input: a `/recommend` query whose first reason-generation attempt fails to return usable structured output
-- Expected:
-  - the service first attempts tool-calling structured output
-  - one smaller-payload retry is attempted before server fallback
-  - trace exposes per-batch `mode`, `retry_count`, `returned_ratio`, `prompt_budget_mode`, `trim_applied`, and `attempts`
-
-### 14. Relevant evidence pool policy
-
-- Input: a candidate with many matching papers, projects, and patents
-- Expected:
-  - evidence selection caps the relevant pool at `10` papers, `10` projects, and `10` patents
-  - final `recommendation.evidence` still resolves from the selected ids or deterministic fallback
-
-### 15. Evidence id contract and resolve trace
-
-- Input: a recommendation response where the model returns invalid-format ids or ids not present in the candidate pool
-- Expected:
-  - invalid-format ids are recorded separately from unresolved-but-well-formed ids
-  - trace exposes both the ids returned by the LLM and the ids actually available to the resolver
-  - profile fallback is explainable from trace without relying on server logs
-
-### 16. Keyword pool then hybrid retrieval
-
-- Input: a query whose sparse keyword stage returns a narrower candidate pool than a direct hybrid search would return
-- Expected:
-  - sparse keyword retrieval runs before hybrid retrieval on every request
-  - hybrid retrieval is restricted to the keyword-stage `basic_info.researcher_id` pool
-  - candidates outside the keyword-stage pool are not returned even if they appear in the hybrid response
-  - trace exposes `query_payload.retrieval_mode="keyword_pool_then_hybrid"` and `keyword_stage_candidate_count`
-
-### 17. Step-by-step retrieval logging
-
-- Input: a normal `/recommend` or `/search/candidates` request
-- Expected:
-  - `trace.server_logs` uses the readable one-line format with `trace=<id>` and `[METHOD /path]`
-  - `trace.server_logs` includes request start, user-query receipt, planner start/completion, retrieval start/completion, candidate card build, and response-ready summary logs
-  - planner logs include the actual `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, and `bundle_ids`, not only their counts
-  - retriever logs include actual `retrieval_keywords`, 1st-stage keyword query text, 2nd-stage hybrid query text, candidate previews, and branch/path counts
-  - `trace.query_payload` exposes retrieval keywords, semantic query, branch query text, branch/path counts, and support pass/filter counts without logging vectors or full payloads
+### 19. 단계별 로깅
+- Input: 정상 `/recommend` 또는 `/search/candidates`
+- Expected: `trace.server_logs`가 `trace=<id>` + `[METHOD /path]` 한 줄 형식, 요청 시작·질의 수신·플래너·1차/2차 검색·집계·응답 준비 로그 포함, planner/retriever 로그에 실제 키워드·쿼리 텍스트·doc_type 경로 count 포함(벡터/전체 payload 미출력).
 
 ## Acceptance Criteria
 
-- Sparse keyword retrieval text is built only from planner `retrieval_core`/`core_keywords`; hybrid retrieval may use planner `semantic_query` inside that keyword candidate pool.
-- Retrieval always uses the fixed `keyword_pool_then_hybrid` flow: sparse keyword candidate pool first, then hybrid RRF inside that pool.
-- `/search/candidates` preserves retrieval order.
-- `/recommend` preserves retrieval order for returned items.
-- `/recommend` sends only Top-k candidates to the LLM.
-- `/recommend` re-ranks candidate-internal evidence against planner `core_keywords` before LLM reason generation.
-- `/recommend` builds a relevant evidence pool capped at `10/10/10` before LLM reason generation.
-- `/recommend` batches reason generation in groups of up to 5 candidates.
-- `/recommend` uses tool calling first, then one compact JSON retry, then deterministic server fallback.
-- `/recommend` resolves final `recommendation.evidence` from the LLM-selected relevant evidence ids.
-- `/recommend` generates a conservative fallback reason when the LLM omits a candidate or returns an empty reason.
-- Trace exposes `planner_keywords`, `retrieval_keywords`, `planner_retry_count`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.retrieval_keywords`, `query_payload.semantic_query`, `query_payload.keyword_stage_queries`, `query_payload.hybrid_stage_queries`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.batches`, `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`, and candidate-level evidence resolution details needed to explain fallback.
-- Server logs must show request context, user query, extracted planner keywords, actual retrieval query text, 1st-stage keyword retrieval, 2nd-stage hybrid retrieval, evidence selection, reason generation, and response preparation without printing LLM raw responses, dense vectors, or full Qdrant payloads.
-- Legacy verifier, multi-view retrieval, judge, and evidence-resolver traces are no longer part of the active contract.
+- 저장 단위는 chunk(Point ID=`chunk_id`), 한 연구자는 다수 Point.
+- 검색은 항상 `keyword_pool_then_hybrid`: sparse 키워드 풀 → 풀 내부 하이브리드 RRF.
+- 검색 후 `researcher_id`로 집계해 연구자당 1건, 점수는 RRF 누적, doc_type별 `chunk_cap` 적용.
+- hard filter는 시스템이 deterministic 보장, 다중 doc_type recency는 OR 결합.
+- `/search/candidates`와 `/recommend`는 검색·집계 순서를 유지하고 `/recommend`는 Top-k만 LLM에 전달.
+- evidence 선별은 family별 캡을 적용하되 후보 순위를 바꾸지 않는다.
+- `recommendation.evidence`는 LLM이 고른 `chunk_id`로 resolve, 무효 시 결정론적 fallback.
+- Trace는 `planner_keywords`, `retrieval_keywords`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.keyword_stage_doc_type_counts`, `query_payload.hybrid_stage_raw_doc_type_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.*`, 후보별 evidence resolution 상세를 노출한다.
+- evidence id는 `chunk_id`이며, 구 `paper:N`/`project:N`/`patent:N` 형식은 더 이상 계약에 없다.
+- 구 verifier / multi-view retrieval / branch named vector / judge-as-core 구조는 active 계약이 아니다.

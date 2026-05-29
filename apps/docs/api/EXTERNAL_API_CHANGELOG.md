@@ -21,6 +21,43 @@
 | 2026-04-15 | `3c9bceb` | 주요 변경 | `/search/candidates.candidates[*].branch_coverage`가 `branch_presence_flags`로 이름이 바뀌었습니다. `/search/candidates.trace`에는 `retrieval_score_traces`와 `final_sort_policy`가 추가되어, 최종 점수와 branch 매칭 근거를 외부에서 직접 볼 수 있게 되었습니다. |
 | 2026-04-23 | `pending` | 확장 | 검색 동작이 고정 2단계(`keyword_pool_then_hybrid`)로 바뀌었습니다. 외부 최상위 스키마는 유지되지만 `trace.query_payload`에서 `retrieval_mode`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다. 같은 변경에서 `trace.server_logs`에는 `trace=<id>`와 `[METHOD /path]`를 포함한 사용자 질의, 플래너, 1차 검색, 2차 검색, 응답 준비 단계별 요약 로그가 포함됩니다. |
 | 2026-04-23 | `pending` | 확장 | 운영 로그와 `trace.query_payload`에 실제 키워드 추출 결과와 검색 쿼리 텍스트가 추가되었습니다. `trace.server_logs`는 `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, `bundle_ids`, 실제 `retrieval_keywords`, 1차 `keyword_stage_queries`, 2차 `hybrid_stage_queries`를 값 그대로 보여줍니다. |
+| 2026-05-28 | `v2.0` | **주요 변경(BREAKING)** | chunk 데이터 모델 재설계. 외부 응답에서 다음이 변경됩니다 — `/recommend`/`/search/candidates`/`/health`의 `searched_branches` → `searched_doc_types`; `recommendations[*].evidence[*].type`이 4종(`paper/patent/project/profile`)에서 **11개 doc_type 문자열**로 확장; `evidence[*]`에 **`chunk_id` 추가**; `/search/candidates.candidates[*].branch_presence_flags` → `doc_type_coverage`(family 단위) + `matched_doc_types` 추가; `counts`가 `researcher_meta` 기반(`publication_count` 등 명칭)으로 변경. `trace.query_payload`의 `*_branch_counts` → `*_doc_type_counts`. 컬렉션 기본값 `researcher_recommend_proto` → `ntis_researcher_chunks`. |
+
+## v2.0 재설계 (chunk 데이터 모델, 2026-05-28)
+
+> 데이터 적재 단위가 `chunk_id`/`doc_type` 기반으로 바뀌면서, 저장 단위를 "연구자 1 Point"에서 "chunk 1 Point"로 전환했습니다. 외부 소비자가 체감하는 변경은 아래와 같습니다. 배경은 [`../architecture/ADR/0002-chunk-level-point-model.md`](../architecture/ADR/0002-chunk-level-point-model.md).
+
+### A. 필드 이름 변경 (BREAKING)
+
+| 구 필드 | 신 필드 | 위치 |
+|---|---|---|
+| `searched_branches` | `searched_doc_types` | `/recommend`, `/search/candidates`, `/health` |
+| `candidates[*].branch_presence_flags` | `candidates[*].doc_type_coverage` (family 단위) | `/search/candidates` |
+| `trace.query_payload.keyword_stage_branch_counts` | `...keyword_stage_doc_type_counts` | trace |
+| `trace.query_payload.hybrid_stage_raw_branch_counts` | `...hybrid_stage_raw_doc_type_counts` | trace |
+
+### B. evidence 구조 변경 (BREAKING)
+
+- `recommendations[*].evidence[*].type`이 `paper/patent/project/profile` 4종에서 **doc_type 11종 문자열**(`publication`, `intellectual_property`, `research_project`, `researcher_assessor`, `expert_assessor`, `researcher_tech`, `expert_tech`, `researcher_core`, `researcher_major`, `expert_specific`, `profile`)로 확장됩니다.
+- `evidence[*]`에 불변 식별자 **`chunk_id`** 가 추가됩니다.
+- 내부 LLM 계약의 `selected_evidence_ids`도 `paper:N` 형식에서 **`chunk_id`** 로 바뀝니다(외부 응답에는 노출되지 않던 내부 계약이지만, trace를 파싱하는 운영 UI는 영향).
+
+### C. 신규 필드
+
+- `/search/candidates.candidates[*].matched_doc_types` — 이번 검색에서 실제 hit한 doc_type 목록.
+- `/recommend.recommendations[*].evidence[*].chunk_id`.
+
+### D. 컬렉션/스키마 변경
+
+- 기본 컬렉션 `researcher_recommend_proto` → `ntis_researcher_chunks`.
+- named vector `basic/art/pat/pjt_vector_*` 4쌍 → 단일 `dense_e5i` + `sparse_splade`.
+- 외부 API 호출 형태(요청 스키마)는 변하지 않습니다.
+
+### 소비자 가이드
+
+- `searched_branches`/`branch_presence_flags`를 직접 참조하는 프런트는 v2.0에서 깨집니다 → `searched_doc_types`/`doc_type_coverage`로 교체.
+- `evidence[*].type`을 4종 enum으로 가정한 코드는 doc_type 문자열을 허용하도록 확장해야 합니다.
+- 근거를 식별·dedupe할 때는 `evidence[*].chunk_id`를 사용하는 것이 안전합니다.
 
 ## 변경 상세
 
@@ -49,11 +86,11 @@
 - 추가된 축: `reason_generation_trace`, `retrieval_score_traces`, `recommendation_ids`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.hybrid_stage_raw_branch_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`
 - 소비자 영향: 운영 UI가 `trace`를 강하게 파싱한다면, 이 변경점을 기준으로 버전 분기 또는 방어 코드를 둬야 합니다.
 
-## 현재 기준 호환성 메모
+## 현재 기준 호환성 메모 (v2.0 기준)
 
-- `/recommend`의 1차 계약 필드는 `recommendation_reason`입니다.
-- `/recommend.recommendations[*].reasons`는 하위 호환 alias로만 취급하는 것이 맞습니다.
-- `/search/candidates`의 branch 상태 필드는 `branch_presence_flags`입니다.
+- `/recommend`의 1차 계약 필드는 `recommendation_reason`입니다(`reasons` alias는 하위 호환 전용).
+- 검색 대상 영역 필드는 `searched_doc_types`이며, family 보유 플래그는 `candidates[*].doc_type_coverage`입니다(구 `searched_branches`/`branch_presence_flags` 폐기).
+- 근거 식별자는 `evidence[*].chunk_id`이며, `evidence[*].type`은 doc_type 문자열입니다.
 - `/recommend`와 `/search/candidates` 모두 `trace`는 존재하지만, 디버그 목적 필드이므로 안정성이 top-level 계약보다 낮습니다.
 
 ## 근거 파일
