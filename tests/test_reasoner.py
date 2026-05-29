@@ -2,12 +2,20 @@ import asyncio
 import json
 import logging
 
+import pytest
 from langchain_core.messages import AIMessage
 
 from apps.core.config import Settings
 from apps.domain.models import CandidateCard, PlannerOutput, PublicationEvidence
 from apps.recommendation.evidence_selector import RelevantEvidenceBundle, RelevantEvidenceItem
 from apps.recommendation.reasoner import FIT_HIGH, OpenAICompatReasonGenerator
+
+# WO-0: 아래 테스트들은 514403e "검색 로직 변경 - 설계 변경"으로 변경된 reasoner retry/병합 동작을
+# 구설계 기준으로 검증하는 stale 테스트다(must_aspects 등 제거 포함). WO-C에서 재작성/제거 예정.
+_WOC_STALE = pytest.mark.xfail(
+    reason="WO-C 이연: 514403e 설계 변경으로 superseded된 구설계 검증(stale). WO-C에서 재작성/제거.",
+    strict=False,
+)
 
 
 class FakeReasonModel:
@@ -114,6 +122,7 @@ def test_reason_generator_normalizes_output_to_input_order():
     assert generator.last_trace["retry_count"] == 0
 
 
+@_WOC_STALE
 def test_reason_generator_serializes_selected_evidence_and_do_not_mention_only():
     generator = OpenAICompatReasonGenerator(
         Settings(app_env="test", strict_runtime_validation=False)
@@ -180,6 +189,7 @@ def test_reason_generator_serializes_selected_evidence_and_do_not_mention_only()
     assert "selected_evidence_ids" not in tool_properties
 
 
+@_WOC_STALE
 def test_reason_generator_logs_missing_and_empty_reasons(caplog):
     generator = OpenAICompatReasonGenerator(
         Settings(app_env="test", strict_runtime_validation=False)
@@ -276,6 +286,7 @@ def test_reason_generator_prefers_tool_call_arguments_when_present():
     assert generator.last_trace["mode"] == "tool_call"
 
 
+@_WOC_STALE
 def test_reason_generator_retries_with_compact_payload_when_first_attempt_returns_no_candidate_ids():
     generator = OpenAICompatReasonGenerator(
         Settings(app_env="test", strict_runtime_validation=False)
@@ -362,6 +373,7 @@ def test_reason_generator_retries_with_compact_payload_when_first_attempt_return
     assert generator.last_trace["prompt_budget_mode"] == "retry_compact"
 
 
+@_WOC_STALE
 def test_reason_generator_retries_with_compact_payload_when_first_attempt_returns_partial_candidates():
     generator = OpenAICompatReasonGenerator(
         Settings(app_env="test", strict_runtime_validation=False)

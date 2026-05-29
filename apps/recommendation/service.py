@@ -389,7 +389,7 @@ class RecommendationService:
         }
 
         reason_batch_count = len(
-            self._chunk_candidates(
+            self._batch_candidates(
                 shortlist,
                 batch_size=REASON_GENERATION_BATCH_SIZE,
             )
@@ -507,7 +507,7 @@ class RecommendationService:
         return None
 
     @staticmethod
-    def _chunk_candidates(
+    def _batch_candidates(
         candidates: list[CandidateCard], *, batch_size: int
     ) -> list[list[CandidateCard]]:
         if batch_size <= 0:
@@ -528,7 +528,7 @@ class RecommendationService:
     ) -> tuple[ReasonGenerationOutput, list[dict[str, Any]]]:
         batch_outputs: list[ReasonGenerationOutput] = []
         batch_traces: list[dict[str, Any]] = []
-        candidate_batches = self._chunk_candidates(
+        candidate_batches = self._batch_candidates(
             candidates, batch_size=REASON_GENERATION_BATCH_SIZE
         )
 
