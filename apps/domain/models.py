@@ -283,3 +283,63 @@ class RecommendationDecision(BaseModel):
     def reasons(self) -> list[str]:
         normalized_reason = " ".join(self.recommendation_reason.split())
         return [normalized_reason] if normalized_reason else []
+
+
+# ---------------------------------------------------------------------------
+# v2.0 chunk 모델 (WO-A) — "chunk 1개 = 1 Point". DATA_MODEL.md §3 3층 구조.
+# 기존 v1.x 모델(BasicInfo/ExpertPayload/SeedEvidencePoint 등)은 불변 — seed_data/롤백 의존.
+# doc_type enum 멤버십 검증은 apps.ingest.validate_chunks가 담당한다(domain→search 순환 import 회피).
+# ---------------------------------------------------------------------------
+
+
+class ResearcherMeta(BaseModel):
+    """모든 chunk에 비정규화 반복 저장되는 연구자 집계 메타 (DATA_MODEL §3.1).
+
+    v1.x ResearcherProfile의 4 count를 계승하고 assessor 2종(v2.0 신규)을 추가한다.
+    """
+
+    affiliated_organization: str | None = None
+    highest_degree: str | None = None
+    publication_count: int = 0
+    scie_publication_count: int = 0
+    intellectual_property_count: int = 0
+    research_project_count: int = 0
+    researcher_assessor_count: int = 0
+    expert_assessor_count: int = 0
+
+    @field_validator(
+        "publication_count",
+        "scie_publication_count",
+        "intellectual_property_count",
+        "research_project_count",
+        "researcher_assessor_count",
+        "expert_assessor_count",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_counts(cls, value: Any) -> Any:
+        return _normalize_int(value)
+
+
+class ChunkPayload(BaseModel):
+    """v2.0 chunk = 1 Point payload (DATA_MODEL §3). Point ID == chunk_id.
+
+    event_date는 ISO 날짜 문자열(예: "2024-05-01") 또는 None(시점 없는 doc_type).
+    doc_type은 11종 enum 값 문자열이며, 멤버십 검증은 apps.ingest.validate_chunks가 한다.
+    """
+
+    # 1층 · 공통 식별
+    researcher_id: str
+    researcher_name: str
+    doc_type: str
+    doc_id: str
+    chunk_id: str
+    chunk_text: str
+    chunk_text_len: int
+    researcher_meta: ResearcherMeta
+    # 2층 · 도메인 통합 정규화
+    event_date: str | None = None
+    event_year: int | None = None
+    tags: list[str] = Field(default_factory=list)
+    # 3층 · 도메인 고유
+    domain_attrs: dict[str, Any] = Field(default_factory=dict)
