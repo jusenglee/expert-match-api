@@ -166,6 +166,49 @@ class Settings(BaseSettings):
     seed_on_startup: bool = False
     seed_allow_recreate_collection: bool = False
 
+    # =========================================================================
+    # 8. v2.0 chunk 모델 설정 (WO-C C1)
+    # =========================================================================
+    # 전부 additive·비파괴 — 소비 코드(retriever/evidence/main 등)가 v2.0으로 바뀌기 전까지
+    # 이 설정들은 미사용이며 v1.x 동작에 영향이 없다. (branch_* 개명·support_rule 제거·컬렉션
+    # default 변경 등 BREAKING 정리는 해당 소비 코드 전환 슬라이스에서 함께 수행한다.)
+
+    # doc_type 집계 prior. 미설정(None)=equal. HARD: equal이 기본값(ADR 0005 §2).
+    # 이는 앱단 랭크 누적 가중일 뿐 Qdrant 가중 RRF/score 가중합이 아니다.
+    doc_type_priors: dict[str, float] | None = None
+
+    # 후보(연구자) cross-encoder 리랭커. 기본 off. band=score 동률 밴드 내 재배열만
+    # (탈락/생성 금지). 후보 순위 척추는 RRF 고정. (ADR 0005 §3)
+    candidate_reranker: Literal["off", "band"] = "off"
+
+    # 검색 대상 doc_type 화이트리스트. 미설정(None)=전체 11종.
+    # planner는 doc_type on/off를 결정하지 않으며, 축소는 운영 화이트리스트로만. (ADR 0003)
+    retrieval_doc_types: list[str] | None = None
+
+    # 한 연구자의 동일 doc_type에서 점수 누적에 기여하는 최대 chunk 수(다작 독식 방지).
+    doc_type_chunk_cap: int = 3
+
+    # evidence family별 top-N cap (grounding 선별 한정 — 후보 순위 영향 0).
+    evidence_family_cap: dict[str, int] = Field(
+        default_factory=lambda: {
+            "achievement": 10,
+            "assessment": 6,
+            "expertise": 6,
+            "identity": 1,
+        }
+    )
+
+    # evidence 리랭커 백엔드. 모델 부재 시 기본 lexical 강등. cross_encoder는 모델/서빙 설정 필요.
+    evidence_reranker_backend: Literal["cross_encoder", "lexical"] = "lexical"
+    cross_encoder_model_name: str | None = None
+    cross_encoder_base_url: str | None = None
+    cross_encoder_api_key: str | None = None
+    # CrossEncoderEvidenceSelector 생성자 인자와 1:1 매핑(WO-0 스텁/WO-C 구현).
+    ce_relevance_floor: float = 0.30
+    ce_pregate_per_type: int = 20
+    ce_max_pairs_per_request: int = 256
+    ce_top_n_per_type: int = 5
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

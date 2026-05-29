@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# WO-0 단일 출처: doc_type 11종 enum + 4 family 매핑(아래 v2.0 섹션에서 재노출).
+from apps.search.doc_types import DOC_TYPE_TO_FAMILY, DOC_TYPES, Family
+
 
 # =========================================================================
 # 시스템에서 사용하는 주요 데이터 브랜치 (Branches)
@@ -95,6 +98,82 @@ PAYLOAD_INDEX_FIELDS: tuple[tuple[str, str], ...] = (
     ("research_projects[].reference_year", "integer"),
     ("research_projects[].performing_organization", "keyword"),
     ("research_projects[].managing_agency", "keyword"),
+)
+
+
+# =========================================================================
+# v2.0 chunk 모델 스키마 (WO-C C2) — additive
+# =========================================================================
+# 기존 BRANCHES / DENSE_VECTOR_BY_BRANCH / SPARSE_VECTOR_BY_BRANCH / PAYLOAD_INDEX_FIELDS(nested)는
+# 소비 코드(retriever/live_validator/seed_data)가 단일 벡터·chunk payload로 전환되는 C3/C8 슬라이스에서
+# 제거한다. 그 전까지는 아래 v2.0 상수를 추가만 해 두고 v1.x 동작을 보존한다.
+
+# 단일 named vector. doc_type별 named vector를 두지 않는다 — doc_type은 payload 필터. (DATA_MODEL §2)
+DENSE_VECTOR_NAME = "dense_e5i"
+SPARSE_VECTOR_NAME = "sparse_splade"
+
+# WO-0 상수 재노출(검색 코드가 schema_registry 한 곳에서 doc_type/family를 참조하도록).
+DOC_TYPES_V2: tuple[str, ...] = DOC_TYPES
+DOC_TYPE_TO_FAMILY_V2: dict[str, str] = dict(DOC_TYPE_TO_FAMILY)
+FAMILIES: tuple[str, ...] = tuple(f.value for f in Family)
+
+# v2.0 3층 payload에서 필터(FieldCondition) 가능한 키 (DATA_MODEL §5).
+FILTERABLE_FIELDS_V2: frozenset[str] = frozenset(
+    {
+        "researcher_id",
+        "doc_type",
+        "tags",
+        "event_year",
+        "event_date",
+        "researcher_meta.affiliated_organization",
+        "researcher_meta.highest_degree",
+        "researcher_meta.publication_count",
+        "researcher_meta.scie_publication_count",
+        "researcher_meta.intellectual_property_count",
+        "researcher_meta.research_project_count",
+        "researcher_meta.researcher_assessor_count",
+        "researcher_meta.expert_assessor_count",
+        "domain_attrs.journal_class",
+        "domain_attrs.ip_type",
+        "domain_attrs.application_country",
+        "domain_attrs.performing_organization",
+        "domain_attrs.managing_agency",
+        "domain_attrs.appointing_organization",
+        "domain_attrs.evaluation_agency_name",
+        "domain_attrs.tech_classification_system",
+        "domain_attrs.specific_specialty_name",
+        "domain_attrs.tech_rank",
+        "domain_attrs.specialty_count",
+    }
+)
+
+# v2.0 Qdrant payload 인덱스 세트 (DATA_MODEL §5).
+# ★WO-B 부트스트랩이 실제 생성하는 인덱스와 1:1 정합해야 한다(C8 readiness 기준).
+PAYLOAD_INDEX_FIELDS_V2: tuple[tuple[str, str], ...] = (
+    ("researcher_id", "keyword"),
+    ("doc_type", "keyword"),
+    ("tags", "keyword"),
+    ("researcher_meta.affiliated_organization", "keyword"),
+    ("researcher_meta.highest_degree", "keyword"),
+    ("domain_attrs.journal_class", "keyword"),
+    ("domain_attrs.ip_type", "keyword"),
+    ("domain_attrs.application_country", "keyword"),
+    ("domain_attrs.performing_organization", "keyword"),
+    ("domain_attrs.managing_agency", "keyword"),
+    ("domain_attrs.appointing_organization", "keyword"),
+    ("domain_attrs.evaluation_agency_name", "keyword"),
+    ("domain_attrs.tech_classification_system", "keyword"),
+    ("domain_attrs.specific_specialty_name", "keyword"),
+    ("event_year", "integer"),
+    ("researcher_meta.publication_count", "integer"),
+    ("researcher_meta.scie_publication_count", "integer"),
+    ("researcher_meta.intellectual_property_count", "integer"),
+    ("researcher_meta.research_project_count", "integer"),
+    ("researcher_meta.researcher_assessor_count", "integer"),
+    ("researcher_meta.expert_assessor_count", "integer"),
+    ("domain_attrs.tech_rank", "integer"),
+    ("domain_attrs.specialty_count", "integer"),
+    ("event_date", "datetime"),
 )
 
 
