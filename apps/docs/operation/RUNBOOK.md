@@ -1,6 +1,6 @@
-# 운영 매뉴얼 (RUNBOOK) — chunk 재설계
+# 운영 매뉴얼 (RUNBOOK) — flat chunk 모델
 
-**문서 버전:** v2.0 (2026-05-28)
+**문서 버전:** v2.1 (flat payload 정렬, 2026-06-02)
 
 전문가 추천 시스템의 설치·실행·점검·모니터링 지침. 데이터 모델은 [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md), 환경 변수는 [`ENVIRONMENT.md`](ENVIRONMENT.md).
 
@@ -16,18 +16,18 @@ python -m pip install -e .[dev]
 - Qdrant 서버 구동 및 `NTIS_QDRANT_URL` 접근 확인.
 - 기본 컬렉션 이름은 `ntis_researcher_chunks`(`NTIS_QDRANT_COLLECTION_NAME`으로 override).
 - 컬렉션 스키마(필수):
-  - Point ID = `chunk_id` 문자열
-  - named vector: `dense_e5i`(1024, Cosine) + `sparse_splade`
-  - payload 인덱스: `researcher_id`, `doc_type`, `tags`, `event_year`, `researcher_meta.*_count`(8종), 주요 기관/구분 keyword 필드 ([`DATA_MODEL.md §5`](../architecture/DATA_MODEL.md))
+  - Point ID = `chunk_id` 문자열 (`<doc_type>_<숫자doc_id>_c<NNN>`, 예: `paper_100000045256_c000`)
+  - named vector: `vector_e5i`(1024, Cosine) + `vector_splade`. doc_type은 named vector가 아니라 payload 필터.
+  - payload 인덱스: `researcher_id`(keyword), `doc_type`(keyword), 연구자 공통 count 5종(`publication_count`/`scie_publication_count`/`intellectual_property_count`/`research_project_count`/`researcher_assessor_activity_count`, integer), `doc_date`(datetime, recency), `affiliated_organization`/`highest_degree` 및 주요 `doc_attrs.*` keyword 필드 ([`DATA_MODEL.md §5`](../architecture/DATA_MODEL.md))
 - 시작 시, 실제 선택된 sparse backend에 맞춰 sparse vector modifier(`IDF` 또는 없음)를 자동 확인·복구한다.
 
 ### 2.1 적재(ingestion) 불변식 점검
 
-적재 데이터는 [`DATA_MODEL.md §6`](../architecture/DATA_MODEL.md)의 불변식을 만족해야 한다. 운영 표본 점검 항목:
+적재는 **외부 제공자 소관**이며(구 `apps/ingest`는 `legacy_v1x/ingest/`로 격리), 적재 데이터는 [`DATA_MODEL.md §6`](../architecture/DATA_MODEL.md)의 불변식을 만족해야 한다. 운영 표본 점검 항목:
 - Point ID == `chunk_id`, 전역 유일.
-- 한 `researcher_id`의 모든 chunk에서 `researcher_meta`/`researcher_name` 동일.
-- `doc_type` ∈ 정의된 11종.
-- `event_year` == `event_date`의 연도(둘 다 null 허용).
+- 한 `researcher_id`의 모든 chunk에서 flat root 공통 메타(`researcher_name`/`affiliated_organization`/`highest_degree` + count 5종) 동일.
+- `doc_type` ∈ 정의된 5종(`paper`/`patent`/`project`/`assessor_activity`/`specialty`).
+- `doc_date`는 단일 문자열(`"NONE"` 또는 결측 허용); recency는 datetime 인덱스에 매칭되는 값만 대상.
 - dense/sparse가 동일 `chunk_text`에서 생성.
 - `chunk_text`에 요청 어투(role/action 불용어) 미포함.
 
@@ -36,7 +36,7 @@ python -m pip install -e .[dev]
 `apps/tools/bootstrap_chunks.py` — `ntis_researcher_chunks` 컬렉션 생성·점검·스모크.
 
 ```bash
-# 컬렉션 생성(단일 dense_e5i + sparse_splade + payload 인덱스)
+# 컬렉션 생성(단일 vector_e5i + vector_splade + flat payload 인덱스)
 NTIS_QDRANT_COLLECTION_NAME=ntis_researcher_chunks python -m apps.tools.bootstrap_chunks ensure
 # 스키마/인덱스 확인 + 레거시 컬렉션 Point 수(보존) 확인
 ... python -m apps.tools.bootstrap_chunks inspect
@@ -63,10 +63,10 @@ NTIS_QDRANT_COLLECTION_NAME=ntis_researcher_chunks python -m apps.tools.bootstra
 
 `/health/ready`가 `503`/`ready:false`면 점검:
 - 컬렉션 존재 여부
-- named vector `dense_e5i`/`sparse_splade` 존재 여부
+- named vector `vector_e5i`/`vector_splade` 존재 여부
 - sparse vector modifier 값(IDF/none)
-- 필수 payload 인덱스(`researcher_id`, `doc_type`, `event_year`, `researcher_meta.*_count` 등) 생성 여부
-- 유효 샘플 Point 존재 및 구조(`chunk_id`, `doc_type`, `researcher_meta`, `domain_attrs`)
+- 필수 payload 인덱스(`researcher_id`, `doc_type`, `doc_date`, 연구자 count 5종 등) 생성 여부
+- 유효 샘플 Point 존재 및 구조(flat root: `chunk_id`, `doc_type`, `researcher_id`, 공통 메타 + count 5종, doc_type별 `doc_attrs`)
 
 ## 4. 서버 실행
 
@@ -117,8 +117,8 @@ curl -X POST http://127.0.0.1:8011/recommend `
 ```
 [09:45:51.125] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend top_k=5 exclude_orgs=1 query='드론 화재 진압 평가위원 추천'
 [09:45:52.010] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 완료: retrieval_core=['드론','화재 진압'] core_keywords=['드론','화재 진압'] role_terms=['평가위원'] action_terms=['추천'] semantic_query='드론 기반 화재 진압 기술 전문가' exclude_orgs=['A기관'] hard_filters={} top_k=5
-[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 컴파일: mode=keyword_pool_then_hybrid retrieval_keywords=['드론','화재','진압'] doc_types=11 limits={prefetch:100, output:50, chunk_cap:3, retrieval:80}
-[09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.1 researcher_pool=37 doc_type_counts={'publication':15,'research_project':9,'researcher_assessor':6,'intellectual_property':2}
+[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 컴파일: mode=keyword_pool_then_hybrid retrieval_keywords=['드론','화재','진압'] doc_types=5 limits={prefetch:100, output:50, chunk_cap:3, retrieval:80}
+[09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.1 researcher_pool=37 doc_type_counts={'paper':15,'project':9,'assessor_activity':6,'patent':2}
 [09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 2차 하이브리드+집계 완료: raw_doc_type_counts={...} aggregated_candidates=24 support_pass=15 support_filtered=9 final=15
 [09:45:54.330] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms':880,'search_ms':210,'total_ms':3205}
 ```

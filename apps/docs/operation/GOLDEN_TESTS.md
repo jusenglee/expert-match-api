@@ -1,6 +1,6 @@
-# Golden Tests (chunk 재설계)
+# Golden Tests (flat chunk 모델)
 
-**문서 버전:** v2.0 (2026-05-28)
+**문서 버전:** v2.1 (flat payload 정렬, 2026-06-02)
 
 데이터 모델: [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md) · 흐름: [`../architecture/SERVICE_FLOW.md`](../architecture/SERVICE_FLOW.md) · 계약: [`../api/DATA_CONTRACT.md`](../api/DATA_CONTRACT.md).
 
@@ -31,32 +31,32 @@
 - Expected: Qdrant 검색 생략, `retrieval_skipped_reason` trace 존재, `recommendations=[]`.
 
 ### 7. chunk = 1 Point 적재 (NEW)
-- Input: 한 연구자에 publication 3건 + research_project 2건이 적재됨
-- Expected: Qdrant에 5개 Point(각 ID=`chunk_id`)가 존재, 모두 동일 `researcher_id`/`researcher_meta`.
+- Input: 한 연구자에 paper 3건 + project 2건이 적재됨
+- Expected: Qdrant에 5개 Point(각 ID=`chunk_id`)가 존재, 모두 동일 `researcher_id` 및 동일 flat root 공통 메타(`researcher_name`/`affiliated_organization`/`highest_degree` + count 5종).
 
 ### 8. 연구자 집계와 dedupe (NEW)
 - Input: 한 연구자의 여러 doc_type chunk이 동시에 hit
 - Expected: 결과에 연구자당 **1건**만 등장, 점수는 그 연구자 chunk hit들의 RRF 누적, `matched_doc_types`에 hit한 doc_type 나열.
 
 ### 9. doc_type별 chunk 캡 (NEW)
-- Input: publication chunk을 매우 많이 가진 다작 연구자 vs 소수지만 고관련 연구자
+- Input: paper chunk을 매우 많이 가진 다작 연구자 vs 소수지만 고관련 연구자
 - Expected: doc_type별 상위 `chunk_cap`(기본 3)개만 집계에 기여, 다작이 chunk 수만으로 순위를 독식하지 않음.
 
 ### 10. 통합 recency는 OR 결합 (NEW, 과거 장애 회귀 방지)
 - Input: "최근 3년 활동" 의도(여러 doc_type 대상)
-- Expected: `event_year >= 올해-3` 조건이 doc_type들에 대해 **OR(min_should, min_count=1)** 로 결합, 세 영역 모두 동시 충족하는 극소수만 남는 AND 회귀가 발생하지 않음.
+- Expected: `doc_date >= 올해-3년` 조건이 doc_type들에 대해 **OR(min_should, min_count=1)** 로 결합, 세 영역 모두 동시 충족하는 극소수만 남는 AND 회귀가 발생하지 않음. `doc_date`가 `"NONE"`/결측인 chunk은 datetime range에 매칭되지 않아 recency 대상에서 제외된다.
 
-### 11. researcher_meta 기반 hard filter (NEW)
+### 11. flat root 메타 기반 hard filter (NEW)
 - Input: `publication_count_min` / `highest_degree` 필터
-- Expected: `researcher_meta.publication_count`/`highest_degree`로 chunk 단계에서 deterministic 필터, 위반 후보 0건.
+- Expected: flat root의 `publication_count`/`highest_degree`로 chunk 단계에서 deterministic 필터, 위반 후보 0건.
 
 ### 12. 제외 기관 (cross-chunk)
 - Input: `exclude_orgs` 지정
-- Expected: `researcher_meta.affiliated_organization` + 매칭 chunk의 `performing_organization`/`managing_agency`/`appointing_organization`/`evaluation_agency_name` 어디에도 해당 기관이 없는 후보만 반환.
+- Expected: flat root `affiliated_organization` + 매칭 chunk의 `doc_attrs.performing_organization`/`doc_attrs.managing_agency`(project) 어디에도 해당 기관이 없는 후보만 반환. (assessor_activity/specialty의 `doc_attrs` 키는 미상 → passthrough, 인덱스 대상 아님.)
 
 ### 13. 평가이력 신호 (NEW)
 - Input: "평가위원 경험이 풍부한" 의도
-- Expected: `researcher_assessor`/`expert_assessor` chunk이 검색·evidence에 1급으로 포함, (옵트인 시) assessment family prior가 집계에 반영.
+- Expected: `assessor_activity` chunk(assessment family)이 검색·evidence에 1급으로 포함, (옵트인 시) assessment family prior가 집계에 반영.
 
 ### 14. chunk_id 기반 evidence (NEW)
 - Input: 추천 후보가 다수 관련 chunk 보유
@@ -74,11 +74,15 @@
 - Input: sparse 키워드 단계가 직접 하이브리드보다 좁은 풀을 내는 질의
 - Expected: 1차 sparse 풀 수집이 항상 먼저, 2차 하이브리드는 `researcher_id MatchAny` 풀 내부로 제한, 풀 밖 연구자는 하이브리드에 떠도 최종 제외, trace에 `retrieval_mode="keyword_pool_then_hybrid"`와 `keyword_stage_candidate_count`.
 
-### 18. 배치 사유 생성 + 서버 fallback
+### 18. 확장 사전 제거
+- Input: planner 출력에 legacy `bundle_ids`가 포함된 질의
+- Expected: 검색 쿼리에 v1.x `basic`/`art`/`pat`/`pjt` 확장어가 추가되지 않으며, `branch_queries.expanded`는 `branch_queries.stable`과 동일하다.
+
+### 19. 배치 사유 생성 + 서버 fallback
 - Input: Top-k>5이고 LLM이 일부 후보를 누락/공란
 - Expected: 5명 단위 순차 배치, 검색 순서 유지, 누락·공란 후보는 보수적 서버 fallback 사유, trace에 배치별 후보 id와 fallback 대상 노출.
 
-### 19. 단계별 로깅
+### 20. 단계별 로깅
 - Input: 정상 `/recommend` 또는 `/search/candidates`
 - Expected: `trace.server_logs`가 `trace=<id>` + `[METHOD /path]` 한 줄 형식, 요청 시작·질의 수신·플래너·1차/2차 검색·집계·응답 준비 로그 포함, planner/retriever 로그에 실제 키워드·쿼리 텍스트·doc_type 경로 count 포함(벡터/전체 payload 미출력).
 
@@ -86,8 +90,9 @@
 
 - 저장 단위는 chunk(Point ID=`chunk_id`), 한 연구자는 다수 Point.
 - 검색은 항상 `keyword_pool_then_hybrid`: sparse 키워드 풀 → 풀 내부 하이브리드 RRF.
+- v1.x 확장 사전은 active 검색 경로에 없으며 `expanded` 쿼리는 별도 확장어를 추가하지 않는다.
 - 검색 후 `researcher_id`로 집계해 연구자당 1건, 점수는 RRF 누적, doc_type별 `chunk_cap` 적용.
-- hard filter는 시스템이 deterministic 보장, 다중 doc_type recency는 OR 결합.
+- hard filter는 시스템이 deterministic 보장(flat root 메타 기준), 다중 doc_type `doc_date` recency는 OR 결합.
 - `/search/candidates`와 `/recommend`는 검색·집계 순서를 유지하고 `/recommend`는 Top-k만 LLM에 전달.
 - evidence 선별은 family별 캡을 적용하되 후보 순위를 바꾸지 않는다.
 - `recommendation.evidence`는 LLM이 고른 `chunk_id`로 resolve, 무효 시 결정론적 fallback.

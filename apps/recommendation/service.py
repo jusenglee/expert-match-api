@@ -2,7 +2,7 @@
 사용자의 요청(추천 질의)을 받아 전체 RAG(Retrieval-Augmented Generation) 기반 추천 파이프라인을 지휘하는 오케스트레이터입니다.
 
 [Architecture Overview]
-1. Planner (의도 분석): 사용자의 자연어 질의를 분석하여 검색 키워드, 동의어 확장 번들, 사전 필터 등을 추출합니다.
+1. Planner (의도 분석): 사용자의 자연어 질의를 분석하여 검색 키워드, 의미 검색 문장, 사전 필터 등을 추출합니다.
 2. Retriever (검색): Qdrant 하이브리드 엔진을 통해 수만 명의 후보자 중 가장 관련성 높은 후보자 풀을 확보합니다.
 3. Card Builder (정보 수합): 검색된 후보자의 논문, 특허, 과제 실적을 모아 '후보자 카드(CandidateCard)'를 만듭니다.
 4. Evidence Selector (증거 선별): 후보자의 수많은 실적 중, 사용자 질의와 가장 매칭되는 실적 상위 N개를 추려냅니다.
@@ -29,10 +29,11 @@ from apps.recommendation.reasoner import (
     ReasonGenerator,
     VALID_EVIDENCE_ID_PATTERN,
 )
+from apps.search.doc_types import DOC_TYPES
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.query_builder import QueryTextBuilder
-from apps.search.retriever import QdrantHybridRetriever, SearchHit
-from apps.search.schema_registry import BRANCHES
+from apps.search.retriever import QdrantHybridRetriever
+from apps.domain.models import ResearcherCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class RecommendationService:
             exclude_orgs=exclude_orgs,
             top_k=top_k,
             retrieve=self.retriever.search,
-            mode_label="keyword_pool_then_hybrid",
+            mode_label="grouped_hybrid_rrf",
         )
 
     async def search_weighted_candidates(
@@ -114,8 +115,8 @@ class RecommendationService:
         top_k: int | None = None,
     ) -> dict[str, Any]:
         """
-        [/search/candidates 전용] 순수 가중치 하이브리드 검색 파이프라인.
-        dense * 0.6 + sparse * 0.4 점수 융합 + 핵심 키워드 포함 별도 필터.
+        [/search/candidates 전용] grouped RRF로 통일된 검색 파이프라인(/recommend과 동일 경로).
+        query_points_groups(group_by=researcher_id) + 앱단 RRF 누적. (구 가중 0.6/0.4 융합 폐기.)
         """
         return await self._run_search_pipeline(
             query=query,
@@ -124,7 +125,7 @@ class RecommendationService:
             exclude_orgs=exclude_orgs,
             top_k=top_k,
             retrieve=self.retriever.search_weighted,
-            mode_label="keyword_pool_then_weighted_hybrid",
+            mode_label="grouped_hybrid_rrf",
         )
 
     async def _run_search_pipeline(
@@ -234,17 +235,16 @@ class RecommendationService:
 
         retrieval_payload = retrieval.query_payload or {}
         logger.info(
-            "검색 단계 완료: elapsed_ms=%.2f hits=%d cache_hit=%s mode=%s retrieval_keywords=%s keyword_candidates=%s hybrid_filter_candidates=%s aggregated_candidates=%s support_pass=%s support_filtered=%s",
+            "검색 단계 완료: elapsed_ms=%.2f hits=%d cache_hit=%s mode=%s retrieval_keywords=%s group_count=%s aggregated=%s org_filtered=%s final=%s",
             search_timer.elapsed_ms,
             len(retrieval.hits),
             retrieval.cache_hit,
             retrieval_payload.get("retrieval_mode"),
             retrieval.retrieval_keywords,
-            retrieval_payload.get("keyword_stage_candidate_count"),
-            retrieval_payload.get("hybrid_stage_candidate_filter_count"),
+            retrieval_payload.get("group_count"),
             retrieval_payload.get("aggregated_candidate_count"),
-            retrieval_payload.get("support_pass_count"),
-            retrieval_payload.get("support_filtered_count"),
+            retrieval_payload.get("org_filtered_count"),
+            retrieval_payload.get("final_hit_count"),
         )
 
         display_hits = retrieval.hits[:top_k] if top_k is not None else retrieval.hits
@@ -267,7 +267,7 @@ class RecommendationService:
             "cache_hit": retrieval.cache_hit,
             "filtered_out_candidates": retrieval.filtered_out_candidates,
             "query_payload": retrieval.query_payload,
-            "branch_queries": retrieval.branch_queries,
+            "branch_queries": {"stable": retrieval.queries.stable, "expanded": retrieval.queries.expanded},
             "retrieval_keywords": retrieval.retrieval_keywords,
             "retrieval_score_traces": retrieval.retrieval_score_traces,
             "expanded_shadow_hits": self._serialize_shadow_hits(retrieval.expanded_shadow_hits),
@@ -324,6 +324,20 @@ class RecommendationService:
             top_k_used,
             len(shortlist),
             [candidate.expert_id for candidate in shortlist],
+        )
+        logger.info(
+            "추천 후보 상세: %s",
+            [
+                {
+                    "expert_id": c.expert_id,
+                    "name": c.name,
+                    "org": c.organization,
+                    "rank_score": c.rank_score,
+                    "doc_types": c.doc_types_present,
+                    "counts": c.counts,
+                }
+                for c in shortlist
+            ],
         )
 
         if search_result["retrieved_count"] == 0 or not shortlist:
@@ -642,7 +656,7 @@ class RecommendationService:
 
     @staticmethod
     def _build_profile_evidence(card: CandidateCard) -> EvidenceItem | None:
-        if not (card.organization or card.degree or card.major):
+        if not (card.organization or card.degree):
             return None
         return EvidenceItem(
             type="profile",
@@ -651,7 +665,6 @@ class RecommendationService:
                 [
                     card.organization or "unknown organization",
                     card.degree or "unknown degree",
-                    card.major or "unknown major",
                 ]
             ),
         )
@@ -663,6 +676,8 @@ class RecommendationService:
             title=item.title,
             date=item.date,
             detail=item.detail,
+            snippet=item.snippet,
+            chunk_id=item.item_id,
         )
 
     @staticmethod
@@ -690,6 +705,8 @@ class RecommendationService:
             "project": "과제",
             "paper": "논문",
             "patent": "특허",
+            "assessor_activity": "심사위원 활동",
+            "specialty": "전문분야",
             "profile": "프로필",
         }
         referenced_items: list[str] = []
@@ -846,11 +863,11 @@ class RecommendationService:
         return recommendations, selected_evidence_trace, server_fallback_reasons
 
     @staticmethod
-    def _serialize_shadow_hits(hits: list[SearchHit]) -> list[dict[str, str]]:
+    def _serialize_shadow_hits(hits: list[ResearcherCandidate]) -> list[dict[str, str]]:
         return [
             {
-                "expert_id": hit.expert_id,
-                "name": hit.payload.basic_info.researcher_name or "",
+                "expert_id": hit.researcher_id,
+                "name": hit.researcher_name or "",
             }
             for hit in hits
         ]
@@ -861,7 +878,7 @@ class RecommendationService:
         plan: PlannerOutput,
         candidate_cards: list[CandidateCard],
         query_payload: dict[str, Any],
-        branch_queries: dict[str, CompiledBranchQueries],
+        branch_queries: dict[str, Any],
         raw_query: str,
         retrieval_keywords: list[str],
         retrieval_score_traces: list[dict[str, Any]],
@@ -881,7 +898,7 @@ class RecommendationService:
         return {
             "intent_summary": plan.intent_summary,
             "applied_filters": plan.hard_filters,
-            "searched_branches": list(BRANCHES),
+            "searched_branches": list(DOC_TYPES),
             "retrieved_count": retrieved_count,
             "recommendations": recommendations,
             "data_gaps": merged_data_gaps,

@@ -1,11 +1,7 @@
-"""
-Qdrant 컬렉션의 데이터 무결성과 시스템 의존성(LLM, Embedding)의 연결 상태를 실시간으로 점검하는 모듈입니다.
+"""Qdrant 컬렉션 데이터 무결성 + 백엔드(LLM/Embedding) 연결 상태를 점검하는 모듈 (flat 모델, v2.1).
 
-[Architecture Overview]
-본 애플리케이션은 시작(Startup) 시 단순히 Qdrant 서버가 떠있는지(`ping`)만 확인하는 것이 아니라,
-실제 추천 서비스가 의존하는 데이터 스키마가 완벽히 구성되어 있는지를 무작위 샘플링 검증을 통해 확인합니다.
-(예: 특정 페이로드 필드가 존재하는지, Dense/Sparse 벡터가 명세대로 생성되어 있는지 등)
-이를 통해 런타임에 발생할 수 있는 뜬금없는 키 에러(KeyError)나 검색 실패를 방지합니다.
+시작 시 단일 벡터(vector_e5i/vector_splade) 구성·payload 인덱스·flat chunk 표본을 검증해
+런타임 KeyError/검색 실패를 예방한다.
 """
 
 from __future__ import annotations
@@ -18,45 +14,39 @@ from qdrant_client import QdrantClient
 
 from apps.core.config import Settings
 from apps.core.runtime_validation import RuntimeDependencyValidator
-from apps.search.schema_registry import BRANCHES, PAYLOAD_INDEX_FIELDS, SearchSchemaRegistry
+from apps.domain.chunk_view import normalize_doc_date
+from apps.search.doc_types import DOC_TYPES
+from apps.search.schema_registry import (
+    DENSE_VECTOR_NAME,
+    PAYLOAD_INDEX_FIELDS,
+    SPARSE_VECTOR_NAME,
+)
 from apps.search.sparse_runtime import SparseRuntimeConfig, model_requires_idf_modifier
 
 logger = logging.getLogger(__name__)
 
+SAMPLE_SCAN_BATCH_SIZE = 32
+SAMPLE_SCAN_LIMIT = 256
 
-# =========================================================================
-# 무결성 검증을 위한 샘플링 설정
-# =========================================================================
-SAMPLE_SCAN_BATCH_SIZE = 32  # Qdrant에서 한 번에 가져올 포인트 수
-SAMPLE_SCAN_LIMIT = 256      # 최대 탐색할 포인트 수 (이 안에 유효 데이터가 없으면 실패 간주)
-
-# =========================================================================
-# 데이터 구조 완성도 필수/선택 체크 항목
-# =========================================================================
-# 아래 항목들은 전부 'True'여야만 서버가 정상 작동하는 것으로 판단됩니다.
+# flat chunk payload 표본 점검: 필수 항목은 전부 True여야 ready.
 SAMPLE_COMPLETENESS_CHECKS = (
-    "sample_root_fields",         # 연구자 기본 정보 필드가 존재하는가
-    "sample_art_present",         # 논문(Article) 데이터가 존재하는가
-    "sample_pjt_present",         # 과제(Project) 데이터가 존재하는가
-    "sample_project_dates_valid", # 과제 날짜 데이터가 날짜 형식으로 올바른가
+    "sample_root_fields",   # flat 공통 식별 필드 존재
+    "sample_doc_type_valid",  # doc_type이 5종 중 하나
 )
-# 있으면 좋지만, 테스트 환경 등에서는 없어도 시스템 동작을 막지 않는 선택 항목
-OPTIONAL_CHECKS = {"sample_pat_present"}  # 특허(Patent) 데이터 존재 여부
+OPTIONAL_CHECKS = {"sample_doc_attrs_present", "sample_doc_date_present"}
+
+_REQUIRED_ROOT_FIELDS = {"researcher_id", "doc_type", "chunk_id", "chunk_text"}
 
 
 @dataclass(slots=True)
 class LiveValidationReport:
-    """
-    시작 시 헬스체크(Health Check) 엔드포인트나 시작 로그에 출력될 검증 보고서 객체입니다.
-    """
-    ready: bool                        # [필수] 시스템이 즉시 트래픽을 받을 수 있는 준비 상태인가
-    checks: dict[str, bool]            # 각 개별 점검 항목별 통과 여부 내역
-    issues: list[str]                  # 발견된 문제점들의 목록 (오류 추적용)
-    collection_name: str               # 검증 대상 Qdrant 컬렉션 이름
-    sample_point_id: str | None = None # 검증에 사용된 대표 무작위 샘플 포인트의 ID
+    ready: bool
+    checks: dict[str, bool]
+    issues: list[str]
+    collection_name: str
+    sample_point_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """보고서 내용을 딕셔너리 형태로 변환합니다."""
         return {
             "ready": self.ready,
             "checks": self.checks,
@@ -67,33 +57,24 @@ class LiveValidationReport:
 
 
 class LiveContractValidator:
-    """
-    코드가 기대하는 데이터 규약(Contract)이 실제 DB 및 서버 환경과 일치하는지 검증합니다.
-    """
+    """코드가 기대하는 flat 데이터 규약이 실제 DB/백엔드와 일치하는지 검증."""
+
     def __init__(
         self,
         *,
         client: QdrantClient,
         settings: Settings,
-        registry: SearchSchemaRegistry,
         dependency_validator: RuntimeDependencyValidator | None = None,
         sparse_runtime: SparseRuntimeConfig | None = None,
     ) -> None:
         self.client = client
         self.settings = settings
-        self.registry = registry
         self.dependency_validator = dependency_validator or RuntimeDependencyValidator(settings)
         self.sparse_runtime = sparse_runtime
 
     def _build_report(
-        self,
-        *,
-        ready: bool,
-        checks: dict[str, bool],
-        issues: list[str],
-        sample_point_id: str | None = None,
+        self, *, ready: bool, checks: dict[str, bool], issues: list[str], sample_point_id: str | None = None
     ) -> LiveValidationReport:
-        """보고서 객체를 생성합니다."""
         return LiveValidationReport(
             ready=ready,
             checks=checks,
@@ -103,18 +84,10 @@ class LiveContractValidator:
         )
 
     @staticmethod
-    def _is_nonempty_list(value: Any) -> bool:
-        """값이 비어있지 않은 리스트인지 확인합니다."""
-        return isinstance(value, list) and bool(value)
-
-    @staticmethod
     def _modifier_is_idf(modifier: Any) -> bool:
-        """Qdrant의 스파스 벡터 수정자가 전형적인 IDF 설정인지 확인합니다."""
         if modifier is None:
             return False
-
-        candidates = [modifier, getattr(modifier, "value", None), getattr(modifier, "name", None)]
-        for candidate in candidates:
+        for candidate in (modifier, getattr(modifier, "value", None), getattr(modifier, "name", None)):
             if candidate is None:
                 continue
             normalized = str(candidate).strip().lower()
@@ -133,48 +106,27 @@ class LiveContractValidator:
         return modifier is None
 
     def _build_sample_checks(self, sample_payload: dict[str, Any]) -> dict[str, bool]:
-        """특정 샘플 포인트의 페이로드가 내부 데이터 규약을 준수하는지 점검합니다."""
-        required_root = {"basic_info", "researcher_profile"}
-        art_items = sample_payload.get("publications")
-        pat_items = sample_payload.get("intellectual_properties")
-        pjt_items = sample_payload.get("research_projects")
-
+        """flat chunk payload 표본 규약 점검."""
+        doc_type = sample_payload.get("doc_type")
+        doc_attrs = sample_payload.get("doc_attrs")
         return {
-            # 필수 루트 필드 존재 여부
-            "sample_root_fields": required_root.issubset(sample_payload.keys()),
-            # 주요 실적 데이터 존재 여부
-            "sample_art_present": self._is_nonempty_list(art_items),
-            "sample_pat_present": self._is_nonempty_list(pat_items),
-            "sample_pjt_present": self._is_nonempty_list(pjt_items),
-            # 과제의 기간 및 연도 데이터 정합성
-            "sample_project_dates_valid": bool(
-                isinstance(pjt_items, list)
-                and pjt_items
-                and all(
-                    isinstance(item, dict)
-                    and all(
-                        key in item and item.get(key) not in (None, "")
-                        for key in ("project_start_date", "project_end_date", "reference_year")
-                    )
-                    for item in pjt_items
-                )
-            ),
+            "sample_root_fields": _REQUIRED_ROOT_FIELDS.issubset(sample_payload.keys()),
+            "sample_doc_type_valid": doc_type in set(DOC_TYPES),
+            "sample_doc_attrs_present": isinstance(doc_attrs, dict),
+            "sample_doc_date_present": normalize_doc_date(sample_payload.get("doc_date")) is not None,
         }
 
     def _sample_completeness_score(self, sample_payload: Any) -> int:
-        """샘플의 데이터 완성도 점수를 계산합니다 (최고점 = 모든 필수 체크 통과)."""
         if not isinstance(sample_payload, dict):
             return -1
         checks = self._build_sample_checks(sample_payload)
         return sum(checks[name] for name in SAMPLE_COMPLETENESS_CHECKS)
 
     def _select_sample_point(self) -> Any | None:
-        """검증에 적합한 가장 완성도 높은 샘플 데이터를 컬렉션에서 찾아 반환합니다."""
         offset: Any | None = None
         scanned = 0
         best_sample: Any | None = None
         best_score = -2
-
         while scanned < SAMPLE_SCAN_LIMIT:
             limit = min(SAMPLE_SCAN_BATCH_SIZE, SAMPLE_SCAN_LIMIT - scanned)
             records, next_offset = self.client.scroll(
@@ -186,30 +138,25 @@ class LiveContractValidator:
             )
             if not records:
                 break
-
             scanned += len(records)
             for record in records:
                 score = self._sample_completeness_score(getattr(record, "payload", None))
                 if best_sample is None or score > best_score:
                     best_sample = record
                     best_score = score
-                # 완벽한 샘플을 찾으면 즉시 반환
                 if score == len(SAMPLE_COMPLETENESS_CHECKS):
                     return record
-
             if next_offset is None or len(records) < limit:
                 break
             offset = next_offset
-
         return best_sample
 
     def validate(self) -> LiveValidationReport:
-        """전체 시스템 환경과 데이터 상태를 종합적으로 검증합니다."""
         checks: dict[str, bool] = {}
         issues: list[str] = []
         sample_point_id: str | None = None
 
-        # 1. 백엔드 연결성 점검 (LLM, Embedding 서버)
+        # 1. 백엔드 연결성
         backend_results = self.dependency_validator.validate_backends()
         checks["llm_backend_connected"] = all(item.ok for item in backend_results if item.name == "llm_backend")
         checks["embedding_backend_connected"] = all(item.ok for item in backend_results if item.name == "embedding_backend")
@@ -217,7 +164,7 @@ class LiveContractValidator:
             if not item.ok:
                 issues.append(item.detail)
 
-        # 2. Qdrant 컬렉션 존재 여부 확인
+        # 2. 컬렉션 존재
         try:
             collection_info = self.client.get_collection(self.settings.qdrant_collection_name)
             checks["collection_exists"] = True
@@ -230,47 +177,34 @@ class LiveContractValidator:
         vector_config = getattr(collection_info.config.params, "vectors", None) or {}
         sparse_config = getattr(collection_info.config.params, "sparse_vectors", None) or {}
         payload_schema = getattr(collection_info, "payload_schema", {}) or {}
-
         dense_names = set(vector_config.keys() if isinstance(vector_config, dict) else [])
         sparse_names = set(sparse_config.keys() if isinstance(sparse_config, dict) else [])
 
-        # 3. Dense 벡터(의미 검색용) 설정 확인
-        checks["dense_vectors_present"] = all(
-            self.registry.dense_vector_by_branch[branch] in dense_names for branch in BRANCHES
-        )
+        # 3. 단일 dense/sparse 벡터 존재
+        checks["dense_vectors_present"] = DENSE_VECTOR_NAME in dense_names
         if not checks["dense_vectors_present"]:
-            issues.append("필수 Dense 벡터 구성이 컬렉션에 없습니다.")
-
-        # 4. Sparse 벡터(키워드 검색용) 설정 및 IDF 수정자 확인
-        checks["sparse_vectors_present"] = all(
-            self.registry.sparse_vector_by_branch[branch] in sparse_names for branch in BRANCHES
-        )
+            issues.append(f"필수 Dense 벡터({DENSE_VECTOR_NAME})가 컬렉션에 없습니다. (있는 것: {sorted(dense_names)})")
+        checks["sparse_vectors_present"] = SPARSE_VECTOR_NAME in sparse_names
         if not checks["sparse_vectors_present"]:
-            issues.append("필수 Sparse 벡터 구성이 컬렉션에 없습니다.")
+            issues.append(f"필수 Sparse 벡터({SPARSE_VECTOR_NAME})가 컬렉션에 없습니다. (있는 것: {sorted(sparse_names)})")
 
-        checks["sparse_vectors_idf"] = True
-        expects_idf_modifier = self._requires_idf_modifier()
-        for branch in BRANCHES:
-            vector_name = self.registry.sparse_vector_by_branch[branch]
-            params = sparse_config.get(vector_name) if isinstance(sparse_config, dict) else None
-            modifier = getattr(params, "modifier", None)
-            if not self._modifier_matches_expected(modifier):
-                checks["sparse_vectors_idf"] = False
-                expected = "IDF" if expects_idf_modifier else "None"
-                issues.append(
-                    f"{vector_name}의 Sparse 벡터 수정자가 기대값({expected})과 일치하지 않습니다."
-                )
-                break
+        # 4. Sparse modifier
+        params = sparse_config.get(SPARSE_VECTOR_NAME) if isinstance(sparse_config, dict) else None
+        modifier = getattr(params, "modifier", None)
+        checks["sparse_vectors_idf"] = self._modifier_matches_expected(modifier)
+        if not checks["sparse_vectors_idf"]:
+            expected = "IDF" if self._requires_idf_modifier() else "None"
+            issues.append(f"{SPARSE_VECTOR_NAME}의 Sparse 수정자가 기대값({expected})과 다릅니다.")
 
-        # 5. 페이로드 인덱스 존재 여부 확인
+        # 5. payload 인덱스
         expected_index_keys = {field_name for field_name, _ in PAYLOAD_INDEX_FIELDS}
         available_index_keys = set(payload_schema.keys())
         checks["payload_indexes_present"] = expected_index_keys.issubset(available_index_keys)
         if not checks["payload_indexes_present"]:
             missing = sorted(expected_index_keys - available_index_keys)
-            issues.append(f"필수 페이로드 인덱스가 누락되었습니다: {missing}")
+            issues.append(f"필수 페이로드 인덱스 누락: {missing}")
 
-        # 6. 실제 데이터 샘플 샘플링 및 내용 검증
+        # 6. flat chunk 표본 검증
         try:
             sample = self._select_sample_point()
         except Exception as exc:
@@ -281,45 +215,27 @@ class LiveContractValidator:
 
         checks["sample_point_exists"] = sample is not None
         if sample is None:
-            issues.append("컬렉션에 조회 가능한 샘플 데이터가 전혀 없습니다.")
+            issues.append("컬렉션에 조회 가능한 샘플 데이터가 없습니다.")
             return self._build_report(ready=False, checks=checks, issues=issues)
 
         sample_point_id = str(getattr(sample, "id", None))
         checks["sample_payload_valid"] = True
-
         try:
             sample_payload = sample.payload or {}
             if not isinstance(sample_payload, dict):
                 raise TypeError("샘플 페이로드가 JSON 객체 형식이 아닙니다.")
-
-            # 샘플 내부의 세부 데이터 항목 점검
             sample_checks = self._build_sample_checks(sample_payload)
             checks.update(sample_checks)
-
-            # 발견된 세부 문제점 로깅
             if not checks["sample_root_fields"]:
-                issues.append("샘플 데이터에 필수 루트 필드(basic_info 등)가 누락되었습니다.")
-            if not checks["sample_art_present"]:
-                issues.append("샘플 데이터에 논문 실적(publications)이 없습니다.")
-            if not checks["sample_pjt_present"]:
-                issues.append("샘플 데이터에 과제 실적(research_projects)이 없습니다.")
-
-            if not checks["sample_project_dates_valid"]:
-                issues.append(
-                    "과제 데이터(research_projects)에 시작/종료일 또는 기준 연도 정보가 누락되었습니다."
-                )
+                issues.append("샘플 데이터에 flat 필수 루트 필드(researcher_id/doc_type/chunk_id/chunk_text)가 누락되었습니다.")
+            if not checks["sample_doc_type_valid"]:
+                issues.append(f"샘플 doc_type이 유효 5종이 아닙니다: {sample_payload.get('doc_type')!r}")
         except Exception as exc:
             checks["sample_payload_valid"] = False
             issues.append(f"샘플 데이터 상세 분석 실패: {exc}")
             logger.warning("Sample payload inspection failed during readiness validation", exc_info=True)
-            return self._build_report(
-                ready=False,
-                checks=checks,
-                issues=issues,
-                sample_point_id=sample_point_id,
-            )
+            return self._build_report(ready=False, checks=checks, issues=issues, sample_point_id=sample_point_id)
 
-        # 전체 통과 여부 결정 (Optional 항목 제외한 모든 필수 항목이 True여야 함)
         return self._build_report(
             ready=all(value for key, value in checks.items() if key not in OPTIONAL_CHECKS),
             checks=checks,

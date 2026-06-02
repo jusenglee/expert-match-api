@@ -2,9 +2,21 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
-BranchName = Literal["basic", "art", "pat", "pjt"]
+from apps.domain.chunk_view import clean_value, normalize_doc_date
+
+# 실제 적재 데이터의 doc_type 5종(메모리 flat-payload-contract). evidence/카드 표시용 라벨 포함.
+DocTypeLiteral = Literal["paper", "patent", "project", "assessor_activity", "specialty"]
+
+#: 연구자 공통 집계 count 필드(모든 chunk의 flat root에 비정규화 반복).
+COUNT_FIELDS: tuple[str, ...] = (
+    "publication_count",
+    "scie_publication_count",
+    "intellectual_property_count",
+    "research_project_count",
+    "researcher_assessor_activity_count",
+)
 
 
 def _is_blank_string(value: Any) -> bool:
@@ -28,163 +40,129 @@ def _normalize_string_list(value: Any) -> Any:
     return value
 
 
-def _normalize_nested_list(value: Any) -> Any:
-    if value is None or _is_blank_string(value):
-        return []
-    if isinstance(value, tuple):
-        return list(value)
-    return value
-
-
 def _normalize_int(value: Any) -> Any:
+    """카운트 정규화: None/공백/'NONE' → 0, 숫자문자열 → int."""
     if value is None or _is_blank_string(value):
         return 0
     if isinstance(value, str):
+        stripped = value.strip()
         try:
-            return int(value.strip())
+            return int(stripped)
         except ValueError:
-            return value
+            try:
+                return int(float(stripped))
+            except ValueError:
+                return 0
+    if isinstance(value, float):
+        return int(value)
     return value
 
 
-def _normalize_optional_int(value: Any) -> Any:
-    if value is None or _is_blank_string(value):
-        return None
-    if isinstance(value, str):
-        try:
-            return int(value.strip())
-        except ValueError:
-            return value
-    return value
+# ---------------------------------------------------------------------------
+# flat chunk payload (실제 적재 데이터 = 1 chunk = 1 Point). Point ID == chunk_id.
+# 연구자 공통 메타는 root에 비정규화, doc_type별 상세만 doc_attrs(passthrough).
+# ---------------------------------------------------------------------------
 
 
-class BasicInfo(BaseModel):
+class ChunkPayload(BaseModel):
+    """Qdrant point 1개의 flat payload (메모리 flat-payload-contract).
+
+    실데이터는 root에 연구자 공통 메타가 평탄화되어 있고, doc_type별 상세는 doc_attrs에 들어간다.
+    알 수 없는 추가 키는 무시(extra=ignore)하여 스키마 진화에 견딘다.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # 1층 · 공통 식별
     researcher_id: str
-    researcher_name: str
-    gender: str | None = None
+    researcher_name: str = ""
+    doc_type: str
+    doc_id: str = ""
+    chunk_id: str
+    chunk_text: str = ""
+    doc_date: str | None = None
+    # 연구자 공통 메타(flat root, 비정규화)
     affiliated_organization: str | None = None
-    affiliated_organization_exact: str | None = None
-    department: str | None = None
-    position_title: str | None = None
-
-
-class ResearcherProfile(BaseModel):
     highest_degree: str | None = None
-    major_field: str | None = None
     publication_count: int = 0
     scie_publication_count: int = 0
     intellectual_property_count: int = 0
     research_project_count: int = 0
+    researcher_assessor_activity_count: int = 0
+    # doc_type별 상세(passthrough — assessor_activity/specialty 키는 미상)
+    doc_attrs: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator(
-        "publication_count",
-        "scie_publication_count",
-        "intellectual_property_count",
-        "research_project_count",
-        mode="before",
-    )
+    @field_validator(*COUNT_FIELDS, mode="before")
     @classmethod
     def _normalize_counts(cls, value: Any) -> Any:
         return _normalize_int(value)
 
-
-class PublicationEvidence(BaseModel):
-    journal_index_type: str | None = None
-    publication_title: str
-    journal_name: str | None = None
-    publication_year_month: str | None = None
-    abstract: str | None = None
-    korean_keywords: list[str] = Field(default_factory=list)
-    english_keywords: list[str] = Field(default_factory=list)
-
-    @field_validator("korean_keywords", "english_keywords", mode="before")
+    @field_validator("doc_date", "affiliated_organization", "highest_degree", mode="before")
     @classmethod
-    def _normalize_keyword_lists(cls, value: Any) -> Any:
-        return _normalize_string_list(value)
+    def _normalize_optional_str(cls, value: Any) -> Any:
+        return clean_value(value)
+
+    def counts(self) -> dict[str, int]:
+        return {field: getattr(self, field) for field in COUNT_FIELDS}
 
 
-class IntellectualPropertyEvidence(BaseModel):
-    intellectual_property_type: str | None = None
-    intellectual_property_title: str
-    application_registration_type: str | None = None
-    application_country: str | None = None
-    application_number: str | None = None
-    application_date: str | None = None
-    registration_number: str | None = None
-    registration_date: str | None = None
+class ChunkHit(BaseModel):
+    """검색에서 회수된 chunk 1건(점수 + flat payload). rank=그룹 내 융합점수 순위(1-base)."""
 
+    score: float = 0.0
+    payload: ChunkPayload
+    rank: int | None = None
 
-class ResearchProjectEvidence(BaseModel):
-    project_start_date: str | None = None
-    project_end_date: str | None = None
-    reference_year: int | None = None
-    project_title_korean: str | None = None
-    project_title_english: str | None = None
-    performing_organization: str | None = None
-    managing_agency: str | None = None
-    research_objective_summary: str | None = None
-    research_content_summary: str | None = None
-
-    @field_validator("reference_year", mode="before")
-    @classmethod
-    def _normalize_reference_year(cls, value: Any) -> Any:
-        return _normalize_optional_int(value)
-
-    @computed_field
     @property
-    def display_title(self) -> str:
-        return self.project_title_korean or self.project_title_english or "Untitled project"
+    def chunk_id(self) -> str:
+        return self.payload.chunk_id
+
+    @property
+    def doc_type(self) -> str:
+        return self.payload.doc_type
+
+    @property
+    def researcher_id(self) -> str:
+        return self.payload.researcher_id
 
 
-class EvaluationActivity(BaseModel):
-    appoint_org_nm: str | None = None
-    committee_nm: str | None = None
-    appoint_period: str | None = None
-    appoint_dt: str | None = None
+class ResearcherCandidate(BaseModel):
+    """검색 시점에 researcher_id로 집계된 연구자 후보(구 GroupedSearchHit/ExpertPayload 대체).
 
+    정체성/누적 실적은 chunk root에서 가져오고(모든 chunk 동일), 매칭된 chunk를 doc_type별로 보유한다.
+    """
 
-class ExpertPayload(BaseModel):
-    basic_info: BasicInfo
-    researcher_profile: ResearcherProfile
-    publications: list[PublicationEvidence] = Field(default_factory=list)
-    intellectual_properties: list[IntellectualPropertyEvidence] = Field(default_factory=list)
-    research_projects: list[ResearchProjectEvidence] = Field(default_factory=list)
-    technical_classifications: list[str] = Field(default_factory=list)
-    evaluation_activity_cnt: int = 0
-    external_activity_cnt: int = 0
-    evaluation_activities: list[EvaluationActivity] = Field(default_factory=list)
-
-    @field_validator(
-        "publications",
-        "intellectual_properties",
-        "research_projects",
-        "evaluation_activities",
-        mode="before",
-    )
-    @classmethod
-    def _normalize_nested_lists(cls, value: Any) -> Any:
-        return _normalize_nested_list(value)
-
-    @field_validator("technical_classifications", mode="before")
-    @classmethod
-    def _normalize_string_lists(cls, value: Any) -> Any:
-        return _normalize_string_list(value)
-
-    @field_validator("evaluation_activity_cnt", "external_activity_cnt", mode="before")
-    @classmethod
-    def _normalize_root_counts(cls, value: Any) -> Any:
-        return _normalize_int(value)
-
-    def to_payload_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
-
-
-class SeedEvidencePoint(BaseModel):
-    point_id: str
     researcher_id: str
-    branch: BranchName
-    content_text: str
-    payload: ExpertPayload
+    researcher_name: str = ""
+    affiliated_organization: str | None = None
+    highest_degree: str | None = None
+    counts: dict[str, int] = Field(default_factory=dict)
+    group_score: float = 0.0
+    rank_score: float = 0.0
+    chunks: list[ChunkHit] = Field(default_factory=list)
+
+    @property
+    def doc_types_present(self) -> list[str]:
+        seen: list[str] = []
+        for hit in self.chunks:
+            if hit.doc_type not in seen:
+                seen.append(hit.doc_type)
+        return seen
+
+    def chunks_of(self, doc_type: str) -> list[ChunkHit]:
+        return [hit for hit in self.chunks if hit.doc_type == doc_type]
+
+
+class ChunkEvidence(BaseModel):
+    """표시/grounding용 evidence 단위(doc_type 무관 통일 모델). 참조 id == chunk_id."""
+
+    chunk_id: str
+    doc_type: str
+    title: str | None = None
+    date: str | None = None
+    snippet: str = ""
+    doc_attrs: dict[str, Any] = Field(default_factory=dict)
+    score: float = 0.0
 
 
 class PlannerOutput(BaseModel):
@@ -218,53 +196,44 @@ class PlannerOutput(BaseModel):
         return _normalize_string_list(value)
 
 
-class SearchHit(BaseModel):
-    expert_id: str
-    score: float
-    payload: ExpertPayload
-    branch: BranchName | None = None
-    data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
-    
-    # 아키텍처 Support Rule 추적 정보
-    stable_support_count: int = 0
-    expanded_support_count: int = 0
-    support_branches: list[BranchName] = Field(default_factory=list)
-
-
-class GroupedSearchHit(BaseModel):
-    expert_id: str
-    group_score: float
-    hits: list[SearchHit]
-    data_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
-
-
 class EvidenceItem(BaseModel):
-    type: Literal["paper", "patent", "project", "profile"]
+    """LLM 추천 결정에 포함되는 근거 1건. type=5 doc_type 또는 합성 'profile'."""
+
+    type: Literal["paper", "patent", "project", "assessor_activity", "specialty", "profile"]
     title: str
     date: str | None = None
     detail: str | None = None
+    snippet: str | None = None
+    chunk_id: str | None = None
 
 
 class CandidateCard(BaseModel):
+    """후보 카드(cards→reasoner 인터페이스). evidence는 doc_type별 ChunkEvidence 묶음."""
+
     expert_id: str
     name: str
     organization: str | None = None
-    position: str | None = None
     degree: str | None = None
-    major: str | None = None
-    branch_presence_flags: dict[BranchName, bool] = Field(default_factory=dict)
     counts: dict[str, int] = Field(default_factory=dict)
-    technical_classifications: list[str] = Field(default_factory=list)
-    evaluation_activity_cnt: int = 0
-    evaluation_activities: list[EvaluationActivity] = Field(default_factory=list)
-    top_papers: list[PublicationEvidence] = Field(default_factory=list)
-    top_patents: list[IntellectualPropertyEvidence] = Field(default_factory=list)
-    top_projects: list[ResearchProjectEvidence] = Field(default_factory=list)
+    evidence_by_type: dict[str, list[ChunkEvidence]] = Field(default_factory=dict)
     matched_filter_summary: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     data_gaps: list[str] = Field(default_factory=list)
     shortlist_score: float = 0.0
     rank_score: float = 0.0
+
+    @property
+    def doc_types_present(self) -> list[str]:
+        return [dt for dt, items in self.evidence_by_type.items() if items]
+
+    def evidence_of(self, doc_type: str) -> list[ChunkEvidence]:
+        return self.evidence_by_type.get(doc_type, [])
+
+    def all_evidence(self) -> list[ChunkEvidence]:
+        items: list[ChunkEvidence] = []
+        for bucket in self.evidence_by_type.values():
+            items.extend(bucket)
+        return items
 
 
 class RecommendationDecision(BaseModel):
@@ -283,63 +252,3 @@ class RecommendationDecision(BaseModel):
     def reasons(self) -> list[str]:
         normalized_reason = " ".join(self.recommendation_reason.split())
         return [normalized_reason] if normalized_reason else []
-
-
-# ---------------------------------------------------------------------------
-# v2.0 chunk 모델 (WO-A) — "chunk 1개 = 1 Point". DATA_MODEL.md §3 3층 구조.
-# 기존 v1.x 모델(BasicInfo/ExpertPayload/SeedEvidencePoint 등)은 불변 — seed_data/롤백 의존.
-# doc_type enum 멤버십 검증은 apps.ingest.validate_chunks가 담당한다(domain→search 순환 import 회피).
-# ---------------------------------------------------------------------------
-
-
-class ResearcherMeta(BaseModel):
-    """모든 chunk에 비정규화 반복 저장되는 연구자 집계 메타 (DATA_MODEL §3.1).
-
-    v1.x ResearcherProfile의 4 count를 계승하고 assessor 2종(v2.0 신규)을 추가한다.
-    """
-
-    affiliated_organization: str | None = None
-    highest_degree: str | None = None
-    publication_count: int = 0
-    scie_publication_count: int = 0
-    intellectual_property_count: int = 0
-    research_project_count: int = 0
-    researcher_assessor_count: int = 0
-    expert_assessor_count: int = 0
-
-    @field_validator(
-        "publication_count",
-        "scie_publication_count",
-        "intellectual_property_count",
-        "research_project_count",
-        "researcher_assessor_count",
-        "expert_assessor_count",
-        mode="before",
-    )
-    @classmethod
-    def _normalize_counts(cls, value: Any) -> Any:
-        return _normalize_int(value)
-
-
-class ChunkPayload(BaseModel):
-    """v2.0 chunk = 1 Point payload (DATA_MODEL §3). Point ID == chunk_id.
-
-    event_date는 ISO 날짜 문자열(예: "2024-05-01") 또는 None(시점 없는 doc_type).
-    doc_type은 11종 enum 값 문자열이며, 멤버십 검증은 apps.ingest.validate_chunks가 한다.
-    """
-
-    # 1층 · 공통 식별
-    researcher_id: str
-    researcher_name: str
-    doc_type: str
-    doc_id: str
-    chunk_id: str
-    chunk_text: str
-    chunk_text_len: int
-    researcher_meta: ResearcherMeta
-    # 2층 · 도메인 통합 정규화
-    event_date: str | None = None
-    event_year: int | None = None
-    tags: list[str] = Field(default_factory=list)
-    # 3층 · 도메인 고유
-    domain_attrs: dict[str, Any] = Field(default_factory=dict)

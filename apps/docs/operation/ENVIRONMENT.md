@@ -1,6 +1,6 @@
-# 환경 변수 (Environment Variables) — chunk 재설계
+# 환경 변수 (Environment Variables) — flat chunk 모델
 
-**문서 버전:** v2.0 (2026-05-28)
+**문서 버전:** v2.1 (flat payload 정렬, 2026-06-02)
 
 모든 환경 변수는 `NTIS_` 접두사를 사용한다. 데이터 모델은 [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md) 참조.
 
@@ -27,7 +27,7 @@
 | `NTIS_QDRANT_COLLECTION_NAME` | `ntis_researcher_chunks` | **chunk 컬렉션** (구 `researcher_recommend_proto` 폐기) |
 | `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | 클라우드 추론 활성화 |
 
-> chunk 컬렉션은 Point 1개 = chunk 1개, ID=`chunk_id`, named vector는 `dense_e5i`(dense) + `sparse_splade`(sparse) 단일 쌍이다.
+> chunk 컬렉션은 Point 1개 = chunk 1개, ID=`chunk_id`, named vector는 `vector_e5i`(dense) + `vector_splade`(sparse) 단일 쌍이다. doc_type은 named vector가 아니라 **payload 필터**다. 적재(ingestion)는 외부 제공자 소관(구 `apps/ingest`는 `legacy_v1x/ingest/`로 격리).
 
 ## LLM 백엔드
 
@@ -49,7 +49,7 @@
 | `NTIS_EMBEDDING_BASE_URL` | `http://203.250.234.159:8011/v1` | OpenAI 호환 URL |
 | `NTIS_EMBEDDING_API_KEY` | `EMPTY` | API 키 |
 | `NTIS_EMBEDDING_MODEL_NAME` | `<repo>/multilingual-e5-large-instruct` | 로컬 번들/원격 모델 |
-| `NTIS_EMBEDDING_VECTOR_SIZE` | `1024` | Dense 벡터 크기(`dense_e5i`) |
+| `NTIS_EMBEDDING_VECTOR_SIZE` | `1024` | Dense 벡터 크기(`vector_e5i`) |
 
 로컬 번들 교체 시 `modules.json`, `1_Pooling/config.json`, `2_Normalize/` 구조를 유지해야 한다. chunk 모델에서 dense 입력은 `chunk_text` 단일 필드다.
 
@@ -57,7 +57,7 @@
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_SPARSE_MODEL_NAME` | `<repo>/models/PIXIE-Splade-v1.0` | Sparse 모델(`sparse_splade`) |
+| `NTIS_SPARSE_MODEL_NAME` | `<repo>/models/PIXIE-Splade-v1.0` | Sparse 모델(`vector_splade`) |
 | `NTIS_SPARSE_CACHE_DIR` | `<repo>/models` | 캐시 디렉터리 |
 | `NTIS_SPARSE_LOCAL_FILES_ONLY` | `false` | 로컬 파일만 사용 |
 | `NTIS_HF_HUB_OFFLINE` | `false` | HF Hub 오프라인 강제 |
@@ -68,7 +68,7 @@ Sparse fallback 체인: `로컬 PIXIE-Splade-v1.0 → online telepix/PIXIE-Splad
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---|---|
-| `NTIS_RETRIEVAL_DOC_TYPES` | (전체) | 검색 대상 doc_type 화이트리스트(미설정=11종 전체). 운영 축소용 |
+| `NTIS_RETRIEVAL_DOC_TYPES` | (전체) | 검색 대상 doc_type 화이트리스트(미설정=5종 전체: `paper`/`patent`/`project`/`assessor_activity`/`specialty`). 운영 축소용 |
 | `NTIS_DOC_TYPE_PREFETCH_LIMIT` | `100` | doc_type 경로별 prefetch(1차/2차) 제한 |
 | `NTIS_DOC_TYPE_OUTPUT_LIMIT` | `50` | doc_type 경로별 융합 출력 제한 |
 | `NTIS_DOC_TYPE_CHUNK_CAP` | `3` | 연구자 집계 시 doc_type별 기여 chunk 상한(다작 독식 방지) |
@@ -116,5 +116,5 @@ Sparse fallback 체인: `로컬 PIXIE-Splade-v1.0 → online telepix/PIXIE-Splad
 | 구 변수 | 처리 |
 |---|---|
 | `NTIS_BRANCH_PREFETCH_LIMIT` / `NTIS_BRANCH_OUTPUT_LIMIT` | → `NTIS_DOC_TYPE_PREFETCH_LIMIT` / `NTIS_DOC_TYPE_OUTPUT_LIMIT` |
-| branch별 벡터명 상수(`*_vector_e5i`, `*_vector_splade`) | 단일 `dense_e5i`/`sparse_splade`로 대체(코드 상수) |
+| branch별 벡터명 상수(`*_vector_e5i`, `*_vector_splade`) | 단일 `vector_e5i`/`vector_splade`로 대체(코드 상수) |
 | `NTIS_QDRANT_COLLECTION_NAME` 기본값 `researcher_recommend_proto` | `ntis_researcher_chunks` |

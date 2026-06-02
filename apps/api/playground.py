@@ -463,7 +463,7 @@ PLAYGROUND_HTML = dedent(
                 <div style="margin-top: 1rem">
                   <div class="input-group">
                     <label for="filtersInput">필터 재정의 (JSON 형식)</label>
-                    <textarea id="filtersInput" placeholder='{&#10;  "degree_slct_nm": "박사",&#10;  "art_sci_slct_nm": "SCIE"&#10;}'></textarea>
+                    <textarea id="filtersInput" placeholder='{&#10;  "highest_degree": "박사",&#10;  "journal_class": "SCIE",&#10;  "research_project_count_min": 3&#10;}'></textarea>
                   </div>
                   <div class="input-group">
                     <label for="includeInput">검색 대상 기관 (소속 제한)</label>
@@ -525,24 +525,64 @@ PLAYGROUND_HTML = dedent(
           const trace = retrievalTraceMap.get(expertId);
           if (!trace) return '';
 
-          const branchMatches = trace.branch_matches || [];
-          const branchLines = branchMatches.length
+          const matches = trace.matches || [];
+          const matchLines = matches.length
             ? `<ul style="font-size: 0.85rem; margin-top: 0.5rem">
-                ${branchMatches.map(item => `<li>${escapeHtml(item.branch)} branch rank ${escapeHtml(item.rank)} (score ${escapeHtml(item.score)})</li>`).join('')}
+                ${matches.map(item => {
+                  const contribution = item.contribution != null ? `RRF +${escapeHtml(item.contribution)}` : '';
+                  const rawScore = item.raw_score != null || item.score != null ? `raw ${escapeHtml(item.raw_score ?? item.score)}` : '';
+                  const meta = [
+                    escapeHtml(item.doc_type),
+                    `${escapeHtml(item.path || '-')} rank ${escapeHtml(item.rank)}`,
+                    contribution,
+                    rawScore,
+                    item.chunk_id ? `id ${escapeHtml(item.chunk_id)}` : ''
+                  ].filter(Boolean).join(' · ');
+                  return `<li style="margin-bottom: 0.6rem">
+                    <div>${meta}</div>
+                    ${item.title ? `<div style="font-weight: 600; color: var(--text-main)">${escapeHtml(item.title)}${item.date ? ` (${escapeHtml(item.date)})` : ''}</div>` : ''}
+                    ${item.snippet ? `<div style="color: var(--text-muted); line-height: 1.45">${escapeHtml(item.snippet)}</div>` : ''}
+                  </li>`;
+                }).join('')}
               </ul>`
-            : '<div style="font-size: 0.85rem; margin-top: 0.5rem">branch match trace unavailable</div>';
+            : '<div style="font-size: 0.85rem; margin-top: 0.5rem">chunk match trace unavailable</div>';
+
+          const docTypes = (trace.doc_types || []).join(', ') || 'unknown';
 
           return `
             <details>
               <summary>검색 점수 근거</summary>
               <div style="font-size: 0.85rem; margin-top: 0.5rem">
-                <div><b>Primary branch:</b> ${escapeHtml(trace.primary_branch || 'unknown')}</div>
-                <div><b>Point ID:</b> ${escapeHtml(trace.point_id || 'unknown')}</div>
-                <div><b>Final score:</b> ${escapeHtml(trace.final_score)}</div>
+                <div><b>매칭 doc_type:</b> ${escapeHtml(docTypes)}</div>
+                <div><b>집계 점수(RRF 원점수):</b> ${escapeHtml(trace.final_score)}</div>
+                <div><b>hit 수:</b> stable ${escapeHtml(trace.stable_hits ?? 0)} / expanded ${escapeHtml(trace.expanded_hits ?? 0)}</div>
+                ${trace.score_formula ? `<div><b>계산식:</b> ${escapeHtml(trace.score_formula)}</div>` : ''}
               </div>
-              ${branchLines}
+              ${matchLines}
             </details>
           `;
+        }
+
+        function renderEvidenceItems(evidence) {
+          const items = evidence || [];
+          if (!items.length) {
+            return '<div style="font-size: 0.85rem; margin-top: 0.5rem; color: var(--text-muted)">표시할 증거가 없습니다.</div>';
+          }
+          return `<ul style="font-size: 0.85rem; margin-top: 0.5rem">
+            ${items.map(ev => {
+              const meta = [
+                `[${escapeHtml(ev.type)}]`,
+                ev.date ? escapeHtml(ev.date) : '',
+                ev.detail ? escapeHtml(ev.detail) : '',
+                ev.chunk_id ? `id ${escapeHtml(ev.chunk_id)}` : ''
+              ].filter(Boolean).join(' · ');
+              return `<li style="margin-bottom: 0.75rem">
+                <div style="font-weight: 600; color: var(--text-main)">${escapeHtml(ev.title || ev.chunk_id || '-')}</div>
+                <div style="color: var(--text-muted)">${meta}</div>
+                ${ev.snippet ? `<div style="margin-top: 0.25rem; line-height: 1.45">${escapeHtml(ev.snippet)}</div>` : ''}
+              </li>`;
+            }).join('')}
+          </ul>`;
         }
         
         function pushMessage(role, html, isError = false) {
@@ -638,9 +678,7 @@ PLAYGROUND_HTML = dedent(
                     ${renderRetrievalTrace(r.expert_id, retrievalTraceMap)}
                     <details>
                       <summary>수행 증거 및 실적</summary>
-                      <ul style="font-size: 0.85rem; margin-top: 0.5rem">
-                        ${r.evidence.map(ev => `<li>[${ev.type}] ${escapeHtml(ev.title)}${ev.date ? ` (${escapeHtml(ev.date)})` : ''}</li>`).join('')}
-                      </ul>
+                      ${renderEvidenceItems(r.evidence)}
                     </details>
                   </div>
                 `).join('')}
@@ -656,6 +694,7 @@ PLAYGROUND_HTML = dedent(
                       <div class="stat-box"><span class="label">논문</span><span class="value">${c.counts.article_cnt}</span></div>
                       <div class="stat-box"><span class="label">특허</span><span class="value">${c.counts.patent_cnt}</span></div>
                       <div class="stat-box"><span class="label">과제</span><span class="value">${c.counts.project_cnt}</span></div>
+                      <div class="stat-box"><span class="label">심사</span><span class="value">${c.counts.assessor_cnt ?? 0}</span></div>
                       <div class="stat-box"><span class="label">점수</span><span class="value">${c.shortlist_score.toFixed(2)}</span></div>
                     </div>
                     ${renderRetrievalTrace(c.expert_id, retrievalTraceMap)}

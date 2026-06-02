@@ -43,7 +43,7 @@ from apps.core.runtime_validation import (
     validate_runtime_settings,
 )
 from apps.recommendation.cards import CandidateCardBuilder
-from apps.recommendation.evidence_selector import KeywordEvidenceSelector
+from apps.recommendation.evidence_selector import PassthroughEvidenceSelector
 from apps.recommendation.planner import HeuristicPlanner, OpenAICompatPlanner
 from apps.recommendation.reasoner import (
     OpenAICompatReasonGenerator,
@@ -59,8 +59,8 @@ from apps.search.filters import QdrantFilterCompiler
 from apps.search.live_validator import LiveContractValidator
 from apps.search.qdrant_bootstrap import QdrantBootstrapper
 from apps.search.query_builder import QueryTextBuilder
+from apps.search.doc_types import DOC_TYPES
 from apps.search.retriever import QdrantHybridRetriever
-from apps.search.schema_registry import BRANCHES, SearchSchemaRegistry
 from apps.search.sparse_runtime import (
     prepare_sparse_runtime_environment,
     resolve_sparse_runtime,
@@ -144,7 +144,6 @@ async def build_app_runtime(
 
     validate_runtime_settings(settings)
 
-    registry = SearchSchemaRegistry.default()
     client = QdrantClient(
         url=settings.qdrant_url,
         api_key=settings.qdrant_api_key,
@@ -185,7 +184,6 @@ async def build_app_runtime(
     bootstrapper = QdrantBootstrapper(
         client=client,
         settings=settings,
-        registry=registry,
         sparse_runtime=sparse_runtime,
     )
     bootstrapper.ensure_collection(recreate=settings.seed_allow_recreate_collection)
@@ -195,7 +193,6 @@ async def build_app_runtime(
         retriever=QdrantHybridRetriever(
             client=client,
             settings=settings,
-            registry=registry,
             dense_encoder=dense_encoder,
             sparse_encoder=sparse_encoder,
             sparse_runtime=sparse_runtime,
@@ -204,7 +201,7 @@ async def build_app_runtime(
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
-        evidence_selector=KeywordEvidenceSelector(),
+        evidence_selector=PassthroughEvidenceSelector(),
         reason_generator=reason_generator,
         feedback_store=feedback_store,
     )
@@ -212,7 +209,6 @@ async def build_app_runtime(
     validator = LiveContractValidator(
         client=client,
         settings=settings,
-        registry=registry,
         dependency_validator=RuntimeDependencyValidator(settings),
         sparse_runtime=sparse_runtime,
     )
@@ -343,7 +339,7 @@ def create_app(
         return {
             "status": "ok",
             "collection_name": active_settings.qdrant_collection_name,
-            "searched_branches": list(BRANCHES),
+            "searched_branches": list(DOC_TYPES),
         }
 
     @app.get("/", include_in_schema=False, response_class=HTMLResponse)
@@ -484,25 +480,19 @@ def create_app(
         # 캡처된 로그 주입
         logs = captured_logs_ctx.get()
 
-        candidate_items = []
-        for card in result["candidates"]:
-            # hits_with_support에서 매칭되는 원본 히트를 찾아 지지 정보 추출
-            support_hit = next((h for h in result.get("hits_with_support", []) if h.expert_id == card.expert_id), None)
-            
-            item = SearchCandidateItem(
+        candidate_items = [
+            SearchCandidateItem(
                 expert_id=card.expert_id,
                 name=card.name,
                 organization=card.organization,
-                branch_presence_flags=card.branch_presence_flags,
+                doc_types_present=card.doc_types_present,
                 counts=card.counts,
                 data_gaps=card.data_gaps,
                 risks=card.risks,
                 shortlist_score=card.shortlist_score,
-                stable_hits=support_hit.stable_support_count if support_hit else 0,
-                expanded_hits=support_hit.expanded_support_count if support_hit else 0,
-                support_branches=support_hit.support_branches if support_hit else [],
             )
-            candidate_items.append(item)
+            for card in result["candidates"]
+        ]
 
         planner_payload = result["planner"].model_dump(mode="json")
         logger.info(
@@ -543,13 +533,8 @@ def create_app(
             "exclude_orgs": result["planner"].exclude_orgs,
             "candidate_ids": [card.expert_id for card in result["candidates"]],
             "candidate_support_info": [
-                {
-                    "expert_id": hit.expert_id,
-                    "stable_hits": hit.stable_support_count,
-                    "expanded_hits": hit.expanded_support_count,
-                    "support_branches": hit.support_branches,
-                }
-                for hit in result.get("hits_with_support", [])
+                {"expert_id": card.expert_id, "doc_types_present": card.doc_types_present}
+                for card in result["candidates"]
             ],
             "retrieval_score_traces": result.get("retrieval_score_traces") or [],
             "final_sort_policy": result.get("final_sort_policy"),
@@ -567,7 +552,7 @@ def create_app(
         return SearchCandidatesResponse(
             intent_summary=result["planner"].intent_summary,
             applied_filters=result["planner"].hard_filters,
-            searched_branches=list(BRANCHES),
+            searched_branches=list(DOC_TYPES),
             keywords=result.get("retrieval_keywords") or [],
             retrieved_count=result["retrieved_count"],
             candidates=candidate_items,

@@ -1,24 +1,32 @@
 import asyncio
 import logging
-from types import MethodType, SimpleNamespace
+from types import MethodType
 
 from apps.domain.models import (
     CandidateCard,
+    ChunkEvidence,
     PlannerOutput,
-    PublicationEvidence,
     RecommendationDecision,
+    ResearcherCandidate,
 )
 from apps.recommendation.evidence_selector import (
     RelevantEvidenceBundle,
     RelevantEvidenceItem,
 )
 from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonedCandidate
+from apps.search.doc_types import DOC_TYPES
 from apps.recommendation.service import (
     EMPTY_RETRIEVAL_KEYWORDS_REASON,
     NO_MATCHING_CANDIDATE_REASON,
     RecommendationService,
 )
+from apps.search.query_builder import CompiledQueries
 from apps.search.retriever import RetrievalResult
+
+
+def _chunk_id(expert_id: str) -> str:
+    """Deterministic flat chunk_id (codec: <doc_type>_<numeric_doc_id>_c<NNN>)."""
+    return f"paper_{expert_id}_c000"
 
 
 class DummyPlanner:
@@ -62,7 +70,7 @@ class LoggingPlanner:
             core_keywords=["semiconductor"],
             semantic_query="semiconductor research expert",
             bundle_ids=["semiconductor"],
-            hard_filters={"degree_slct_nm": "PhD"},
+            hard_filters={"highest_degree": "PhD"},
             top_k=2,
         )
 
@@ -77,7 +85,13 @@ class LoggingRetriever:
     async def search(self, **kwargs):
         _ = kwargs
         return RetrievalResult(
-            hits=[SimpleNamespace(expert_id="1")],
+            hits=[
+                ResearcherCandidate(
+                    researcher_id="1",
+                    researcher_name="Alpha",
+                    group_score=1.0,
+                )
+            ],
             query_payload={
                 "retrieval_mode": "keyword_pool_then_hybrid",
                 "keyword_stage_candidate_count": 3,
@@ -86,7 +100,7 @@ class LoggingRetriever:
                 "support_pass_count": 1,
                 "support_filtered_count": 1,
             },
-            branch_queries={},
+            queries=CompiledQueries(stable="semiconductor", expanded="semiconductor"),
             retrieval_keywords=["semiconductor"],
             retrieval_score_traces=[],
         )
@@ -99,6 +113,8 @@ class LoggingCardBuilder:
 
 
 class DummyEvidenceSelector:
+    """flat selector: reads CandidateCard.evidence_by_type, emits chunk_id-keyed items."""
+
     def __init__(self) -> None:
         self.received_candidate_ids: list[list[str]] = []
         self.last_trace = {"mode": "test_selector", "candidate_evidence_counts": []}
@@ -112,32 +128,35 @@ class DummyEvidenceSelector:
             "candidate_evidence_counts": [
                 {
                     "expert_id": candidate.expert_id,
-                    "papers": 1 if candidate.top_papers else 0,
-                    "projects": 0,
-                    "patents": 0,
-                    "total": 1 if candidate.top_papers else 0,
+                    "total": len(candidate.evidence_of("paper")),
+                    "by_doc_type": {
+                        "paper": len(candidate.evidence_of("paper")),
+                    },
                 }
                 for candidate in candidates
             ],
         }
-        return {
-            candidate.expert_id: RelevantEvidenceBundle(
-                expert_id=candidate.expert_id,
-                papers=[
+        bundles: dict[str, RelevantEvidenceBundle] = {}
+        for candidate in candidates:
+            papers = candidate.evidence_of("paper")
+            by_doc_type: dict[str, list[RelevantEvidenceItem]] = {}
+            if papers:
+                ev = papers[0]
+                by_doc_type["paper"] = [
                     RelevantEvidenceItem(
-                        item_id="paper:0",
+                        item_id=ev.chunk_id,
                         type="paper",
-                        title=candidate.top_papers[0].publication_title,
-                        date=candidate.top_papers[0].publication_year_month,
-                        detail=candidate.top_papers[0].journal_name,
+                        title=ev.title or "",
+                        date=ev.date,
+                        detail=(ev.doc_attrs or {}).get("journal_name"),
                         match_score=10.0,
                     )
                 ]
-                if candidate.top_papers
-                else [],
+            bundles[candidate.expert_id] = RelevantEvidenceBundle(
+                expert_id=candidate.expert_id,
+                by_doc_type=by_doc_type,
             )
-            for candidate in candidates
-        }
+        return bundles
 
 
 class RecordingReasonGenerator:
@@ -193,19 +212,32 @@ class RecordingReasonGenerator:
 
 
 def _candidate_card(expert_id: str, name: str, score: float) -> CandidateCard:
+    """flat CandidateCard with a single paper ChunkEvidence (item_id == chunk_id)."""
     return CandidateCard(
         expert_id=expert_id,
         name=name,
         organization="Test Institute",
-        branch_presence_flags={"basic": True, "art": True, "pat": False, "pjt": False},
-        counts={"article_cnt": 1, "scie_cnt": 1, "patent_cnt": 0, "project_cnt": 0},
-        top_papers=[
-            PublicationEvidence(
-                publication_title=f"Paper {expert_id}",
-                publication_year_month="2026-01",
-                journal_name="Test Journal",
-            )
-        ],
+        degree="PhD",
+        counts={
+            "article_cnt": 1,
+            "scie_cnt": 1,
+            "patent_cnt": 0,
+            "project_cnt": 0,
+            "assessor_cnt": 0,
+        },
+        evidence_by_type={
+            "paper": [
+                ChunkEvidence(
+                    chunk_id=_chunk_id(expert_id),
+                    doc_type="paper",
+                    title=f"Paper {expert_id}",
+                    date="2026-01",
+                    snippet=f"Paper {expert_id} abstract",
+                    doc_attrs={"journal_name": "Test Journal"},
+                    score=score,
+                )
+            ]
+        },
         shortlist_score=score,
         rank_score=score,
     )
@@ -296,24 +328,17 @@ def _bind_search_result(
             "candidates": cards,
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
             "branch_queries": {
-                "basic": "semiconductor\nreview",
-                "art": "semiconductor\nreview",
-                "pat": "semiconductor\nreview",
-                "pjt": "semiconductor\nreview",
+                "stable": "semiconductor\nreview",
+                "expanded": "semiconductor\nreview",
             },
             "retrieval_keywords": ["semiconductor", "review"],
             "retrieval_score_traces": [
                 {
                     "expert_id": card.expert_id,
-                    "point_id": f"{card.expert_id}_basic",
-                    "point_branch_hint": "basic",
+                    "point_id": _chunk_id(card.expert_id),
                     "final_score": card.shortlist_score,
-                    "primary_branch": "basic",
-                    "branch_matches": [
-                        {"branch": "basic", "rank": index + 1, "score": card.shortlist_score}
-                    ],
                 }
-                for index, card in enumerate(cards)
+                for card in cards
             ],
             "raw_query": query,
             "retrieval_skipped_reason": retrieval_skipped_reason,
@@ -339,6 +364,7 @@ def test_recommend_returns_empty_when_no_candidates_are_retrieved():
     assert result["not_selected_reasons"] == [NO_MATCHING_CANDIDATE_REASON]
     assert result["trace"]["reason_generation_trace"] == {}
     assert result["trace"]["planner_keywords"] == ["semiconductor", "review"]
+    assert result["searched_branches"] == list(DOC_TYPES)
 
 
 def test_recommend_returns_data_gap_when_retrieval_is_skipped():
@@ -372,13 +398,13 @@ def test_recommend_sends_only_top_k_to_reason_generator_and_preserves_order():
                     expert_id="2",
                     fit="중간",
                     recommendation_reason="Reason for second candidate",
-                    selected_evidence_ids=["paper:0"],
+                    selected_evidence_ids=[_chunk_id("2")],
                 ),
                 ReasonedCandidate(
                     expert_id="1",
                     fit="높음",
                     recommendation_reason="Reason for first candidate",
-                    selected_evidence_ids=["paper:0"],
+                    selected_evidence_ids=[_chunk_id("1")],
                 ),
             ]
         )
@@ -400,16 +426,21 @@ def test_recommend_sends_only_top_k_to_reason_generator_and_preserves_order():
     assert [item.expert_id for item in result["recommendations"]] == ["1", "2"]
     assert result["recommendations"][0].recommendation_reason == "Reason for first candidate"
     assert result["recommendations"][1].recommendation_reason == "Reason for second candidate"
-    assert result["recommendations"][0].evidence[0].title == "Paper 1"
+    # EvidenceItem carries the flat chunk_id and doc_type as evidence.type.
+    first_evidence = result["recommendations"][0].evidence[0]
+    assert first_evidence.title == "Paper 1"
+    assert first_evidence.type == "paper"
+    assert first_evidence.chunk_id == _chunk_id("1")
     assert result["trace"]["recommendation_ids"] == ["1", "2"]
     assert result["trace"]["retrieval_score_traces"][0]["expert_id"] == "1"
     assert result["trace"]["top_k_used"] == 2
     assert "evidence_selection" in result["trace"]["reason_generation_trace"]
     assert (
         result["trace"]["reason_generation_trace"]["selected_evidence"][0]["resolved_evidence_ids"]
-        == ["paper:0"]
+        == [_chunk_id("1")]
     )
     assert result["trace"]["reason_generation_trace"]["batch_count"] == 1
+    assert result["searched_branches"] == list(DOC_TYPES)
 
 
 def test_recommend_batches_reason_generation_and_preserves_global_order():
@@ -421,7 +452,7 @@ def test_recommend_batches_reason_generation_and_preserves_global_order():
                         expert_id=str(index),
                         fit="보통",
                         recommendation_reason=f"Reason {index}",
-                        selected_evidence_ids=["paper:0"],
+                        selected_evidence_ids=[_chunk_id(str(index))],
                     )
                     for index in range(1, 6)
                 ]
@@ -432,7 +463,7 @@ def test_recommend_batches_reason_generation_and_preserves_global_order():
                         expert_id="6",
                         fit="보통",
                         recommendation_reason="Reason 6",
-                        selected_evidence_ids=["paper:0"],
+                        selected_evidence_ids=[_chunk_id("6")],
                     )
                 ]
             ),
@@ -481,6 +512,7 @@ def test_recommend_falls_back_to_top_relevant_evidence_when_llm_selection_is_mis
 
     recommendation: RecommendationDecision = result["recommendations"][0]
     assert recommendation.evidence[0].title == "Paper 1"
+    assert recommendation.evidence[0].chunk_id == _chunk_id("1")
     assert recommendation.recommendation_reason == "Strong publication history"
     assert recommendation.model_dump(mode="json")["reasons"] == [
         "Strong publication history"
@@ -498,7 +530,8 @@ def test_recommend_ignores_invalid_selected_evidence_ids_and_uses_fallback():
                     expert_id="1",
                     fit="보통",
                     recommendation_reason="Strong publication history",
-                    selected_evidence_ids=["project:99", "paper:999"],
+                    # LLM이 존재하지 않는 chunk_id를 선택해도 selector가 확정한 증거가 사용됨
+                    selected_evidence_ids=["project_99_c000", "paper_999_c000"],
                 )
             ]
         )
@@ -510,14 +543,14 @@ def test_recommend_ignores_invalid_selected_evidence_ids_and_uses_fallback():
 
     recommendation: RecommendationDecision = result["recommendations"][0]
     assert recommendation.evidence[0].title == "Paper 1"
-    # LLM이 잘못된 ID를 선택했더라도 EvidenceSelector가 확정한 paper:0이 최종적으로 사용됨
+    # LLM이 잘못된 ID를 선택했더라도 EvidenceSelector가 확정한 paper chunk가 최종적으로 사용됨
     assert (
         result["trace"]["reason_generation_trace"]["selected_evidence"][0]["selected_evidence_ids"]
-        == ["project:99", "paper:999"]
+        == ["project_99_c000", "paper_999_c000"]
     )
     assert (
         result["trace"]["reason_generation_trace"]["selected_evidence"][0]["resolved_evidence_ids"]
-        == ["paper:0"]
+        == [_chunk_id("1")]
     )
     assert recommendation.fit == "보통"
 
@@ -530,7 +563,7 @@ def test_recommend_logs_empty_reason_and_invalid_evidence_selection(caplog):
                     expert_id="1",
                     fit="보통",
                     recommendation_reason="",
-                    selected_evidence_ids=["project:99"],
+                    selected_evidence_ids=["project_99_c000"],
                 )
             ]
         )
@@ -545,7 +578,6 @@ def test_recommend_logs_empty_reason_and_invalid_evidence_selection(caplog):
     assert result["recommendations"][0].recommendation_reason == (
         "'Paper 1' 논문이 확인되어 질의와 관련된 전문성 근거로 참고할 수 있습니다."
     )
-    # 리팩토링 후에는 EvidenceSelector 결과가 우선되므로 ID 미매칭 로그는 더 이상 출력되지 않음
     assert "Recommendation reason is empty after reason generation" in caplog.text
     assert "Recommendation reason fallback generated" in caplog.text
 
@@ -572,7 +604,7 @@ def test_recommend_profile_fallback_trace_exposes_empty_relevant_bundle():
                     expert_id="1",
                     fit="보통",
                     recommendation_reason="Profile-based reason",
-                    selected_evidence_ids=["pat:2009-12-09"],
+                    selected_evidence_ids=["patent_2009_c000"],
                 )
             ]
         )
@@ -592,9 +624,11 @@ def test_recommend_profile_fallback_trace_exposes_empty_relevant_bundle():
     selected_trace = result["trace"]["reason_generation_trace"]["selected_evidence"][0]
     recommendation: RecommendationDecision = result["recommendations"][0]
     assert selected_trace["provided_evidence_ids"] == []
-    assert selected_trace["selected_evidence_ids"] == ["pat:2009-12-09"]
+    assert selected_trace["selected_evidence_ids"] == ["patent_2009_c000"]
     assert selected_trace["fallback"] == "profile"
+    # profile evidence는 합성 type="profile"이며 chunk_id는 없다.
     assert recommendation.evidence[0].type == "profile"
+    assert recommendation.evidence[0].chunk_id is None
 
 
 def test_recommend_generates_fallback_reason_for_omitted_candidate():
@@ -605,7 +639,7 @@ def test_recommend_generates_fallback_reason_for_omitted_candidate():
                     expert_id="1",
                     fit="보통",
                     recommendation_reason="Reason for first candidate",
-                    selected_evidence_ids=["paper:0"],
+                    selected_evidence_ids=[_chunk_id("1")],
                 )
             ]
         )
@@ -626,6 +660,6 @@ def test_recommend_generates_fallback_reason_for_omitted_candidate():
         {
             "expert_id": "2",
             "source": "selected_evidence",
-            "resolved_evidence_ids": ["paper:0"],
+            "resolved_evidence_ids": [_chunk_id("2")],
         }
     ]

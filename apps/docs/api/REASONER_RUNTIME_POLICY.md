@@ -1,16 +1,18 @@
-# Reasoner Runtime Policy (chunk 재설계)
+# Reasoner Runtime Policy (flat chunk 모델)
 
-Last updated: 2026-05-28 (v2.0)
+Last updated: 2026-06-02 (v2.1)
 
 ## Scope
 
-This document records the active runtime behavior of recommendation reason generation on the chunk data model. Data model: [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md). Contract: [`DATA_CONTRACT.md`](DATA_CONTRACT.md).
+This document records the active runtime behavior of recommendation reason generation on the flat chunk data model. Data model: [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md). Contract: [`DATA_CONTRACT.md`](DATA_CONTRACT.md).
+
+> Data unit: 1 chunk = 1 Qdrant Point, Point ID == `chunk_id`. Payload is **flat** — researcher common meta (`researcher_id`, `researcher_name`, `affiliated_organization`, `highest_degree`, and the five counts `publication_count` / `scie_publication_count` / `intellectual_property_count` / `research_project_count` / `researcher_assessor_activity_count`) lives at the **root**; doc_type-specific detail lives in `doc_attrs{}`. There is a single date field `doc_date` (string, may be `"NONE"`). doc_type is exactly one of **paper / patent / project / assessor_activity / specialty**.
 
 ## Active Policy
 
 - Reason generation runs in sequential batches of up to `5` candidates.
 - Candidate order is the retrieval order and is never changed by the reasoner.
-- Evidence selection builds a per-candidate relevant pool of chunks, grouped by doc_type family, capped per family (default `10`).
+- Evidence selection builds a per-candidate relevant pool of chunks, grouped by doc_type and capped per family (default `achievement` 10).
 - The reasoner uses a staged execution model:
   1. primary attempt with tool calling
   2. one retry with a smaller JSON-only payload
@@ -20,15 +22,16 @@ This document records the active runtime behavior of recommendation reason gener
 
 - Chunks are first-class evidence. The selector reranks a candidate's matched chunks against the query (cross-encoder when a model is available, lexical fallback otherwise) and keeps the top chunks per family.
 - The selector never reorders, drops, or invents candidates — it only narrows each candidate's grounding set.
-- Default family caps (tunable): `achievement` 10, `assessment` 6, `expertise` 6, `identity` 1.
+- Default family caps (tunable via `NTIS_EVIDENCE_FAMILY_CAP`): `achievement` 10, `assessment` 6, `expertise` 6, `identity` 1.
+- family membership: `achievement` = {paper, patent, project}, `assessment` = {assessor_activity}, `expertise` = {specialty}, `identity` = synthetic profile evidence (no doc_type; built from the flat root fields shared by every chunk).
 
 ## Prompt Budgeting
 
 - Selected chunks are the direct grounding set for `recommendation_reason`.
 - Compact supporting context may also be included:
-  - candidate head: `profile` + `researcher_meta` summary
-  - assessment-history summary (`*_assessor`)
-  - technical/specialty classifications
+  - candidate head: `profile` + flat-root researcher meta summary (organization / degree / counts)
+  - assessment-history summary (`researcher_assessor_activity_count` + matched `assessor_activity` chunks)
+  - technical/specialty classifications (`specialty` chunks)
   - compact retrieval grounding (which doc_types matched, at what rank)
 - Supporting context is trimmed aggressively to keep structured output stable.
 - Each reason-generation LLM attempt uses an `8192` completion-token hint, forwarded as both `max_tokens` and `max_completion_tokens` by the OpenAI compatibility wrapper.
@@ -44,7 +47,7 @@ The public recommendation response schema is unchanged in shape (see [`API_SPECI
       "expert_id": "M1006328",
       "fit": "높음",
       "recommendation_reason": "짧고 근거 기반인 추천 사유",
-      "selected_evidence_ids": ["PUB_M1006328_0001_c0", "PJT_M1006328_0001_c0"],
+      "selected_evidence_ids": ["paper_100000045256_c000", "project_100000099812_c000"],
       "risks": []
     }
   ],
@@ -52,12 +55,14 @@ The public recommendation response schema is unchanged in shape (see [`API_SPECI
 }
 ```
 
-Evidence ID policy (v2.0):
+Evidence ID policy (v2.x):
 
 - `selected_evidence_ids` MUST copy provided `chunk_id` values exactly.
-- Valid id is any `chunk_id` present in the candidate's provided evidence pool. There is no positional format (`paper:N` is removed).
+- A `chunk_id` follows the codec `<doc_type>_<numeric_doc_id>_c<NNN>` (e.g. `paper_100000045256_c000`); the `<NNN>` chunk index is zero-padded to 3 digits. The owning doc is `doc_id = <doc_type>_<numeric_doc_id>`.
+- Valid id is any `chunk_id` present in the candidate's provided evidence pool. There is no positional format (`paper:N` is removed). The server enforces the codec with the regex `^(?:paper|patent|project|assessor_activity|specialty)_\d+_c\d+$` and discards ids that fail it.
 - If no direct evidence can be selected, the model returns an empty `selected_evidence_ids` array instead of inventing ids.
 - The server resolves final `recommendation.evidence` from the selected `chunk_id`s; invalid or unresolved ids fall back deterministically to the highest-ranked chunks of the candidate.
+- Up to `4` evidence ids may be selected per candidate (`MAX_SELECTED_EVIDENCE_IDS`).
 
 ## Trace Signals
 
@@ -68,12 +73,12 @@ Top-level: `reason_generation_trace.reason_generation_failed`, `reason_generatio
 Per-candidate evidence-resolution:
 - `selected_evidence_ids` (chunk_ids returned by the model)
 - `resolver_available_evidence_ids` (chunk_ids actually offered to the model)
-- `invalid_selected_evidence_ids` (ids not present in the pool)
+- `invalid_selected_evidence_ids` (ids not present in the pool or failing the chunk_id codec)
 - `resolved_evidence_ids`
 - `relevant_bundle_empty`
 - `fallback`
 
 ## Notes
 
-- Evidence id migration from positional (`paper:N`) to `chunk_id` is the only contract change in v2.0 for this layer; batch size, staged execution, and trim behavior are unchanged.
+- Evidence id is the `chunk_id` codec, not a positional reference (`paper:N`); batch size, staged execution, and trim behavior are unchanged from the prior iteration.
 - Reason generation does not require new runbook steps beyond the chunk-collection readiness checks in [`../operation/RUNBOOK.md`](../operation/RUNBOOK.md).

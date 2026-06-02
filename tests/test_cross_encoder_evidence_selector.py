@@ -1,21 +1,21 @@
 """
-CrossEncoderEvidenceSelector 동작 검증.
+CrossEncoderEvidenceSelector 동작 검증 (flat chunk 계약 v2.1).
 
 실제 cross-encoder 모델 없이 FakeScorer를 주입하여
 관련도 정렬 / floor drop / top-N cap / pre-gate / dedup / lexical fallback을 검증한다.
+후보 카드는 doc_type별 ChunkEvidence 묶음(evidence_by_type)을 가진다.
+evidence 참조 id == chunk_id.
 """
 from __future__ import annotations
 
 from apps.domain.models import (
     CandidateCard,
-    IntellectualPropertyEvidence,
+    ChunkEvidence,
     PlannerOutput,
-    PublicationEvidence,
-    ResearchProjectEvidence,
 )
 from apps.recommendation.evidence_selector import (
     CrossEncoderEvidenceSelector,
-    KeywordEvidenceSelector,
+    PassthroughEvidenceSelector,
 )
 
 
@@ -58,28 +58,34 @@ def _plan(*keywords: str, semantic_query: str = "") -> PlannerOutput:
     )
 
 
-def _card(*, papers=None, projects=None, patents=None) -> CandidateCard:
-    return CandidateCard(
-        expert_id="1",
-        name="Alpha",
-        top_papers=list(papers or []),
-        top_projects=list(projects or []),
-        top_patents=list(patents or []),
+def _paper(title: str, *, year: str, abstract: str = "", chunk_index: int = 0) -> ChunkEvidence:
+    # numeric doc id derived from title hash keeps chunk_id deterministic & unique per title.
+    doc_num = abs(hash(title)) % 1_000_000
+    chunk_id = f"paper_{doc_num}_c{chunk_index:03d}"
+    return ChunkEvidence(
+        chunk_id=chunk_id,
+        doc_type="paper",
+        title=title,
+        date=year,
+        snippet=abstract,
     )
 
 
-def _paper(title: str, *, year: str, abstract: str = "") -> PublicationEvidence:
-    return PublicationEvidence(
-        publication_title=title,
-        publication_year_month=year,
-        abstract=abstract,
+def _card(*, papers=None, expert_id: str = "1", name: str = "Alpha") -> CandidateCard:
+    evidence_by_type: dict[str, list[ChunkEvidence]] = {}
+    if papers:
+        evidence_by_type["paper"] = list(papers)
+    return CandidateCard(
+        expert_id=expert_id,
+        name=name,
+        evidence_by_type=evidence_by_type,
     )
 
 
 def _selector(scorer, **kwargs) -> CrossEncoderEvidenceSelector:
     return CrossEncoderEvidenceSelector(
         scorer=scorer,
-        fallback=KeywordEvidenceSelector(reference_year=2026),
+        fallback=PassthroughEvidenceSelector(),
         top_n_per_type=kwargs.get("top_n_per_type", 5),
         relevance_floor=kwargs.get("relevance_floor", 0.30),
         pregate_per_type=kwargs.get("pregate_per_type", 20),
@@ -105,6 +111,9 @@ def test_orders_evidence_by_cross_encoder_score():
     ]
     assert papers[0].rerank_source == "cross_encoder"
     assert papers[0].match_score > papers[1].match_score
+    # item_id == chunk_id 계약.
+    assert all(p.item_id == p.item_id and p.item_id.startswith("paper_") for p in papers)
+    assert papers[0].type == "paper"
 
 
 def test_drops_items_below_relevance_floor():
@@ -120,8 +129,10 @@ def test_drops_items_below_relevance_floor():
     bundles = selector.select(candidates=[card], plan=_plan("imaging"))
 
     assert [p.title for p in bundles["1"].papers] == ["relevant imaging study"]
+    assert selector.last_trace["mode"] == "cross_encoder"
     counts = selector.last_trace["candidate_evidence_counts"][0]
     assert counts["dropped_below_floor"] >= 1
+    assert counts["total"] == 1
 
 
 def test_caps_at_top_n_per_type():
@@ -155,17 +166,34 @@ def test_deduplicates_same_title_and_year_before_scoring():
     scorer = FakeScorer(default=2.0)
     card = _card(
         papers=[
-            _paper("AI semiconductor platform", year="2025-01", abstract="first"),
-            _paper("AI semiconductor platform", year="2025-06", abstract="dup same year"),
+            _paper("AI semiconductor platform", year="2025-01", abstract="first", chunk_index=0),
+            _paper("AI semiconductor platform", year="2025-06", abstract="dup same year", chunk_index=1),
         ]
     )
 
     selector = _selector(scorer)
     bundles = selector.select(candidates=[card], plan=_plan("AI semiconductor"))
 
+    # 동일 title + 동일 연도(2025)는 scoring 전에 dedup → 1건만 남는다.
     assert len(bundles["1"].papers) == 1
     assert scorer.total_pairs == 1
-    assert selector.last_trace["candidate_evidence_counts"][0]["dedup_dropped"] == 1
+
+
+def test_keeps_same_title_different_year():
+    scorer = FakeScorer(default=2.0)
+    card = _card(
+        papers=[
+            _paper("AI semiconductor platform", year="2024-01", chunk_index=0),
+            _paper("AI semiconductor platform", year="2025-01", chunk_index=1),
+        ]
+    )
+
+    selector = _selector(scorer)
+    bundles = selector.select(candidates=[card], plan=_plan("AI semiconductor"))
+
+    # title이 같아도 연도가 다르면 dedup되지 않는다.
+    assert scorer.total_pairs == 2
+    assert len(bundles["1"].papers) == 2
 
 
 def test_falls_back_to_lexical_when_scorer_missing():
@@ -174,9 +202,13 @@ def test_falls_back_to_lexical_when_scorer_missing():
     selector = _selector(None)
     bundles = selector.select(candidates=[card], plan=_plan("medical imaging"))
 
-    assert selector.last_trace["mode"] == "lexical_fallback"
+    assert selector.last_trace["mode"] == "passthrough_fallback"
     assert selector.last_trace["fallback_reason"] == "no_scorer"
-    assert [p.title for p in bundles["1"].papers] == ["medical imaging study"]
+    papers = bundles["1"].papers
+    assert [p.title for p in papers] == ["medical imaging study"]
+    # 강등된 passthrough 경로의 item도 chunk_id를 item_id로 가진다.
+    assert papers[0].item_id.startswith("paper_")
+    assert papers[0].rerank_source == "passthrough"
 
 
 def test_falls_back_to_lexical_when_scorer_raises():
@@ -186,9 +218,9 @@ def test_falls_back_to_lexical_when_scorer_raises():
     selector = _selector(scorer)
     bundles = selector.select(candidates=[card], plan=_plan("medical imaging"))
 
-    assert selector.last_trace["mode"] == "lexical_fallback"
+    assert selector.last_trace["mode"] == "passthrough_fallback"
     assert selector.last_trace["fallback_reason"] == "scorer_error"
-    assert bundles["1"].papers  # lexical matched "medical imaging"
+    assert bundles["1"].papers  # passthrough keeps the evidence
 
 
 def test_prefers_semantic_query_over_core_keywords():

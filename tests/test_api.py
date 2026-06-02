@@ -10,6 +10,7 @@ from apps.api.main import create_app
 from apps.api.schemas import RecommendationResponse, ReadinessResponse
 from apps.core.config import Settings
 from apps.domain.models import RecommendationDecision
+from apps.search.doc_types import DOC_TYPES
 from apps.search.sparse_runtime import ONLINE_PIXIE_SPLADE_MODEL, QDRANT_BM25_MODEL
 
 
@@ -23,7 +24,7 @@ class FakeRecommendationService:
         return {
             "intent_summary": query,
             "applied_filters": filters_override,
-            "searched_branches": ["basic", "art", "pat", "pjt"],
+            "searched_branches": list(DOC_TYPES),
             "retrieved_count": 4,
             "recommendations": [
                 RecommendationDecision(
@@ -42,25 +43,16 @@ class FakeRecommendationService:
                 "planner": {},
                 "planner_trace": {},
                 "reason_generation_trace": {},
-                "branch_queries": {
-                    "basic": "basic",
-                    "art": "paper",
-                    "pat": "patent",
-                    "pjt": "project",
-                },
+                "branch_queries": {"stable": "semiconductor", "expanded": "semiconductor"},
                 "exclude_orgs": [],
                 "candidate_ids": ["1"],
                 "recommendation_ids": ["1"],
                 "retrieval_score_traces": [
                     {
                         "expert_id": "1",
-                        "point_id": "1_basic",
-                        "point_branch_hint": "basic",
+                        "chunk_id": "paper_100000045256_c000",
+                        "doc_type": "paper",
                         "final_score": 17.0,
-                        "primary_branch": "basic",
-                        "branch_matches": [
-                            {"branch": "basic", "rank": 1, "score": 17.0}
-                        ],
                     }
                 ],
                 "final_sort_policy": "rrf_score_desc_name_asc",
@@ -84,13 +76,14 @@ class FakeRecommendationService:
             expert_id = "1"
             name = "Hong Gildong"
             organization = "Test Institute"
-            branch_presence_flags = {
-                "basic": True,
-                "art": True,
-                "pat": False,
-                "pjt": True,
+            doc_types_present = ["paper", "project"]
+            counts = {
+                "article_cnt": 2,
+                "scie_cnt": 1,
+                "patent_cnt": 0,
+                "project_cnt": 3,
+                "assessor_cnt": 0,
             }
-            counts = {"article_cnt": 2, "scie_cnt": 1, "patent_cnt": 0, "project_cnt": 3}
             data_gaps = ["Patent evidence is missing."]
             risks = []
             shortlist_score = 17.0
@@ -105,23 +98,14 @@ class FakeRecommendationService:
             "planner_trace": {"planner_keywords": ["semiconductor"]},
             "retrieved_count": 1,
             "candidates": [Card()],
-            "branch_queries": {
-                "basic": "basic",
-                "art": "paper",
-                "pat": "patent",
-                "pjt": "project",
-            },
+            "branch_queries": {"stable": "semiconductor", "expanded": "semiconductor"},
             "retrieval_keywords": ["semiconductor"],
             "retrieval_score_traces": [
                 {
                     "expert_id": "1",
-                    "point_id": "1_basic",
-                    "point_branch_hint": "basic",
+                    "chunk_id": "paper_100000045256_c000",
+                    "doc_type": "paper",
                     "final_score": 17.0,
-                    "primary_branch": "basic",
-                    "branch_matches": [
-                        {"branch": "basic", "rank": 1, "score": 17.0}
-                    ],
                 }
             ],
             "query_payload": {"prefetch": [], "query_filter": None, "query": "rrf"},
@@ -176,8 +160,10 @@ def test_recommend_endpoint_contract():
 
     assert response.status_code == 200
     parsed = RecommendationResponse.model_validate(response.json())
-    assert parsed.searched_branches == ["basic", "art", "pat", "pjt"]
-    assert response.json()["trace"]["retrieval_score_traces"][0]["primary_branch"] == "basic"
+    assert parsed.searched_branches == list(DOC_TYPES)
+    assert (
+        response.json()["trace"]["retrieval_score_traces"][0]["doc_type"] == "paper"
+    )
     assert response.json()["recommendations"][0]["fit"] == "높음"
     assert (
         response.json()["recommendations"][0]["recommendation_reason"]
@@ -225,7 +211,7 @@ def test_playground_route_serves_local_chat_ui():
     assert 'id="chatForm"' in response.text
     assert "/recommend" in response.text
     assert "/search/candidates" in response.text
-    assert "Primary branch:" in response.text
+    assert "검색 점수 근거" in response.text
     assert "Readiness details" in response.text
 
 
@@ -243,7 +229,10 @@ def test_search_candidates_endpoint_includes_retrieval_score_trace():
         )
 
     assert response.status_code == 200
-    assert response.json()["trace"]["retrieval_score_traces"][0]["primary_branch"] == "basic"
+    assert (
+        response.json()["trace"]["retrieval_score_traces"][0]["doc_type"] == "paper"
+    )
+    assert response.json()["searched_branches"] == list(DOC_TYPES)
     server_logs = response.json()["trace"]["server_logs"]
     assert any("사용자 질의 수신: endpoint=/search/candidates" in line for line in server_logs)
     assert any(
@@ -351,7 +340,6 @@ def test_startup_failure_is_reported_by_readiness_and_service_endpoints(monkeypa
 
 def _patch_runtime_build_dependencies(monkeypatch, *, sparse_encoder_factory):
     dense_encoder = object()
-    registry = object()
 
     class FakeQdrantClient:
         last_instance = None
@@ -374,10 +362,9 @@ def _patch_runtime_build_dependencies(monkeypatch, *, sparse_encoder_factory):
             self.initialized = True
 
     class FakeBootstrapper:
-        def __init__(self, client, settings, registry, sparse_runtime=None):
+        def __init__(self, client, settings, sparse_runtime=None):
             self.client = client
             self.settings = settings
-            self.registry = registry
             self.sparse_runtime = sparse_runtime
             self.recreate = None
 
@@ -385,11 +372,6 @@ def _patch_runtime_build_dependencies(monkeypatch, *, sparse_encoder_factory):
             self.recreate = recreate
 
     monkeypatch.setattr(main_module, "validate_runtime_settings", lambda settings: None)
-    monkeypatch.setattr(
-        main_module.SearchSchemaRegistry,
-        "default",
-        staticmethod(lambda: registry),
-    )
     monkeypatch.setattr(main_module, "QdrantClient", FakeQdrantClient)
     monkeypatch.setattr(main_module, "build_dense_encoder", lambda settings: dense_encoder)
     monkeypatch.setattr(main_module, "SpladeSparseEncoder", sparse_encoder_factory)
@@ -408,7 +390,7 @@ def _patch_runtime_build_dependencies(monkeypatch, *, sparse_encoder_factory):
         main_module, "LiveContractValidator", lambda **kwargs: SimpleNamespace(**kwargs)
     )
 
-    return dense_encoder, registry, FakeQdrantClient
+    return dense_encoder, None, FakeQdrantClient
 
 
 @pytest.mark.anyio

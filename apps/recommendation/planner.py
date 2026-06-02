@@ -5,7 +5,6 @@
 - 사용자가 "화재 관련 컨소시엄 전문가 추천해줘" 라고 입력했을 때, 
   "화재", "컨소시엄"과 같은 기술 도메인 키워드(`retrieval_core`)만을 추출하여 엔진이 노이즈 없이 검색할 수 있게 돕습니다.
 - "전문가", "추천해줘"와 같은 역할어/행동어는 `role_terms`, `action_terms`로 분리하여 검색어에서 배제합니다.
-- 동의어 확장 번들(Lexicon)을 참조하여, "드론" 이라는 단어가 들어오면 "UAV", "무인기" 등 확장 ID(`bundle_ids`)를 추천합니다.
 """
 
 from __future__ import annotations
@@ -23,14 +22,13 @@ from apps.core.llm_policies import build_consistency_invoke_kwargs
 from apps.core.openai_compat_llm import OpenAICompatChatModel
 from apps.core.utils import build_deterministic_seed
 from apps.domain.models import PlannerOutput
-from apps.search.expansion_lexicon import EXPANSION_LEXICON, get_lexicon_summary
 
 logger = logging.getLogger(__name__)
 
 MAX_PLANNER_ATTEMPTS = 2
 
 
-PLANNER_VERSION = "v0.4.0"
+PLANNER_VERSION = "v0.4.1"
 
 
 class Planner(Protocol):
@@ -137,100 +135,91 @@ class OpenAICompatPlanner:
 
     @staticmethod
     def _build_system_prompt() -> str:
-        lexicon_summary = get_lexicon_summary()
-        prompt = f"""
+        prompt = """
                 # 역할
                 당신은 ***동질적인 전문가 코퍼스***를 검색하는 전문가 추천 시스템의 R&D 질의 플래너입니다.
                 당신은 전문가/평가위원을 모아놓은 qdrant 벡터DB 에 검색 할 쿼리를 만들기 위해, 사용자의 질의를 분석하고 정규화해야 합니다.
             
                 # 출력 목표
                 - `retrieval_core`: 실제 기술/도메인 매칭에 필요한 핵심 키워드 리스트(Sparse/Keyword 검색용). "평가위원", "전문가" 등 역할어는 제외하세요.
-                - `bundle_ids`: 질의의 기술적 맥락을 확장하기 위해 아래 [확장 번들 목록]에서 가장 적합한 ID들을 선택하세요. (없으면 빈 리스트)
                 - `semantic_query`: 검색 의도를 담은 자연어 문장(Vector 검색용). 핵심 기술 키워드와 맥락을 포함하세요.
                 - `role_terms`: "평가위원", "교수", "전문가" 등 검색 대상의 페르소나/역할 용어 리스트.
                 - `action_terms`: "추천", "찾아줘", "선정해줘" 등 사용자가 요청한 행동 용어 리스트.
                 - `intent_flags`: 검색 의도에 대한 플래그 (예: "need_experience": true, "prefer_recent": true 등).
                 - `intent_summary`: UI/추적용 짧은 요약 문장.
-            
-                # [확장 번들 목록]
-                {lexicon_summary}
 
                 # 규칙
                 1. 사용자 질의의 주 언어를 유지하세요. 번역하거나 언어를 섞지 마세요.
                 2. `retrieval_core`에는 도메인 개념, 기술, 재료, 분야만 포함해야 합니다. 코퍼스에 공통적으로 나타나는 "전문가", "추천" 등은 여기에 넣지 마세요.
                 2-1. **역할/행위어 누수 금지**: 한 단어를 `role_terms` 또는 `action_terms`에 넣었다면 그 단어는 `retrieval_core`에 절대 다시 넣지 마세요. "평가위원", "심사위원", "심사", "평가", "추천", "선정", "찾아줘", "교수", "전문가" 등은 사용자가 *원하는 결과의 역할/행위* 이며, 검색 대상 인물의 실적 텍스트(논문/특허/과제)에는 등장하지 않습니다.
-                3. `bundle_ids`는 반드시 위에 제공된 [확장 번들 목록]의 ID 중에서만 선택하세요.
-                4. `role_terms`와 `action_terms`는 검색어(Query)가 아니라 제어 신호로 활용됩니다.
-                5. `include_orgs`/`exclude_orgs`는 **검색 대상 인물의 소속 기관 제약**일 때만 사용하세요.
-                5-1. **대상 기관 vs 소속 기관 구분**: "X에서 수행한 과제를 심사", "X 사업 평가", "X 과제 ~" 처럼 기관 X 가 *심사/평가 대상*으로 등장하는 경우, X 는 `include_orgs`에 넣지 말고 `semantic_query`의 맥락으로만 유지하세요. "X 소속 ~", "X 출신 ~" 처럼 명시적으로 소속을 지정한 경우만 `include_orgs`에 넣습니다.
-                6. 명시적으로 지원되는 구조화 필터만 `hard_filters`에 복사하세요.
-                7. 안전한 도메인 키워드가 없으면 `retrieval_core`는 빈 리스트로 반환하세요.
-                8. JSON만 반환하세요. 마크다운 펜스, 설명문, 숨겨진 추론은 포함하지 마세요.
+                3. `role_terms`와 `action_terms`는 검색어(Query)가 아니라 제어 신호로 활용됩니다.
+                4. `include_orgs`/`exclude_orgs`는 **검색 대상 인물의 소속 기관 제약**일 때만 사용하세요.
+                4-1. **대상 기관 vs 소속 기관 구분**: "X에서 수행한 과제를 심사", "X 사업 평가", "X 과제 ~" 처럼 기관 X 가 *심사/평가 대상*으로 등장하는 경우, X 는 `include_orgs`에 넣지 말고 `semantic_query`의 맥락으로만 유지하세요. "X 소속 ~", "X 출신 ~" 처럼 명시적으로 소속을 지정한 경우만 `include_orgs`에 넣습니다.
+                5. 명시적으로 지원되는 구조화 필터만 `hard_filters`에 복사하세요.
+                6. 안전한 도메인 키워드가 없으면 `retrieval_core`는 빈 리스트로 반환하세요.
+                7. JSON만 반환하세요. 마크다운 펜스, 설명문, 숨겨진 추론은 포함하지 마세요.
                 
                 # 출력 스키마
-                {{
+                {
                   "intent_summary": "string",
                   "retrieval_core": ["string"],
-                  "bundle_ids": ["string"],
                   "semantic_query": "string",
                   "role_terms": ["string"],
                   "action_terms": ["string"],
-                  "intent_flags": {{}},
-                  "hard_filters": {{}},
+                  "intent_flags": {},
+                  "hard_filters": {},
                   "include_orgs": ["string"],
                   "exclude_orgs": ["string"],
                   "top_k": integer
-                }}
+                }
             
                 # 예시
                 Input:
-                {{
+                {
                   "query": "난접근성 화재 진압에서 드론을 접목하려고해. 드론을 화재진압 연구에 사용한 경험이 있는 관련된 전문가를 5명 추천해줘",
-                  "filters_override": {{}},
+                  "filters_override": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
                   "top_k": 5
-                }}
+                }
             
                 Output:
-                {{
+                {
                   "intent_summary": "난접근성 화재 진압과 드론 접목 관련 전문가 탐색",
                   "retrieval_core": ["난접근성 화재 진압", "드론"],
-                  "bundle_ids": ["uav", "fire_response"],
                   "semantic_query": "난접근성 화재 현장의 화재 진압을 위한 드론 및 무인 로봇 활용 연구 전문가",
                   "role_terms": ["전문가"],
                   "action_terms": ["추천"],
-                  "intent_flags": {{ "need_experience": true }},
-                  "hard_filters": {{}},
+                  "intent_flags": { "need_experience": true },
+                  "hard_filters": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
                   "top_k": 5
-                }}
+                }
 
                 # 예시 2 (대상 기관 + 역할어 처리)
                 Input:
-                {{
+                {
                   "query": "한국과학기술정보연구원에서 수행한 과제를 심사하기 위한 적절한 평가위원 추천",
-                  "filters_override": {{}},
+                  "filters_override": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
                   "top_k": 5
-                }}
+                }
 
                 Output:
-                {{
+                {
                   "intent_summary": "한국과학기술정보연구원 수행 과제 심사용 평가위원 탐색",
                   "retrieval_core": [],
-                  "bundle_ids": [],
                   "semantic_query": "한국과학기술정보연구원에서 수행한 R&D 과제를 심사할 수 있는 동일/유사 도메인 경험을 가진 평가위원",
                   "role_terms": ["평가위원"],
                   "action_terms": ["심사", "추천"],
-                  "intent_flags": {{}},
-                  "hard_filters": {{}},
+                  "intent_flags": {},
+                  "hard_filters": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
                   "top_k": 5
-                }}
+                }
                 주의: 위 예시에서 "한국과학기술정보연구원"은 *심사 대상 기관* 이므로 `include_orgs`에 넣지 않습니다. "평가위원"은 `role_terms`, "심사"/"추천"은 `action_terms`이며 `retrieval_core`에 중복으로 들어가지 않습니다.
             """
         return textwrap.dedent(prompt).strip()
@@ -265,8 +254,8 @@ class OpenAICompatPlanner:
                 if term.casefold() not in excluded_terms
             ]
 
-        # 번들 ID 유효성 검사 (존재하지 않는 ID는 제거)
-        output.bundle_ids = [bid for bid in _normalize_string_list(output.bundle_ids) if bid in EXPANSION_LEXICON]
+        # v1 branch 기반 lexicon expansion은 제거됐다. 하위호환 필드는 비워 둔다.
+        output.bundle_ids = []
 
         # Backward compatibility mapping
         output.core_keywords = list(output.retrieval_core)

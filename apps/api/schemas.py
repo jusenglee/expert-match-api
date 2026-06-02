@@ -80,18 +80,13 @@ class SearchCandidateItem(BaseModel):
     expert_id: str = Field(..., description="Expert identifier")
     name: str = Field(..., description="Expert name")
     organization: str | None = Field(None, description="Affiliated organization")
-    branch_presence_flags: dict[str, bool] = Field(
-        ..., description="Per-branch data presence flags"
+    doc_types_present: list[str] = Field(
+        default_factory=list, description="doc_type 종류(회수된 chunk 기준)"
     )
     counts: dict[str, int] = Field(..., description="Evidence counts by category")
     data_gaps: list[str] = Field(..., description="Candidate-specific data gaps")
     risks: list[str] = Field(..., description="Candidate-specific risks")
     shortlist_score: float = Field(..., description="Search shortlist score")
-    
-    # Support Rule 추적 정보
-    stable_hits: int = 0
-    expanded_hits: int = 0
-    support_branches: list[str] = Field(default_factory=list)
 
 
 class SearchCandidatesResponse(BaseModel):

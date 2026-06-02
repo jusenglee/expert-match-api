@@ -57,10 +57,9 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://203.250.234.159:8005"  # Qdrant 서버 주소
     qdrant_api_key: str | None = None  # 인증이 필요한 경우 설정
 
-    # [핵심] 검색을 수행할 대상 컬렉션 이름입니다.
-    # Proto(테스트) 환경: "researcher_recommend_proto"
-    # (주의: 이 컬렉션은 Sparse 벡터 이름이 _splade 형식으로 구성되어 있어야 정상 동작합니다.)
-    qdrant_collection_name: str = "researcher_recommend_proto"
+    # [핵심] 검색 대상 컬렉션. flat chunk 모델(1 chunk = 1 Point) 단일 벡터 컬렉션.
+    # 단일 named vector: vector_e5i(dense) + vector_splade(sparse). doc_type은 payload 필터.
+    qdrant_collection_name: str = "researcher_recommend_v1"
 
     qdrant_cloud_inference: bool = False  # Qdrant Cloud의 내장 추론 모델 사용 여부
     qdrant_collection_release_id: str = (
@@ -130,16 +129,15 @@ class Settings(BaseSettings):
     # =========================================================================
     # 검색 파이프라인의 각 단계(Stage)별로 데이터 처리량을 조절하여 품질과 속도의 균형을 맞춥니다.
 
-    # [1단계] 1차 키워드 검색 시 (Sparse), 각 브랜치(논문, 특허, 기본 등)별로 가져오는 최대 후보자 수.
-    # 넓은 키워드 매칭 풀(Pool)을 먼저 확보하여 2차 하이브리드 검색이 이 풀 안에서만 이루어지도록 강제합니다.
-    branch_prefetch_limit: int = 100
+    # [Prefetch] 그룹 하이브리드 검색의 prefetch 단계에서 dense/sparse가 각각 가져오는 chunk 풀 크기.
+    # 넓게 확보할수록 group_by=researcher_id 그룹이 더 많이 형성된다.
+    prefetch_limit: int = 256
 
-    # [2단계] 2차 하이브리드 검색 시 (Dense+Sparse), 1단계 모수 내에서 각 브랜치별로 상위 N명을 가져옵니다.
-    # 추출된 이 결과들이 모두 모여서 최종 RRF(Reciprocal Rank Fusion) 가중합산 점수가 계산됩니다.
-    branch_output_limit: int = 40
+    # [Group size] researcher 그룹당 회수할 최대 chunk 수(query_points_groups.group_size).
+    # 이 chunk들이 곧 후보의 evidence 풀이며, 앱단 RRF 누적(Σ chunk score × doc_type prior)의 입력이다.
+    group_size: int = 10
 
-    # [3단계] 브랜치별 결과를 모두 합산(RRF)하고 Support Rule 필터링을 거친 후,
-    # LLM(평가위원 심사기)에게 넘기기 전에 최종적으로 추려내는 최대 후보자의 수입니다.
+    # [그룹 수] query_points_groups가 반환할 최대 연구자(그룹) 수 = LLM에 넘기기 전 최종 후보 상한.
     retrieval_limit: int = 80
 
     # [최종 단계] LLM이 최종 판단하여 추천할 인원의 상한선과 하한선입니다.
@@ -181,7 +179,7 @@ class Settings(BaseSettings):
     # (탈락/생성 금지). 후보 순위 척추는 RRF 고정. (ADR 0005 §3)
     candidate_reranker: Literal["off", "band"] = "off"
 
-    # 검색 대상 doc_type 화이트리스트. 미설정(None)=전체 11종.
+    # 검색 대상 doc_type 화이트리스트. 미설정(None)=전체 5종(paper/patent/project/assessor_activity/specialty).
     # planner는 doc_type on/off를 결정하지 않으며, 축소는 운영 화이트리스트로만. (ADR 0003)
     retrieval_doc_types: list[str] | None = None
 

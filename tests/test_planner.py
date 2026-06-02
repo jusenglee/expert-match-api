@@ -168,7 +168,7 @@ def test_openai_compat_planner_strips_role_and_action_terms_from_retrieval_core(
     assert "평가위원" in planner.last_trace["removed_role_terms"]
 
 
-def test_openai_compat_planner_selects_expansion_bundles():
+def test_openai_compat_planner_discards_legacy_expansion_bundles():
     planner = OpenAICompatPlanner(
         Settings(app_env="test", strict_runtime_validation=False)
     )
@@ -189,8 +189,5 @@ def test_openai_compat_planner_selects_expansion_bundles():
 
     result = asyncio.run(planner.plan(query="드론 화재 진압 전문가 추천"))
 
-    # 유효한 번들 ID만 남아야 함
-    assert "uav" in result.bundle_ids
-    assert "fire_response" in result.bundle_ids
-    assert "invalid_id" not in result.bundle_ids
-    assert len(result.bundle_ids) == 2
+    assert result.retrieval_core == ["드론", "화재 진압"]
+    assert result.bundle_ids == []

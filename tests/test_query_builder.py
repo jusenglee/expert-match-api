@@ -46,3 +46,28 @@ def test_query_builder_normalizes_and_deduplicates_core_keywords():
     assert "화재" in keywords
     # 중복 제거 확인
     assert len(keywords) == 3
+
+
+def test_query_builder_does_not_expand_bundle_ids():
+    builder = QueryTextBuilder()
+    plan = PlannerOutput(
+        intent_summary="드론 화재 진압 전문가",
+        retrieval_core=["드론", "화재 진압"],
+        core_keywords=["드론", "화재 진압"],
+        semantic_query="드론 화재 진압 기술 전문가",
+        bundle_ids=["legacy_uav"],
+    )
+
+    queries = builder.build_queries(
+        query="드론 화재 진압 전문가 추천",
+        plan=plan,
+    )
+    keyword_queries = builder.build_keyword_queries(
+        query="드론 화재 진압 전문가 추천",
+        plan=plan,
+    )
+
+    assert queries.stable == "드론 화재 진압 기술 전문가"
+    assert queries.expanded == queries.stable
+    assert keyword_queries.stable == "드론 화재 진압"
+    assert keyword_queries.expanded == keyword_queries.stable

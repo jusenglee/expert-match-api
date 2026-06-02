@@ -1,63 +1,47 @@
+"""QdrantHybridRetriever 테스트 (flat chunk 모델, v2.1 — query_points_groups 기반).
+
+검증 계약:
+- 단일 grouped 하이브리드 검색(query_points_groups, group_by=researcher_id) 1콜.
+  prefetch=[dense(vector_e5i), sparse(vector_splade)], query=FusionQuery.RRF, group_size/limit 설정값.
+- 그룹 → ResearcherCandidate. group_score = Σ chunk_score × doc_type_prior (doc_type별 chunk cap).
+- evidence chunk는 cap과 무관하게 모두 보관. exclude_orgs 후처리 배제.
+- search_weighted()는 grouped RRF로 통일(search()와 동일 경로).
+네트워크/실모델 금지 — FakeGroupsClient + Recording 인코더 스텁만.
+"""
+
 import asyncio
-import logging
 from types import SimpleNamespace
 
 from qdrant_client import models
 
 from apps.core.config import Settings
-from apps.domain.models import PlannerOutput
-from apps.search.query_builder import QueryTextBuilder
+from apps.domain.models import PlannerOutput, ResearcherCandidate
+from apps.search.query_builder import CompiledQueries, QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
-from apps.search.schema_registry import SearchSchemaRegistry
+from apps.search.schema_registry import DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
 from apps.search.sparse_runtime import SparseRuntimeConfig
 
 
-class FakeQdrantClient:
-    def __init__(self, payloads: list[dict], scores: list[float] | None = None) -> None:
-        self.payloads = payloads
-        self.scores = scores or [0.88 - (index * 0.01) for index in range(len(payloads))]
-        self.calls: list[dict] = []
-        self.main_kwargs = None
-        self.branch_kwargs: list[dict] = []
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+class FakeGroupsClient:
+    """query_points_groups를 흉내. groups_spec: [(researcher_id, [(payload, score), ...]), ...]."""
 
-    def query_points(self, **kwargs):
-        self.calls.append(kwargs)
-        if kwargs.get("with_payload"):
-            self.main_kwargs = kwargs
-        else:
-            self.branch_kwargs.append(kwargs)
-        return SimpleNamespace(
-            points=[
-                SimpleNamespace(
-                    id=str(index + 1),
-                    payload=payload,
-                    score=self.scores[index],
-                )
-                for index, payload in enumerate(self.payloads)
-            ]
-        )
-
-
-class StageAwareFakeQdrantClient:
-    def __init__(
-        self,
-        *,
-        keyword_payloads: list[dict],
-        hybrid_payloads: list[dict],
-    ) -> None:
-        self.keyword_payloads = keyword_payloads
-        self.hybrid_payloads = hybrid_payloads
+    def __init__(self, groups_spec: list[tuple[str, list[tuple[dict, float]]]]) -> None:
+        self._spec = groups_spec
         self.calls: list[dict] = []
 
-    def query_points(self, **kwargs):
+    def query_points_groups(self, **kwargs):
         self.calls.append(kwargs)
-        payloads = self.hybrid_payloads if "prefetch" in kwargs else self.keyword_payloads
-        return SimpleNamespace(
-            points=[
-                SimpleNamespace(id=str(index + 1), payload=payload, score=0.9)
-                for index, payload in enumerate(payloads)
+        groups = []
+        for rid, hits in self._spec:
+            points = [
+                SimpleNamespace(id=payload.get("chunk_id"), payload=payload, score=score)
+                for payload, score in hits
             ]
-        )
+            groups.append(SimpleNamespace(id=rid, hits=points))
+        return SimpleNamespace(groups=groups)
 
 
 class RecordingDenseEncoder:
@@ -71,309 +55,231 @@ class RecordingDenseEncoder:
         return [0.1] * self.vector_size
 
 
-def _settings() -> Settings:
-    return Settings(
+def _settings(**overrides) -> Settings:
+    base = dict(
         app_env="test",
         strict_runtime_validation=False,
+        cache_enabled=False,  # L3 캐시 비활성(테스트 격리)
         embedding_vector_size=8,
-        branch_prefetch_limit=80,
-        branch_output_limit=50,
+        prefetch_limit=64,
+        group_size=10,
         retrieval_limit=40,
     )
+    base.update(overrides)
+    return Settings(**base)
 
 
-def _payload(researcher_id: str, name: str) -> dict:
+def _chunk_payload(
+    researcher_id: str,
+    name: str,
+    *,
+    doc_type: str = "paper",
+    chunk_index: int = 0,
+    text: str | None = None,
+    organization: str | None = None,
+    doc_attrs: dict | None = None,
+) -> dict:
+    digits = "".join(ch for ch in researcher_id if ch.isdigit()) or "0"
+    doc_num = f"1000000000{int(digits):02d}"
     return {
-        "basic_info": {"researcher_id": researcher_id, "researcher_name": name},
-        "researcher_profile": {},
-        "publications": [{"publication_title": f"{name} paper"}],
-        "intellectual_properties": [],
-        "research_projects": [],
+        "researcher_id": researcher_id,
+        "researcher_name": name,
+        "doc_type": doc_type,
+        "doc_id": f"{doc_type}_{doc_num}",
+        "chunk_id": f"{doc_type}_{doc_num}_c{chunk_index:03d}",
+        "chunk_text": text if text is not None else f"{name} {doc_type} chunk",
+        "doc_date": None,
+        "affiliated_organization": organization,
+        "highest_degree": "박사",
+        "publication_count": 3,
+        "scie_publication_count": 1,
+        "intellectual_property_count": 0,
+        "research_project_count": 2,
+        "researcher_assessor_activity_count": 0,
+        "doc_attrs": doc_attrs or {},
     }
 
 
-def _keyword_calls(client) -> list[dict]:
-    return [call for call in client.calls if "prefetch" not in call]
+def _run(retriever, *, query="검색 질의", core=None, **plan_kwargs):
+    plan = PlannerOutput(
+        intent_summary=query,
+        retrieval_core=core or ["키워드"],
+        core_keywords=core or ["키워드"],
+        **plan_kwargs,
+    )
+    return asyncio.run(retriever.search(query=query, plan=plan, query_filter=None))
 
 
-def _hybrid_calls(client) -> list[dict]:
-    return [call for call in client.calls if "prefetch" in call]
-
-
-def test_retriever_uses_single_clean_query_across_all_branches_and_name_tiebreak():
-    payloads = [
-        {
-            "basic_info": {"researcher_id": "2", "researcher_name": "Bravo"},
-            "researcher_profile": {},
-            "publications": [{"publication_title": "B paper"}],
-            "intellectual_properties": [],
-            "research_projects": [],
-        },
-        {
-            "basic_info": {"researcher_id": "1", "researcher_name": "Alpha"},
-            "researcher_profile": {},
-            "publications": [{"publication_title": "A paper"}],
-            "intellectual_properties": [],
-            "research_projects": [],
-        },
-    ]
-    client = FakeQdrantClient(payloads=payloads, scores=[0.91, 0.91])
-    encoder = RecordingDenseEncoder()
-    retriever = QdrantHybridRetriever(
+def _retriever(client, **settings_overrides) -> QdrantHybridRetriever:
+    return QdrantHybridRetriever(
         client=client,
-        settings=_settings(),
-        registry=SearchSchemaRegistry.default(),
-        dense_encoder=encoder,
+        settings=_settings(**settings_overrides),
+        dense_encoder=RecordingDenseEncoder(),
         query_builder=QueryTextBuilder(),
     )
 
-    result = asyncio.run(
-        retriever.search(
-            query="Recommend AI semiconductor reviewers",
-            plan=PlannerOutput(
-                intent_summary="Recommend AI semiconductor reviewers",
-                retrieval_core=["AI semiconductor", "chip design"],
-                core_keywords=["AI semiconductor", "chip design"],
-            ),
-            query_filter=None,
-        ),
-    )
 
-    assert result.retrieval_keywords == ["AI", "semiconductor", "chip", "design"]
-    assert "AI semiconductor" in result.branch_queries["basic"].stable
-    assert "chip design" in result.branch_queries["basic"].stable
-    assert "AI semiconductor" in result.branch_queries["art"].stable
-    assert "chip design" in result.branch_queries["art"].stable
-    assert "AI semiconductor" in result.branch_queries["pat"].stable
-    assert "chip design" in result.branch_queries["pat"].stable
-    assert "AI semiconductor" in result.branch_queries["pjt"].stable
-    assert "chip design" in result.branch_queries["pjt"].stable
-    assert {hit.expert_id for hit in result.hits} == {"1", "2"}
-    assert len(encoder.inputs) == 6
-    assert all("AI semiconductor" in text for text in encoder.inputs)
-    assert all("chip design" in text for text in encoder.inputs)
-    keyword_calls = _keyword_calls(client)
-    hybrid_calls = _hybrid_calls(client)
-    assert len(keyword_calls) == 6
-    assert len(hybrid_calls) == 6
-    keyword_sparse_texts = [
-        call["query"].text
-        for call in keyword_calls
-    ]
-    sparse_texts = [
-        call["prefetch"][1].query.text
-        for call in hybrid_calls
-    ]
-    assert keyword_sparse_texts == encoder.inputs
-    assert sparse_texts == encoder.inputs
-    assert len(client.calls) == 12
-    assert result.query_payload["retrieval_mode"] == "keyword_pool_then_hybrid"
-    assert result.query_payload["retrieval_keywords"] == [
-        "AI",
-        "semiconductor",
-        "chip",
-        "design",
-    ]
-    assert "AI semiconductor" in result.query_payload["keyword_stage_queries"]["basic"]["stable"]
-    assert "chip design" in result.query_payload["hybrid_stage_queries"]["art"]["stable"]
-    assert result.query_payload["keyword_stage_candidate_count"] == 2
-    assert len(result.retrieval_score_traces) == 2
-    assert result.retrieval_score_traces[0]["expert_id"] in {"1", "2"}
-    assert {item["branch"] for item in result.retrieval_score_traces[0]["branch_matches"]} == {
-        "basic",
-        "art",
-        "pat",
-        "pjt",
-    }
+# ---------------------------------------------------------------------------
+# _sort_hits
+# ---------------------------------------------------------------------------
+def test_sort_hits_breaks_ties_by_name_then_researcher_id():
+    bravo = ResearcherCandidate(researcher_id="2", researcher_name="Bravo", group_score=0.5)
+    alpha = ResearcherCandidate(researcher_id="1", researcher_name="Alpha", group_score=0.5)
+    higher = ResearcherCandidate(researcher_id="3", researcher_name="Zulu", group_score=0.9)
+    ordered = QdrantHybridRetriever._sort_hits([bravo, alpha, higher])
+    assert [c.researcher_id for c in ordered] == ["3", "1", "2"]
 
 
-def test_retriever_limits_hybrid_stage_to_keyword_candidate_pool_and_existing_filter(caplog):
-    caplog.set_level(logging.INFO)
-    keyword_payloads = [_payload("1", "Keyword Match")]
-    hybrid_payloads = [
-        _payload("1", "Keyword Match"),
-        _payload("2", "Outside Pool"),
-    ]
-    client = StageAwareFakeQdrantClient(
-        keyword_payloads=keyword_payloads,
-        hybrid_payloads=hybrid_payloads,
-    )
-    base_filter = models.Filter(
-        must=[
-            models.FieldCondition(
-                key="researcher_profile.highest_degree",
-                match=models.MatchAny(any=["PhD"]),
-            )
+# ---------------------------------------------------------------------------
+# search() — grouped hybrid RRF
+# ---------------------------------------------------------------------------
+def test_search_groups_into_researcher_candidates():
+    client = FakeGroupsClient(
+        [
+            ("M2", [(_chunk_payload("M2", "Bravo"), 0.91)]),
+            ("M1", [(_chunk_payload("M1", "Alpha"), 0.90)]),
         ]
     )
+    result = _run(_retriever(client), core=["AI semiconductor", "chip design"])
+
+    assert all(isinstance(hit, ResearcherCandidate) for hit in result.hits)
+    assert {hit.researcher_id for hit in result.hits} == {"M1", "M2"}
+    assert all(len(hit.chunks) >= 1 for hit in result.hits)
+    assert isinstance(result.queries, CompiledQueries)
+    assert result.retrieval_keywords == ["AI", "semiconductor", "chip", "design"]
+
+    # query_points_groups 단일 콜.
+    assert len(client.calls) == 1
+    assert result.query_payload["retrieval_mode"] == "grouped_hybrid_rrf"
+    assert result.query_payload["group_count"] == 2
+    assert result.query_payload["aggregated_candidate_count"] == 2
+    assert result.query_payload["final_hit_count"] == 2
+
+    # score traces: 후보별 1건 + doc_types/family_contributions.
+    assert len(result.retrieval_score_traces) == 2
+    trace = result.retrieval_score_traces[0]
+    assert trace["expert_id"] in {"M1", "M2"}
+    assert set(trace["doc_types"]) == {"paper"}
+    assert "achievement" in trace["family_contributions"]
+
+
+def test_search_uses_grouped_hybrid_query_shape():
+    client = FakeGroupsClient([("M1", [(_chunk_payload("M1", "Alpha"), 0.9)])])
+    settings_obj = _settings()
     retriever = QdrantHybridRetriever(
-        client=client,
-        settings=_settings(),
-        registry=SearchSchemaRegistry.default(),
-        dense_encoder=RecordingDenseEncoder(),
-        query_builder=QueryTextBuilder(),
+        client=client, settings=settings_obj,
+        dense_encoder=RecordingDenseEncoder(), query_builder=QueryTextBuilder(),
     )
+    asyncio.run(retriever.search(
+        query="single vector check",
+        plan=PlannerOutput(intent_summary="x", retrieval_core=["alpha"], core_keywords=["alpha"]),
+        query_filter=None,
+    ))
 
-    result = asyncio.run(
-        retriever.search(
-            query="keyword constrained hybrid",
-            plan=PlannerOutput(
-                intent_summary="keyword constrained hybrid",
-                retrieval_core=["keyword"],
-                core_keywords=["keyword"],
-            ),
-            query_filter=base_filter,
-        ),
-    )
+    assert len(client.calls) == 1
+    call = client.calls[0]
+    assert call["collection_name"] == settings_obj.qdrant_collection_name
+    assert call["group_by"] == "researcher_id"
+    assert call["group_size"] == settings_obj.group_size
+    assert call["limit"] == settings_obj.retrieval_limit
+    prefetch = call["prefetch"]
+    assert len(prefetch) == 2
+    assert prefetch[0].using == DENSE_VECTOR_NAME
+    assert prefetch[1].using == SPARSE_VECTOR_NAME
+    assert prefetch[0].limit == settings_obj.prefetch_limit
+    assert isinstance(call["query"], models.FusionQuery)
+    assert call["query"].fusion == models.Fusion.RRF
 
-    assert [hit.expert_id for hit in result.hits] == ["1"]
-    assert len(_keyword_calls(client)) == 6
-    assert len(_hybrid_calls(client)) == 6
-    hybrid_filter = _hybrid_calls(client)[0]["query_filter"]
-    must_conditions = hybrid_filter.must or []
-    assert any(
-        getattr(condition, "key", None) == "researcher_profile.highest_degree"
-        for condition in must_conditions
-    )
-    candidate_conditions = [
-        condition
-        for condition in must_conditions
-        if getattr(condition, "key", None) == "basic_info.researcher_id"
+
+def test_search_app_side_rrf_accumulation_with_doc_type_prior():
+    # 그룹에 paper(prior 1.0) + specialty(prior 0.5) → group_score = 0.8*1.0 + 0.4*0.5 = 1.0
+    group_hits = [
+        (_chunk_payload("M1", "Alpha", doc_type="paper", chunk_index=0), 0.8),
+        (_chunk_payload("M1", "Alpha", doc_type="specialty", chunk_index=0), 0.4),
     ]
-    assert len(candidate_conditions) == 1
-    assert candidate_conditions[0].match.any == ["1"]
-    assert result.query_payload["hybrid_stage_candidate_filter_count"] == 1
-    assert result.query_payload["hybrid_stage_raw_branch_counts"] == {
-        "basic:stable": 2,
-        "art:stable": 2,
-        "art:expanded": 2,
-        "pat:stable": 2,
-        "pjt:stable": 2,
-        "pjt:expanded": 2,
-    }
-    assert result.query_payload["aggregated_candidate_count"] == 1
-    assert result.query_payload["support_pass_count"] == 1
-    assert result.query_payload["support_filtered_count"] == 0
-    assert "1차 키워드 검색 시작" in caplog.text
-    assert "2차 하이브리드 검색 시작" in caplog.text
-    assert "검색 집계 완료" in caplog.text
-
-
-def test_retriever_returns_empty_when_keyword_stage_has_no_candidates():
-    client = StageAwareFakeQdrantClient(
-        keyword_payloads=[],
-        hybrid_payloads=[_payload("1", "Hybrid Only")],
-    )
-    retriever = QdrantHybridRetriever(
-        client=client,
-        settings=_settings(),
-        registry=SearchSchemaRegistry.default(),
-        dense_encoder=RecordingDenseEncoder(),
-        query_builder=QueryTextBuilder(),
-    )
-
-    result = asyncio.run(
-        retriever.search(
-            query="no keyword candidates",
-            plan=PlannerOutput(
-                intent_summary="no keyword candidates",
-                retrieval_core=["missing"],
-                core_keywords=["missing"],
-            ),
-            query_filter=None,
-        ),
-    )
-
-    assert result.hits == []
-    assert len(_keyword_calls(client)) == 6
-    assert _hybrid_calls(client) == []
-    assert result.query_payload["retrieval_mode"] == "keyword_pool_then_hybrid"
-    assert result.query_payload["keyword_stage_candidate_count"] == 0
-    assert result.query_payload["hybrid_stage_skipped_reason"] == "keyword_stage_empty"
-    assert result.query_payload["aggregated_candidate_count"] == 0
-
-
-def test_retriever_skips_invalid_points_and_keeps_valid_hits():
-    payloads = [
-        {
-            "basic_info": {"researcher_id": "bad", "researcher_name": "Broken"},
-            "researcher_profile": {},
-            "publications": "broken payload",
-            "intellectual_properties": [],
-            "research_projects": [],
-        },
-        {
-            "basic_info": {"researcher_id": "good", "researcher_name": "Valid"},
-            "researcher_profile": {},
-            "publications": [{"publication_title": "Valid paper"}],
-            "intellectual_properties": [],
-            "research_projects": [],
-        },
-    ]
-    client = FakeQdrantClient(payloads=payloads)
-    retriever = QdrantHybridRetriever(
-        client=client,
-        settings=_settings(),
-        registry=SearchSchemaRegistry.default(),
-        dense_encoder=RecordingDenseEncoder(),
-        query_builder=QueryTextBuilder(),
-    )
-
-    result = asyncio.run(
-        retriever.search(
-            query="skip broken payloads",
-            plan=PlannerOutput(
-                intent_summary="skip broken payloads",
-                core_keywords=["valid"],
-            ),
-            query_filter=None,
-        ),
-    )
+    client = FakeGroupsClient([("M1", group_hits)])
+    retriever = _retriever(client, doc_type_priors={"specialty": 0.5})
+    result = _run(retriever)
 
     assert len(result.hits) == 1
-    assert result.hits[0].expert_id == "good"
-    assert len(result.retrieval_score_traces) == 1
-    assert result.retrieval_score_traces[0]["expert_id"] == "good"
+    assert result.hits[0].group_score == 0.8 * 1.0 + 0.4 * 0.5
 
 
-def test_retriever_uses_active_sparse_runtime_model_for_builtin_queries():
-    payloads = [
-        {
-            "basic_info": {"researcher_id": "1", "researcher_name": "Alpha"},
-            "researcher_profile": {},
-            "publications": [{"publication_title": "A paper"}],
-            "intellectual_properties": [],
-            "research_projects": [],
-        },
+def test_search_doc_type_chunk_cap_limits_score_contribution():
+    # 같은 (researcher, doc_type)에서 chunk가 cap보다 많아도 점수 기여는 cap개까지만.
+    hits = [(_chunk_payload("M1", "Prolific", doc_type="paper", chunk_index=i), 0.9) for i in range(5)]
+    client = FakeGroupsClient([("M1", hits)])
+    result = _run(_retriever(client, doc_type_chunk_cap=2))
+
+    assert len(result.hits) == 1
+    hit = result.hits[0]
+    assert len(hit.chunks) == 5  # evidence chunk는 모두 보관
+    # 점수 기여는 cap(2)개 × 0.9 = 1.8
+    assert hit.group_score == 0.9 * 2
+
+
+def test_search_skips_invalid_points():
+    hits = [
+        ({"researcher_id": "bad", "researcher_name": "Broken"}, 0.9),  # chunk_id/doc_type 없음
+        (_chunk_payload("good", "Valid"), 0.8),
     ]
-    client = FakeQdrantClient(payloads=payloads)
+    client = FakeGroupsClient([("good", hits)])
+    result = _run(_retriever(client))
+
+    assert len(result.hits) == 1
+    assert result.hits[0].researcher_id == "good"
+    assert len(result.hits[0].chunks) == 1  # 깨진 point는 skip
+
+
+def test_search_excludes_candidates_by_org():
+    client = FakeGroupsClient(
+        [
+            ("1", [(_chunk_payload("1", "Keep", organization="서울대학교"), 0.9)]),
+            ("2", [(_chunk_payload("2", "Drop", organization="한국전자통신연구원"), 0.9)]),
+        ]
+    )
+    retriever = _retriever(client)
+    result = asyncio.run(retriever.search(
+        query="exclude org",
+        plan=PlannerOutput(intent_summary="x", core_keywords=["x"], exclude_orgs=["한국전자통신연구원"]),
+        query_filter=None,
+    ))
+    ids = {hit.researcher_id for hit in result.hits}
+    assert ids == {"1"}
+    assert any(f["expert_id"] == "2" for f in result.filtered_out_candidates)
+
+
+def test_search_returns_empty_when_no_groups():
+    client = FakeGroupsClient([])
+    result = _run(_retriever(client))
+    assert result.hits == []
+    assert result.query_payload["group_count"] == 0
+
+
+def test_search_uses_active_sparse_runtime_model():
+    client = FakeGroupsClient([("M1", [(_chunk_payload("M1", "Alpha"), 0.9)])])
     retriever = QdrantHybridRetriever(
-        client=client,
-        settings=_settings(),
-        registry=SearchSchemaRegistry.default(),
-        dense_encoder=RecordingDenseEncoder(),
-        query_builder=QueryTextBuilder(),
+        client=client, settings=_settings(),
+        dense_encoder=RecordingDenseEncoder(), query_builder=QueryTextBuilder(),
         sparse_runtime=SparseRuntimeConfig(
-            backend="fastembed_builtin",
-            active_model_name="Qdrant/bm25",
-            requires_idf_modifier=True,
-            used_fallback=True,
+            backend="fastembed_builtin", active_model_name="Qdrant/bm25",
+            requires_idf_modifier=True, used_fallback=True,
         ),
     )
+    _run(retriever)
+    # sparse prefetch(Document)의 model이 활성 런타임 모델.
+    sparse_prefetch = client.calls[0]["prefetch"][1]
+    assert sparse_prefetch.query.model == "Qdrant/bm25"
 
-    asyncio.run(
-        retriever.search(
-            query="bm25 fallback query",
-            plan=PlannerOutput(
-                intent_summary="bm25 fallback query",
-                core_keywords=["bm25", "fallback"],
-            ),
-            query_filter=None,
-        )
-    )
 
-    sparse_models = [
-        call["prefetch"][1].query.model if "prefetch" in call else call["query"].model
-        for call in client.calls
-    ]
-    assert sparse_models == ["Qdrant/bm25"] * 12
+def test_search_weighted_is_grouped_alias():
+    client = FakeGroupsClient([("M1", [(_chunk_payload("M1", "Alpha"), 0.9)])])
+    retriever = _retriever(client)
+    result = asyncio.run(retriever.search_weighted(
+        query="weighted unified",
+        plan=PlannerOutput(intent_summary="x", retrieval_core=["alpha"], core_keywords=["alpha"]),
+        query_filter=None,
+    ))
+    assert [hit.researcher_id for hit in result.hits] == ["M1"]
+    assert result.query_payload["retrieval_mode"] == "grouped_hybrid_rrf"
+    assert len(client.calls) == 1  # grouped 단일 콜(가중 fan-out 폐기)

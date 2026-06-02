@@ -1,45 +1,113 @@
-"""WO-C C2: v2.0 schema_registry 상수(단일 벡터명·인덱스 세트·family) 검증 (additive)."""
+"""flat chunk schema_registry 상수(단일 벡터명·인덱스 세트·family) 검증 (v2.1)."""
 from __future__ import annotations
 
 from apps.search import schema_registry as sr
-from apps.search.doc_types import DOC_TYPES
+from apps.search.doc_types import DOC_TYPE_TO_FAMILY, DOC_TYPES
 
 
 def test_single_named_vectors():
-    assert sr.DENSE_VECTOR_NAME == "dense_e5i"
-    assert sr.SPARSE_VECTOR_NAME == "sparse_splade"
+    assert sr.DENSE_VECTOR_NAME == "vector_e5i"
+    assert sr.SPARSE_VECTOR_NAME == "vector_splade"
 
 
-def test_doc_types_and_families_reexported():
-    assert sr.DOC_TYPES_V2 == DOC_TYPES
+def test_dense_vector_geometry():
+    assert sr.DENSE_VECTOR_SIZE == 1024
+    assert sr.DENSE_DISTANCE == "Cosine"
+
+
+def test_doc_types_reexported_exactly_five():
+    assert sr.DOC_TYPES == DOC_TYPES
+    assert set(sr.DOC_TYPES) == {
+        "paper",
+        "patent",
+        "project",
+        "assessor_activity",
+        "specialty",
+    }
+
+
+def test_families_four_values():
     assert set(sr.FAMILIES) == {"identity", "achievement", "assessment", "expertise"}
-    assert set(sr.DOC_TYPE_TO_FAMILY_V2) == set(DOC_TYPES)
 
 
-def test_payload_index_fields_v2_shape():
-    paths = [path for path, _ in sr.PAYLOAD_INDEX_FIELDS_V2]
-    # 핵심 인덱스 존재
-    assert ("researcher_id", "keyword") in sr.PAYLOAD_INDEX_FIELDS_V2
-    assert ("doc_type", "keyword") in sr.PAYLOAD_INDEX_FIELDS_V2
-    assert ("event_year", "integer") in sr.PAYLOAD_INDEX_FIELDS_V2
-    assert ("event_date", "datetime") in sr.PAYLOAD_INDEX_FIELDS_V2
-    # 8 researcher_meta count 전부 integer 인덱스
+def test_doc_type_to_family_map_covers_all_doc_types():
+    assert set(sr.DOC_TYPE_TO_FAMILY_MAP) == set(DOC_TYPES)
+    assert sr.DOC_TYPE_TO_FAMILY_MAP == dict(DOC_TYPE_TO_FAMILY)
+    # achievement = {paper, patent, project}
+    assert sr.DOC_TYPE_TO_FAMILY_MAP["paper"] == "achievement"
+    assert sr.DOC_TYPE_TO_FAMILY_MAP["patent"] == "achievement"
+    assert sr.DOC_TYPE_TO_FAMILY_MAP["project"] == "achievement"
+    assert sr.DOC_TYPE_TO_FAMILY_MAP["assessor_activity"] == "assessment"
+    assert sr.DOC_TYPE_TO_FAMILY_MAP["specialty"] == "expertise"
+    # identity has no doc_type member
+    assert "identity" not in sr.DOC_TYPE_TO_FAMILY_MAP.values()
+
+
+def test_filterable_fields_are_flat_keys():
+    # flat root keys present
+    for field in (
+        "researcher_id",
+        "doc_type",
+        "doc_date",
+        "affiliated_organization",
+        "highest_degree",
+        "publication_count",
+        "scie_publication_count",
+        "intellectual_property_count",
+        "research_project_count",
+        "researcher_assessor_activity_count",
+    ):
+        assert field in sr.FILTERABLE_FIELDS
+    # doc_attrs.* keys present
+    assert "doc_attrs.indexing_database" in sr.FILTERABLE_FIELDS
+    assert "doc_attrs.is_scie" in sr.FILTERABLE_FIELDS
+    # no v1.x nested[] residue, no v2.0-doc'd event_year/researcher_meta keys
+    for field in sr.FILTERABLE_FIELDS:
+        assert "[]" not in field
+    assert "event_year" not in sr.FILTERABLE_FIELDS
+    assert "event_date" not in sr.FILTERABLE_FIELDS
+    assert not any(f.startswith("researcher_meta.") for f in sr.FILTERABLE_FIELDS)
+
+
+def test_payload_index_fields_shape():
+    paths = [path for path, _ in sr.PAYLOAD_INDEX_FIELDS]
+    # core keyword indexes
+    assert ("researcher_id", "keyword") in sr.PAYLOAD_INDEX_FIELDS
+    assert ("doc_type", "keyword") in sr.PAYLOAD_INDEX_FIELDS
+    assert ("affiliated_organization", "keyword") in sr.PAYLOAD_INDEX_FIELDS
+    assert ("highest_degree", "keyword") in sr.PAYLOAD_INDEX_FIELDS
+    # 5 flat count fields are integer indexes
     for count in (
         "publication_count",
         "scie_publication_count",
         "intellectual_property_count",
         "research_project_count",
-        "researcher_assessor_count",
-        "expert_assessor_count",
+        "researcher_assessor_activity_count",
     ):
-        assert (f"researcher_meta.{count}", "integer") in sr.PAYLOAD_INDEX_FIELDS_V2
-    # nested(v1.x) 잔재 없음
+        assert (count, "integer") in sr.PAYLOAD_INDEX_FIELDS
+    # recency is a flat datetime field on doc_date (not event_date/event_year)
+    assert ("doc_date", "datetime") in sr.PAYLOAD_INDEX_FIELDS
+    assert ("event_date", "datetime") not in sr.PAYLOAD_INDEX_FIELDS
+    assert ("event_year", "integer") not in sr.PAYLOAD_INDEX_FIELDS
+    # no nested(v1.x) residue, no researcher_meta nesting
     assert not any("[]" in path for path in paths)
-    # 인덱스 대상은 모두 필터 가능 키 집합에 포함
-    assert set(paths) <= sr.FILTERABLE_FIELDS_V2
+    assert not any(path.startswith("researcher_meta.") for path in paths)
 
 
-def test_v1x_constants_still_present_non_destructive():
-    # C3에서 제거될 때까지 v1.x 상수 보존
-    assert sr.BRANCHES == ("basic", "art", "pat", "pjt")
-    assert "basic_vector_e5i" in sr.DENSE_VECTOR_BY_BRANCH.values()
+def test_payload_index_subset_of_filterable():
+    paths = {path for path, _ in sr.PAYLOAD_INDEX_FIELDS}
+    assert paths <= sr.FILTERABLE_FIELDS
+
+
+def test_v1x_branch_constants_removed():
+    for removed in (
+        "BRANCHES",
+        "DENSE_VECTOR_BY_BRANCH",
+        "SPARSE_VECTOR_BY_BRANCH",
+        "SearchSchemaRegistry",
+        "DOC_TYPES_V2",
+        "DOC_TYPE_TO_FAMILY_V2",
+        "FILTERABLE_FIELDS_V2",
+        "PAYLOAD_INDEX_FIELDS_V2",
+    ):
+        assert not hasattr(sr, removed), f"{removed} should be removed from schema_registry"

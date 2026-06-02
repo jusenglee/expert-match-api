@@ -13,14 +13,13 @@ from apps.api.main import build_dense_encoder
 from apps.core.config import Settings
 from apps.core.feedback_store import FeedbackStore
 from apps.recommendation.cards import CandidateCardBuilder
-from apps.recommendation.evidence_selector import KeywordEvidenceSelector
+from apps.recommendation.evidence_selector import PassthroughEvidenceSelector
 from apps.recommendation.planner import OpenAICompatPlanner
 from apps.recommendation.reasoner import OpenAICompatReasonGenerator
 from apps.recommendation.service import RecommendationService
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.query_builder import QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
-from apps.search.schema_registry import SearchSchemaRegistry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("evaluator")
@@ -35,7 +34,6 @@ GOLDEN_DATA = [
 async def evaluate() -> None:
     settings = Settings()
     client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
-    registry = SearchSchemaRegistry.default()
     dense_encoder = build_dense_encoder(settings)
 
     service = RecommendationService(
@@ -43,13 +41,12 @@ async def evaluate() -> None:
         retriever=QdrantHybridRetriever(
             client=client,
             settings=settings,
-            registry=registry,
             dense_encoder=dense_encoder,
             query_builder=QueryTextBuilder(),
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
-        evidence_selector=KeywordEvidenceSelector(),
+        evidence_selector=PassthroughEvidenceSelector(),
         reason_generator=OpenAICompatReasonGenerator(settings),
         feedback_store=FeedbackStore(settings.feedback_db_path, settings.feedback_table),
     )

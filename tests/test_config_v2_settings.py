@@ -1,4 +1,4 @@
-"""WO-C C1: v2.0 chunk 모델 설정 default 검증 (additive·비파괴)."""
+"""flat 계약(v2.1): apps.core.config.Settings default 검증."""
 from __future__ import annotations
 
 from apps.core.config import Settings
@@ -9,7 +9,7 @@ def test_v2_settings_defaults():
     # 집계/리랭커 HARD 기본값
     assert s.doc_type_priors is None          # 미설정 = equal (ADR 0005 §2)
     assert s.candidate_reranker == "off"      # 후보 리랭커 기본 OFF (ADR 0005 §3)
-    assert s.retrieval_doc_types is None      # 미설정 = 전체 11종 (ADR 0003)
+    assert s.retrieval_doc_types is None      # 미설정 = 전체 5종 (ADR 0003)
     assert s.doc_type_chunk_cap == 3
     assert s.evidence_family_cap == {
         "achievement": 10,
@@ -34,9 +34,11 @@ def test_v2_settings_env_override(monkeypatch):
     assert s.doc_type_chunk_cap == 5
 
 
-def test_v1x_settings_still_present():
-    """비파괴 확인: v1.x 설정이 그대로 존재(소비 코드 전환 전까지 유지)."""
+def test_flat_collection_and_pipeline_defaults():
+    """flat 단일 벡터 컬렉션 default 및 검색 파이프라인 한계."""
     s = Settings()
-    assert s.qdrant_collection_name == "researcher_recommend_proto"
-    assert s.branch_prefetch_limit == 100
-    assert s.branch_output_limit == 40
+    # flat chunk 모델 단일 벡터 컬렉션 (레거시 researcher_recommend_proto 폐기)
+    assert s.qdrant_collection_name == "researcher_recommend_v1"
+    assert s.embedding_vector_size == 1024
+    assert s.prefetch_limit == 256
+    assert s.group_size == 10

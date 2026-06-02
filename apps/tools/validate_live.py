@@ -13,7 +13,6 @@ from apps.core.config import get_settings
 from apps.core.runtime_validation import validate_runtime_settings
 from apps.search.encoders import SpladeSparseEncoder
 from apps.search.live_validator import LiveContractValidator
-from apps.search.schema_registry import SearchSchemaRegistry
 from apps.search.sparse_runtime import (
     prepare_sparse_runtime_environment,
     resolve_sparse_runtime,
@@ -47,7 +46,6 @@ def main() -> int:
     validator = LiveContractValidator(
         client=client,
         settings=settings,
-        registry=SearchSchemaRegistry.default(),
         sparse_runtime=sparse_runtime,
     )
     

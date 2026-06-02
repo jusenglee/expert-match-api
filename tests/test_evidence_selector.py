@@ -1,207 +1,161 @@
-import pytest
+"""flat-contract (v2.1) tests for PassthroughEvidenceSelector.
 
-from apps.domain.models import (
-    CandidateCard,
-    IntellectualPropertyEvidence,
-    PlannerOutput,
-    PublicationEvidence,
-    ResearchProjectEvidence,
+검색(query_points_groups)이 이미 연구자별 chunk를 하이브리드 RRF 관련도순으로 모으므로, 기본 selector는
+lexical 재랭크 없이 CandidateCard.evidence_by_type을 doc_type별로 묶고 family cap만 적용해 그대로 노출한다.
+각 항목은 item_id == chunk_id, rerank_source == "passthrough", 점수순(match_score=chunk score) 정렬.
+"""
+from __future__ import annotations
+
+from apps.domain.models import CandidateCard, ChunkEvidence, PlannerOutput
+from apps.recommendation.evidence_selector import (
+    PassthroughEvidenceSelector,
+    RelevantEvidenceBundle,
 )
-from apps.recommendation.evidence_selector import KeywordEvidenceSelector
-
-# WO-0: 아래 테스트들은 514403e "검색 로직 변경 - 설계 변경"으로 제거/변경된 구설계
-# (must_aspects/aspect_coverage 등)를 검증하는 stale 테스트다. WO-C에서 재작성/제거 예정.
-_WOC_STALE = pytest.mark.xfail(
-    reason="WO-C 이연: 514403e 설계 변경으로 superseded된 구설계 검증(stale). WO-C에서 재작성/제거.",
-    strict=False,
-)
+from apps.search.doc_types import DOC_TYPES, FAMILY_EVIDENCE_CAP
 
 
-def _plan(*aspects: str, generic_terms: list[str] | None = None) -> PlannerOutput:
-    return PlannerOutput(
-        intent_summary="test",
-        core_keywords=list(aspects),
-        retrieval_core=list(aspects),
-        must_aspects=list(aspects),
-        generic_terms=list(generic_terms or []),
+def _plan(*keywords: str) -> PlannerOutput:
+    return PlannerOutput(intent_summary="test", core_keywords=list(keywords), retrieval_core=list(keywords))
+
+
+def _evidence(
+    *,
+    chunk_id: str,
+    doc_type: str,
+    title: str | None = None,
+    date: str | None = None,
+    snippet: str = "",
+    doc_attrs: dict | None = None,
+    score: float = 0.0,
+) -> ChunkEvidence:
+    return ChunkEvidence(
+        chunk_id=chunk_id, doc_type=doc_type, title=title, date=date,
+        snippet=snippet, doc_attrs=doc_attrs or {}, score=score,
     )
 
 
-def _candidate_card() -> CandidateCard:
+def _card(expert_id: str = "1", **evidence_by_type: list[ChunkEvidence]) -> CandidateCard:
     return CandidateCard(
-        expert_id="1",
-        name="Alpha",
-        top_papers=[],
-        top_projects=[],
-        top_patents=[],
+        expert_id=expert_id, name="Alpha", organization="LabX", degree="박사",
+        counts={}, evidence_by_type=dict(evidence_by_type),
     )
 
 
-@_WOC_STALE
-def test_selector_matches_whitespace_variants_in_project_titles():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_projects = [
-        ResearchProjectEvidence(
-            project_title_korean="AI  semiconductor process platform",
-            project_end_date="2025-12-31",
-            research_objective_summary="Process optimization",
-        )
-    ]
+def test_passthrough_sets_item_id_to_chunk_id_and_source():
+    selector = PassthroughEvidenceSelector()
+    card = _card(paper=[_evidence(chunk_id="paper_100000045256_c000", doc_type="paper",
+                                  title="Medical Imaging", date="2024-01", score=0.9)])
+    bundle = selector.select(candidates=[card], plan=_plan("medical imaging"))["1"]
 
-    bundles = selector.select(candidates=[card], plan=_plan("AI semiconductor"))
-
-    assert bundles["1"].projects[0].title == "AI  semiconductor process platform"
-    assert bundles["1"].projects[0].matched_keywords == ["ai semiconductor"]
-    assert bundles["1"].direct_match_count == 1
-    assert bundles["1"].aspect_coverage == 1
+    assert isinstance(bundle, RelevantEvidenceBundle)
+    paper = bundle.papers[0]
+    assert paper.item_id == "paper_100000045256_c000"  # ADR-0004
+    assert paper.type == "paper"
+    assert paper.rerank_source == "passthrough"
+    assert paper.title == "Medical Imaging"
+    assert paper.match_score == 0.9
 
 
-def test_selector_is_case_insensitive_for_english_keywords():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_papers = [
-        PublicationEvidence(
-            publication_title="Medical Imaging Assessment for CT",
-            publication_year_month="2024-01",
-            abstract="Emergency imaging workflow",
-        )
-    ]
-
-    bundles = selector.select(candidates=[card], plan=_plan("medical imaging"))
-
-    assert bundles["1"].papers[0].title == "Medical Imaging Assessment for CT"
-    assert bundles["1"].papers[0].matched_keywords == ["medical imaging"]
-    assert bundles["1"].papers[0].item_id == "paper:0"
+def test_passthrough_preserves_all_evidence_without_keyword_filter():
+    # 키워드와 무관하게 모든 evidence 보존(검색이 이미 관련도 선별).
+    selector = PassthroughEvidenceSelector()
+    card = _card(paper=[
+        _evidence(chunk_id="paper_1_c000", doc_type="paper", title="unrelated cooking", score=0.7),
+        _evidence(chunk_id="paper_2_c000", doc_type="paper", title="soft robotics", score=0.6),
+    ])
+    bundle = selector.select(candidates=[card], plan=_plan("medical imaging"))["1"]
+    assert {p.item_id for p in bundle.papers} == {"paper_1_c000", "paper_2_c000"}
 
 
-@_WOC_STALE
-def test_selector_excludes_irrelevant_newer_evidence():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_papers = [
-        PublicationEvidence(
-            publication_title="Soft robot manipulation",
-            publication_year_month="2026-01",
-            abstract="Anthropomorphic hand control",
-        ),
-        PublicationEvidence(
-            publication_title="Medical imaging segmentation for emergency CT",
-            publication_year_month="2022-05",
-            abstract="Imaging triage support",
-        ),
-    ]
-
-    bundles = selector.select(candidates=[card], plan=_plan("medical imaging"))
-
-    assert [item.title for item in bundles["1"].papers] == [
-        "Medical imaging segmentation for emergency CT"
-    ]
-    assert bundles["1"].direct_match_count == 1
+def test_passthrough_orders_by_score_desc():
+    selector = PassthroughEvidenceSelector()
+    card = _card(paper=[
+        _evidence(chunk_id="paper_lo_c000", doc_type="paper", title="low", score=0.3),
+        _evidence(chunk_id="paper_hi_c000", doc_type="paper", title="high", score=0.95),
+        _evidence(chunk_id="paper_mid_c000", doc_type="paper", title="mid", score=0.6),
+    ])
+    bundle = selector.select(candidates=[card], plan=_plan())["1"]
+    assert [p.item_id for p in bundle.papers] == ["paper_hi_c000", "paper_mid_c000", "paper_lo_c000"]
 
 
-@_WOC_STALE
-def test_selector_deduplicates_same_title_and_year():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_projects = [
-        ResearchProjectEvidence(
-            project_title_korean="AI semiconductor process platform",
-            project_end_date="2025-12-31",
-            research_objective_summary="Process optimization",
-        ),
-        ResearchProjectEvidence(
-            project_title_korean="AI semiconductor process platform",
-            project_end_date="2025-06-01",
-            research_objective_summary="Duplicate title same year",
-        ),
-    ]
-
-    bundles = selector.select(candidates=[card], plan=_plan("AI semiconductor"))
-
-    assert len(bundles["1"].projects) == 1
-    assert bundles["1"].dedup_dropped_count == 1
+def test_family_cap_limits_achievement_to_ten():
+    cap = FAMILY_EVIDENCE_CAP["achievement"]
+    assert cap == 10
+    selector = PassthroughEvidenceSelector()
+    papers = [_evidence(chunk_id=f"paper_{i}_c000", doc_type="paper", title=f"s{i}", score=1.0 - i * 0.01)
+              for i in range(cap + 5)]
+    bundle = selector.select(candidates=[_card(paper=papers)], plan=_plan())["1"]
+    assert len(bundle.papers) == cap
+    # 상위 점수 cap개만 유지.
+    assert bundle.papers[0].item_id == "paper_0_c000"
 
 
-@_WOC_STALE
-def test_selector_caps_selected_evidence_and_tracks_aspect_coverage():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_papers = [
-        PublicationEvidence(
-            publication_title=f"Medical imaging paper {index}",
-            publication_year_month=f"2024-{index:02d}",
-            abstract="Emergency CT workflow",
-        )
-        for index in range(1, 6)
-    ]
-    card.top_projects = [
-        ResearchProjectEvidence(
-            project_title_korean=f"Emergency CT project {index}",
-            project_end_date=f"2024-{index:02d}-01",
-            research_objective_summary="Medical imaging support",
-        )
-        for index in range(1, 6)
-    ]
-    card.top_patents = [
-        IntellectualPropertyEvidence(
-            intellectual_property_title=f"medical imaging emergency ct patent {index}",
-            application_date=f"2024-{index:02d}-01",
-        )
-        for index in range(1, 6)
-    ]
+def test_family_cap_limits_assessment_and_expertise_to_six():
+    assert FAMILY_EVIDENCE_CAP["assessment"] == 6
+    assert FAMILY_EVIDENCE_CAP["expertise"] == 6
+    selector = PassthroughEvidenceSelector()
+    assessor = [_evidence(chunk_id=f"assessor_activity_{i}_c000", doc_type="assessor_activity", title=f"a{i}", score=0.5)
+                for i in range(12)]
+    specialty = [_evidence(chunk_id=f"specialty_{i}_c000", doc_type="specialty", title=f"s{i}", score=0.5)
+                 for i in range(12)]
+    bundle = selector.select(candidates=[_card(assessor_activity=assessor, specialty=specialty)], plan=_plan())["1"]
+    assert len(bundle.items_of("assessor_activity")) == 6
+    assert len(bundle.items_of("specialty")) == 6
 
-    bundles = selector.select(
-        candidates=[card],
-        plan=_plan("medical imaging", "emergency ct"),
+
+def test_custom_family_cap_overrides_default():
+    selector = PassthroughEvidenceSelector(
+        family_cap={"achievement": 2, "assessment": 6, "expertise": 6, "identity": 1}
     )
+    papers = [_evidence(chunk_id=f"paper_{i}_c000", doc_type="paper", title=f"s{i}", score=1.0 - i * 0.01)
+              for i in range(8)]
+    bundle = selector.select(candidates=[_card(paper=papers)], plan=_plan())["1"]
+    assert len(bundle.papers) == 2
 
-    assert len(bundles["1"].all_items()) <= 4
-    assert bundles["1"].aspect_coverage == 2
-    assert set(bundles["1"].matched_aspects) == {"medical imaging", "emergency ct"}
-    assert selector.last_trace["candidate_evidence_counts"][0]["total"] <= 4
+
+def test_all_five_doc_types_are_bucketed():
+    selector = PassthroughEvidenceSelector()
+    evidence_by_type = {
+        doc_type: [_evidence(chunk_id=f"{doc_type}_1_c000", doc_type=doc_type, title="t", score=0.5)]
+        for doc_type in DOC_TYPES
+    }
+    bundle = selector.select(candidates=[_card(**evidence_by_type)], plan=_plan())["1"]
+    assert set(bundle.by_doc_type.keys()) == set(DOC_TYPES)
+    assert bundle.items_of("assessor_activity")[0].item_id == "assessor_activity_1_c000"
+    assert bundle.items_of("specialty")[0].item_id == "specialty_1_c000"
+    assert len(bundle.by_item_id()) == len(DOC_TYPES)
 
 
-@_WOC_STALE
-def test_selector_marks_generic_only_candidates_without_direct_evidence():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_papers = [
-        PublicationEvidence(
-            publication_title="Research experience overview",
-            publication_year_month="2024-01",
-            abstract="Long experience in multiple domains",
-        )
-    ]
-
-    bundles = selector.select(
-        candidates=[card],
-        plan=_plan("medical imaging", generic_terms=["experience"]),
+def test_detail_is_derived_from_doc_attrs_per_doc_type():
+    selector = PassthroughEvidenceSelector()
+    card = _card(
+        paper=[_evidence(chunk_id="paper_1_c000", doc_type="paper", title="t",
+                         doc_attrs={"journal_name": "Nature Imaging"}, score=0.5)],
+        project=[_evidence(chunk_id="project_1_c000", doc_type="project", title="t",
+                           doc_attrs={"performing_organization": "KAIST"}, score=0.5)],
     )
-
-    assert bundles["1"].papers == []
-    assert bundles["1"].generic_only is True
-    assert bundles["1"].direct_match_count == 0
-    assert selector.last_trace["empty_candidate_ids"] == ["1"]
+    bundle = selector.select(candidates=[card], plan=_plan())["1"]
+    assert bundle.papers[0].detail == "Nature Imaging"
+    assert bundle.projects[0].detail == "KAIST"
 
 
-@_WOC_STALE
-def test_selector_keeps_future_projects_and_traces_future_selected_evidence():
-    selector = KeywordEvidenceSelector(reference_year=2026)
-    card = _candidate_card()
-    card.top_projects = [
-        ResearchProjectEvidence(
-            project_title_korean="Medical imaging platform",
-            project_end_date="2030-12-31",
-            research_objective_summary="Medical imaging workflow",
-        )
-    ]
+def test_title_falls_back_to_chunk_id_when_missing():
+    selector = PassthroughEvidenceSelector()
+    card = _card(specialty=[_evidence(chunk_id="specialty_42_c000", doc_type="specialty",
+                                      title=None, snippet="", score=0.5)])
+    item = selector.select(candidates=[card], plan=_plan())["1"].items_of("specialty")[0]
+    assert item.title == "specialty_42_c000"
+    assert item.item_id == "specialty_42_c000"
 
-    bundles = selector.select(candidates=[card], plan=_plan("medical imaging"))
 
-    assert bundles["1"].projects[0].is_future_item is True
-    assert bundles["1"].future_selected_evidence_ids == ["project:0"]
-    assert (
-        selector.last_trace["candidate_evidence_counts"][0]["future_selected_evidence_ids"]
-        == ["project:0"]
-    )
+def test_trace_records_passthrough_mode_and_empty_candidates():
+    selector = PassthroughEvidenceSelector()
+    has = _card("1", paper=[_evidence(chunk_id="paper_1_c000", doc_type="paper", title="t", score=0.5)])
+    empty = _card("2")  # no evidence
+    bundles = selector.select(candidates=[has, empty], plan=_plan())
+    assert bundles["2"].all_items() == []
+    trace = selector.last_trace
+    assert trace["mode"] == "passthrough"
+    assert trace["empty_candidate_ids"] == ["2"]
+    counts = {c["expert_id"]: c["total"] for c in trace["candidate_evidence_counts"]}
+    assert counts == {"1": 1, "2": 0}
