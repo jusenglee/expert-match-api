@@ -11,7 +11,7 @@
 - family: achievement={paper,patent,project} / assessment={assessor_activity} /
           expertise={specialty} / identity=합성(전용 doc_type 없음, root 필드로 구성)
 
-근거: apps/docs/architecture/DATA_MODEL.md, ADR/0002(Point ID==chunk_id), ADR/0004(evidence=chunk_id)
+근거: apps/docs/architecture/DATA_MODEL.md, ADR/0002(chunk-level point model), ADR/0004(evidence=chunk_id)
 """
 from __future__ import annotations
 
@@ -92,7 +92,8 @@ assert set(FAMILY_EVIDENCE_CAP) == set(Family), "FAMILY_EVIDENCE_CAP는 4 family
 # chunk_id 코덱
 #   형식: <doc_type>_<doc_num>_c<NNN>    (예: paper_100000045256_c000)
 #   doc_id: <doc_type>_<doc_num>          (예: paper_100000045256)
-#   계약: ① 결정성(같은 chunk → 같은 id) ② 전역 유일성 ③ 멱등 upsert(Point ID==chunk_id)
+#   계약: ① 결정성(같은 chunk → 같은 id) ② 전역 유일성 ③ payload evidence id
+#   참고: Point ID로 chunk_id를 쓰면 멱등 upsert가 쉬우나 런타임은 payload.chunk_id를 기준으로 한다.
 # ---------------------------------------------------------------------------
 
 #: chunk_index zero-pad 자릿수(샘플 c000과 일치).

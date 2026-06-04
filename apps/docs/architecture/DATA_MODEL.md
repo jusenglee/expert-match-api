@@ -26,17 +26,18 @@ payload는 **FLAT**이다. 연구자 공통 메타는 payload **ROOT에 비정�
 |---|---|---|
 | 컬렉션 이름 | `ntis_researcher_chunks` (기본값) | `NTIS_QDRANT_COLLECTION_NAME`으로 override. 구 `researcher_recommend_proto`는 레거시 v1.x(blue/green 가드로 보호, 절대 재생성 안 함) |
 | Point 단위 | **chunk 1개 = Point 1개** | nested 배열 없음. 한 연구자 = 다수 Point |
-| Point ID | `chunk_id` 문자열 그대로 (예: `paper_100000045256_c000`) | 결정론적 ID → upsert 멱등성 + evidence 참조 안정성 |
+| Payload evidence ID | root `chunk_id` 문자열 (예: `paper_100000045256_c000`) | 런타임 evidence resolve/trace의 authoritative id |
+| Point ID | `chunk_id` 권장, UUID 허용 | 멱등 적재에는 `chunk_id`가 유리하나, 런타임은 payload `chunk_id`를 기준으로 동작 |
 | Named vector | `vector_e5i` (dense) + `vector_splade` (sparse) **각 1개** | doc_type별 named vector를 두지 않는다. doc_type은 **payload 필터** |
 | 거리 함수 | dense: **Cosine** (1024차원) | multilingual-e5-large-instruct 권장 |
 
-### 1.1 Point ID를 `chunk_id`로 고정하는 이유
+### 1.1 payload `chunk_id`를 evidence id로 고정하는 이유
 
-- **멱등 적재:** 같은 chunk를 다시 적재해도 같은 Point를 덮어쓴다(중복 Point 방지). 재적재·증분 적재가 안전하다.
+- **멱등 적재:** Point ID를 `chunk_id`로 쓰면 같은 chunk를 다시 적재해도 같은 Point를 덮어쓴다(중복 Point 방지). 재적재·증분 적재가 안전하다.
 - **evidence 참조 안정성:** LLM이 고른 근거를 `chunk_id`로 그대로 참조한다. 과거 `paper:0` 같은 **배열 인덱스 기반 id가 사라진다** — 인덱스는 직렬화 순서가 바뀌면 깨지지만 `chunk_id`는 불변이다. ([`api/REASONER_RUNTIME_POLICY.md`](../api/REASONER_RUNTIME_POLICY.md) 참조)
-- **운영 추적성:** trace/로그에 찍힌 id를 Qdrant에서 바로 조회할 수 있다.
+- **운영 추적성:** trace/로그의 evidence id는 payload `chunk_id`다. Qdrant Point ID가 UUID인 운영 컬렉션도 허용하되, 조회·비교·dedupe는 payload `chunk_id`로 수행한다.
 
-> **HARD 제약 — evidence 참조 id == `chunk_id`.** LLM은 후보를 재정렬/탈락/생성하지 않으며, 근거 인용 id는 반드시 컬렉션의 `chunk_id`여야 한다.
+> **HARD 제약 — evidence 참조 id == payload `chunk_id`.** LLM은 후보를 재정렬/탈락/생성하지 않으며, 근거 인용 id는 반드시 payload root의 `chunk_id`여야 한다. Point ID는 `chunk_id`일 수도 있고 UUID일 수도 있다.
 
 ---
 
@@ -69,7 +70,7 @@ payload는 **2개 영역**만 갖는다: (A) ROOT 평탄 필드(공통 식별 + 
 | `researcher_name` | keyword | — | 성명 (동점 정렬 보조) |
 | `doc_type` | keyword | ✅ keyword | **5종 중 하나**. 검색 분기·faceting의 핵심 (§4) |
 | `doc_id` | keyword | — | 문서 식별자 `<doc_type>_<숫자doc_id>` (예: `paper_100000045256`) |
-| `chunk_id` | keyword | (= Point ID) | chunk 식별자. evidence 참조 단위 (예: `paper_100000045256_c000`) |
+| `chunk_id` | keyword | ✅ keyword 권장 | authoritative chunk/evidence 식별자 (예: `paper_100000045256_c000`). Point ID와 다를 수 있다 |
 | `chunk_text` | text | (선택) full-text | 임베딩 입력 원문. 운영 full-text 매칭이 필요하면 text index |
 | `doc_date` | string | ✅ datetime | **도메인 통합 단일 대표 일자.** 결측은 `"NONE"`(또는 빈값)일 수 있다. recency 필터의 유일 기준 (§3.4) |
 
@@ -194,7 +195,7 @@ doc_type은 **정확히 5종**이며, 검색·집계·evidence에서 일관되�
 
 외부 적재 제공자가 보장해야 하는 불변식. 위반 시 검색·필터가 비결정적이 된다.
 
-1. **Point ID == `chunk_id`** 이고 컬렉션 전역에서 유일하다.
+1. **payload root `chunk_id`가 컬렉션 전역에서 유일**하다. Point ID는 `chunk_id` 사용을 권장하지만 UUID도 허용한다.
 2. `chunk_id`는 코덱 `<doc_type>_<숫자doc_id>_c<NNN>`(3자리 zero-pad)을 따르고, `doc_id == <doc_type>_<숫자doc_id>`다.
 3. 한 `researcher_id`의 모든 chunk에서 ROOT 공통 메타(`researcher_name`·소속·학위·count 5종)가 **동일**하다.
 4. `doc_type`은 정의된 **5종** enum(`paper`/`patent`/`project`/`assessor_activity`/`specialty`) 중 하나다.
@@ -223,7 +224,7 @@ doc_type은 **정확히 5종**이며, 검색·집계·evidence에서 일관되�
 | `tags` / `chunk_text_len`(구 초안) | 없음 |
 | split `researcher_assessor_count` + `expert_assessor_count`(구 초안) | 단일 `researcher_assessor_activity_count` |
 | `basic_info.researcher_id` (root) | `researcher_id` (ROOT, 모든 chunk) |
-| evidence id `paper:0` | evidence id = `chunk_id` |
+| evidence id `paper:0` | evidence id = payload `chunk_id` |
 
 전체 단계별 전환 계획은 [`../plans/MIGRATION_PLAN.md`](../plans/MIGRATION_PLAN.md).
 
@@ -238,4 +239,4 @@ doc_type은 **정확히 5종**이며, 검색·집계·evidence에서 일관되�
 - **다중 doc_type recency는 OR(`min_should`).** AND 결합 금지(0건 회귀 방지).
 - **LLM은 후보를 재정렬·탈락·생성하지 않는다.** 주어진 후보 집합 위에서 근거를 인용해 판단만 한다.
 - **embedding 텍스트는 role/action 불용어를 배제한다.**
-- **evidence 참조 id == `chunk_id`.**
+- **evidence 참조 id == payload `chunk_id`.**

@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 MAX_PLANNER_ATTEMPTS = 2
 
 
-PLANNER_VERSION = "v0.4.1"
+PLANNER_VERSION = "v0.5.0"  # concept_specs(동적 Concept Evidence Plan) 추가 — 캐시 무효화
 
 
 class Planner(Protocol):
@@ -124,7 +124,8 @@ class OpenAICompatPlanner:
 
     def __init__(self, settings: Settings, cache: PlanCache | None = None) -> None:
         self.settings = settings
-        self.fallback = HeuristicPlanner()
+        # LLM 실패 fallback은 plan() 내장 fallback_broad_search 경로를 쓴다(HeuristicPlanner는
+        # llm_backend=='heuristic'일 때 main.py가 직접 주입). 여기서 인스턴스를 들고 있지 않는다.
         self.model = OpenAICompatChatModel(
             model_name=settings.llm_model_name,
             base_url=settings.llm_base_url,
@@ -147,6 +148,7 @@ class OpenAICompatPlanner:
                 - `action_terms`: "추천", "찾아줘", "선정해줘" 등 사용자가 요청한 행동 용어 리스트.
                 - `intent_flags`: 검색 의도에 대한 플래그 (예: "need_experience": true, "prefer_recent": true 등).
                 - `intent_summary`: UI/추적용 짧은 요약 문장.
+                - `concept_specs`: 질의의 핵심 기술/도메인 개념 목록(검색·검증 용어 분리). 상세는 아래 [Concept Evidence Plan].
 
                 # 규칙
                 1. 사용자 질의의 주 언어를 유지하세요. 번역하거나 언어를 섞지 마세요.
@@ -157,8 +159,25 @@ class OpenAICompatPlanner:
                 4-1. **대상 기관 vs 소속 기관 구분**: "X에서 수행한 과제를 심사", "X 사업 평가", "X 과제 ~" 처럼 기관 X 가 *심사/평가 대상*으로 등장하는 경우, X 는 `include_orgs`에 넣지 말고 `semantic_query`의 맥락으로만 유지하세요. "X 소속 ~", "X 출신 ~" 처럼 명시적으로 소속을 지정한 경우만 `include_orgs`에 넣습니다.
                 5. 명시적으로 지원되는 구조화 필터만 `hard_filters`에 복사하세요.
                 6. 안전한 도메인 키워드가 없으면 `retrieval_core`는 빈 리스트로 반환하세요.
-                7. JSON만 반환하세요. 마크다운 펜스, 설명문, 숨겨진 추론은 포함하지 마세요.
-                
+                7. (Solar 추론) 내부적으로 단계적으로 추론하되, 최종 출력은 JSON 객체 **하나만** 반환하세요. 마크다운 펜스, 설명문, 추론 과정을 출력에 포함하지 마세요.
+
+                # [Concept Evidence Plan] (concept_specs 생성 규칙)
+                질의에서 핵심 기술/도메인 개념(concept)을 뽑고, concept마다 아래 용어를 **분리**해 생성하세요.
+                AI/반도체에 한정하지 마세요 — 배터리/바이오/로봇/양자 등 어떤 도메인이든 동일 규칙으로 만드세요.
+                - id: 영문 snake_case 식별자 (예: "ai", "semiconductor", "solid_state_battery").
+                - label: 한글 대표어.
+                - role: 질의가 반드시 요구하면 "required", 부가/선택이면 "optional".
+                - query_terms: 검색(recall)용 대표 검색어 — 최대 8개.
+                - evidence_terms: 개념을 '확정'하는 분별력 있는 용어(고유명사·전문용어·약어). 문서에 직접 등장하면 그 개념으로 확정됨 — 최대 12개.
+                - weak_terms: 단독으로는 근거가 약한 연관어(확정 근거 아님) — 최대 12개.
+
+                [필수 규칙]
+                - evidence_terms와 weak_terms를 반드시 구분하세요. "지능형/스마트/시스템/산업/개발/소재/센서/경험/연구" 같은
+                  일반·약한 단어는 evidence_terms에 절대 넣지 말고 weak_terms에 넣으세요(거짓 확정 방지).
+                - concept은 최대 5개. 질의에 명시된 기술/도메인만 만드세요. 역할어/행위어는 concept이 아닙니다.
+                - 영문 약어(AI/NPU/ADAS 등)는 그 자체로 분별력이 있을 때만 evidence_terms에 넣으세요.
+                - 도메인 개념이 없으면 concept_specs는 빈 배열 [] 로 두세요.
+
                 # 출력 스키마
                 {
                   "intent_summary": "string",
@@ -170,7 +189,11 @@ class OpenAICompatPlanner:
                   "hard_filters": {},
                   "include_orgs": ["string"],
                   "exclude_orgs": ["string"],
-                  "top_k": integer
+                  "top_k": integer,
+                  "concept_specs": [
+                    {"id": "string", "label": "string", "role": "required|optional",
+                     "query_terms": ["string"], "evidence_terms": ["string"], "weak_terms": ["string"]}
+                  ]
                 }
             
                 # 예시
@@ -194,7 +217,17 @@ class OpenAICompatPlanner:
                   "hard_filters": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
-                  "top_k": 5
+                  "top_k": 5,
+                  "concept_specs": [
+                    {"id": "fire_suppression", "label": "화재 진압", "role": "required",
+                     "query_terms": ["화재 진압", "소방"],
+                     "evidence_terms": ["화재 진압", "소방", "화재진압로봇", "난접근성 화재"],
+                     "weak_terms": ["화재", "안전", "현장"]},
+                    {"id": "drone", "label": "드론", "role": "required",
+                     "query_terms": ["드론", "UAV"],
+                     "evidence_terms": ["드론", "UAV", "무인기", "무인비행체"],
+                     "weak_terms": ["비행", "로봇", "무인"]}
+                  ]
                 }
 
                 # 예시 2 (대상 기관 + 역할어 처리)
@@ -218,9 +251,40 @@ class OpenAICompatPlanner:
                   "hard_filters": {},
                   "include_orgs": [],
                   "exclude_orgs": [],
-                  "top_k": 5
+                  "top_k": 5,
+                  "concept_specs": []
                 }
-                주의: 위 예시에서 "한국과학기술정보연구원"은 *심사 대상 기관* 이므로 `include_orgs`에 넣지 않습니다. "평가위원"은 `role_terms`, "심사"/"추천"은 `action_terms`이며 `retrieval_core`에 중복으로 들어가지 않습니다.
+                주의: 위 예시에서 "한국과학기술정보연구원"은 *심사 대상 기관* 이므로 `include_orgs`에 넣지 않습니다. "평가위원"은 `role_terms`, "심사"/"추천"은 `action_terms`이며 `retrieval_core`에 중복으로 들어가지 않습니다. 기술 도메인이 없으므로 `concept_specs`는 빈 배열입니다.
+
+                # 예시 3 (비-AI 도메인 — concept_specs는 어떤 도메인이든 동일 규칙)
+                Input:
+                {
+                  "query": "전고체 배터리 소재 개발 경험이 있는 연구자를 찾아줘",
+                  "filters_override": {},
+                  "include_orgs": [],
+                  "exclude_orgs": [],
+                  "top_k": 10
+                }
+
+                Output:
+                {
+                  "intent_summary": "전고체 배터리 소재 개발 경험 연구자 탐색",
+                  "retrieval_core": ["전고체 배터리", "고체전해질", "소재 개발"],
+                  "semantic_query": "전고체 배터리용 고체전해질 등 소재 개발 경험을 가진 연구자",
+                  "role_terms": ["연구자"],
+                  "action_terms": ["찾아줘"],
+                  "intent_flags": { "need_experience": true },
+                  "hard_filters": {},
+                  "include_orgs": [],
+                  "exclude_orgs": [],
+                  "top_k": 10,
+                  "concept_specs": [
+                    {"id": "solid_state_battery", "label": "전고체 배터리", "role": "required",
+                     "query_terms": ["전고체전지", "전고체 배터리", "고체전해질"],
+                     "evidence_terms": ["전고체전지", "전고체 배터리", "solid-state battery", "고체전해질", "황화물계 전해질", "산화물계 전해질"],
+                     "weak_terms": ["배터리", "전지", "소재", "개발"]}
+                  ]
+                }
             """
         return textwrap.dedent(prompt).strip()
 

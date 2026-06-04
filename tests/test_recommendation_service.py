@@ -93,12 +93,18 @@ class LoggingRetriever:
                 )
             ],
             query_payload={
-                "retrieval_mode": "keyword_pool_then_hybrid",
-                "keyword_stage_candidate_count": 3,
-                "hybrid_stage_candidate_filter_count": 3,
+                "retrieval_mode": "grouped_hybrid_rrf",
+                "search_query_plan": {
+                    "raw_query": "Recommend reviewers",
+                    "dense_query": "Recommend reviewers",
+                    "sparse_joint_query": "반도체",
+                    "sparse_concept_queries": {"semiconductor": "반도체 시스템반도체 반도체소자 반도체설계"},
+                    "required_concepts": ["semiconductor"],
+                    "optional_concepts": [],
+                },
+                "group_count": 3,
                 "aggregated_candidate_count": 2,
-                "support_pass_count": 1,
-                "support_filtered_count": 1,
+                "relevance_filtered_candidate_count": 1,
             },
             queries=CompiledQueries(stable="semiconductor", expanded="semiconductor"),
             retrieval_keywords=["semiconductor"],

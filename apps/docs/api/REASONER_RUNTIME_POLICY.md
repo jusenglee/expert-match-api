@@ -6,7 +6,7 @@ Last updated: 2026-06-02 (v2.1)
 
 This document records the active runtime behavior of recommendation reason generation on the flat chunk data model. Data model: [`../architecture/DATA_MODEL.md`](../architecture/DATA_MODEL.md). Contract: [`DATA_CONTRACT.md`](DATA_CONTRACT.md).
 
-> Data unit: 1 chunk = 1 Qdrant Point, Point ID == `chunk_id`. Payload is **flat** — researcher common meta (`researcher_id`, `researcher_name`, `affiliated_organization`, `highest_degree`, and the five counts `publication_count` / `scie_publication_count` / `intellectual_property_count` / `research_project_count` / `researcher_assessor_activity_count`) lives at the **root**; doc_type-specific detail lives in `doc_attrs{}`. There is a single date field `doc_date` (string, may be `"NONE"`). doc_type is exactly one of **paper / patent / project / assessor_activity / specialty**.
+> Data unit: 1 chunk = 1 Qdrant Point. Payload root `chunk_id` is the authoritative evidence id; Qdrant Point ID may be the same `chunk_id` or an operational UUID. Payload is **flat** — researcher common meta (`researcher_id`, `researcher_name`, `affiliated_organization`, `highest_degree`, and the five counts `publication_count` / `scie_publication_count` / `intellectual_property_count` / `research_project_count` / `researcher_assessor_activity_count`) lives at the **root**; doc_type-specific detail lives in `doc_attrs{}`. There is a single date field `doc_date` (string, may be `"NONE"`). doc_type is exactly one of **paper / patent / project / assessor_activity / specialty**.
 
 ## Active Policy
 

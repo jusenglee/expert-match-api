@@ -4,6 +4,7 @@ import logging
 from langchain_core.messages import AIMessage
 
 from apps.core.config import Settings
+from apps.domain.models import ConceptSpec, PlannerOutput
 from apps.recommendation.planner import OpenAICompatPlanner
 
 
@@ -191,3 +192,60 @@ def test_openai_compat_planner_discards_legacy_expansion_bundles():
 
     assert result.retrieval_core == ["드론", "화재 진압"]
     assert result.bundle_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Concept Evidence Plan (concept_specs)
+# ---------------------------------------------------------------------------
+def test_system_prompt_includes_concept_evidence_plan():
+    prompt = OpenAICompatPlanner._build_system_prompt()
+    for token in ("concept_specs", "[Concept Evidence Plan]", "query_terms", "evidence_terms", "weak_terms"):
+        assert token in prompt, token
+    assert "solid_state_battery" in prompt  # 비-AI 도메인 예시(도메인 일반화)
+    assert "weak_terms에 넣으세요" in prompt  # evidence/weak 분리(거짓 확정 방지) 규칙
+
+
+def test_planner_emits_concept_specs_from_llm():
+    planner = OpenAICompatPlanner(Settings(app_env="test", strict_runtime_validation=False))
+    planner.model = FakePlannerModel(
+        """{
+          "intent_summary": "인공지능 반도체 연구자 탐색",
+          "retrieval_core": ["인공지능", "반도체"],
+          "semantic_query": "인공지능과 반도체 연구 경험 연구자",
+          "role_terms": ["연구자"],
+          "action_terms": ["추천"],
+          "hard_filters": {},
+          "include_orgs": [],
+          "exclude_orgs": [],
+          "top_k": 5,
+          "concept_specs": [
+            {"id": "ai", "label": "인공지능", "role": "required",
+             "query_terms": ["인공지능", "AI"],
+             "evidence_terms": ["인공지능", "AI", "딥러닝"],
+             "weak_terms": ["지능형", "스마트"]},
+            {"id": "semiconductor", "label": "반도체", "role": "required",
+             "query_terms": ["반도체"],
+             "evidence_terms": ["반도체", "시스템반도체"],
+             "weak_terms": ["시스템", "공정"]}
+          ]
+        }"""
+    )
+
+    result = asyncio.run(planner.plan(query="인공지능 반도체 연구자 추천"))
+
+    assert [s.id for s in result.concept_specs] == ["ai", "semiconductor"]
+    assert result.concept_specs[0].evidence_terms == ["인공지능", "AI", "딥러닝"]
+    assert result.concept_specs[0].weak_terms == ["지능형", "스마트"]
+
+
+def test_apply_request_constraints_preserves_concept_specs():
+    out = PlannerOutput(
+        intent_summary="x",
+        retrieval_core=["반도체"],
+        concept_specs=[ConceptSpec(id="semiconductor", label="반도체", evidence_terms=["반도체"])],
+    )
+    result = OpenAICompatPlanner._apply_request_constraints(
+        output=out, normalized_query="반도체 연구자",
+        filters_override=None, include_orgs=None, exclude_orgs=None, top_k=None,
+    )
+    assert result.concept_specs and result.concept_specs[0].id == "semiconductor"

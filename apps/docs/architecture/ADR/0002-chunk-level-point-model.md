@@ -2,7 +2,7 @@
 
 ## 상태
 
-승인 (2026-05-28). 갱신 (2026-06-02, flat payload 계약 v2.1). 이전 기준 "연구자 1명 = 1 Point + nested 배열"을 대체한다.
+승인 (2026-05-28). 갱신 (2026-06-02, flat payload 계약 v2.1). 보정 (2026-06-04, payload `chunk_id` authoritative). 이전 기준 "연구자 1명 = 1 Point + nested 배열"을 대체한다.
 
 ## 맥락
 
@@ -14,7 +14,8 @@
 
 ## 결정
 
-- 저장 단위를 **chunk 1개 = Point 1개**로 전환한다. Point ID = `chunk_id`.
+- 저장 단위를 **chunk 1개 = Point 1개**로 전환한다.
+- payload root의 `chunk_id`를 evidence authoritative id로 사용한다. 신규 멱등 적재에서는 Point ID = `chunk_id`를 권장하지만, 운영 컬렉션의 Point ID가 UUID인 경우도 허용한다. 런타임 조회·dedupe·trace·LLM evidence resolve는 payload `chunk_id` 기준이다.
 - payload는 **flat 구조**다. 연구자 공통 메타(`researcher_id`, `researcher_name`, `affiliated_organization`, `highest_degree`, `publication_count`, `scie_publication_count`, `intellectual_property_count`, `research_project_count`, `researcher_assessor_activity_count`)는 **root에 비정규화**되어 모든 chunk에 반복 저장된다. doc_type별 상세는 `doc_attrs{}`에, 날짜는 단일 `doc_date`(문자열, 결측은 `"NONE"`)에 들어간다. (`researcher_meta` 같은 nesting 없음.)
 - named vector는 **단일 dense `vector_e5i` + 단일 sparse `vector_splade`**(둘 다 입력 `chunk_text`). doc_type은 named vector가 아니라 **payload 필터**다.
 - 연구자 후보는 **검색 시점에 `researcher_id`로 집계**해서 만든다(RRF 누적 + doc_type별 chunk cap + dedupe).
@@ -24,6 +25,6 @@
 
 ## 결과
 
-- 멱등 적재(중복 Point 방지), evidence 참조 안정성(`chunk_id` 불변), 의미 검색·evidence 선별의 자연스러움 확보.
+- 멱등 적재(신규 적재에서 Point ID=`chunk_id` 사용 시 중복 Point 방지), evidence 참조 안정성(payload `chunk_id` 불변), 의미 검색·evidence 선별의 자연스러움 확보.
 - 비용: 연구자 집계 로직 신규 필요. flat root 메타 적재 일관성 책임은 외부 적재 제공자에게 있다(앱은 적재하지 않으며, v1.x 적재 코드는 [`../../../legacy_v1x/`](../../../legacy_v1x/)로 격리됨).
 - 후속: 컬렉션 기본값 `ntis_researcher_chunks`, 외부 API 필드 변경([`../../api/EXTERNAL_API_CHANGELOG.md`](../../api/EXTERNAL_API_CHANGELOG.md)), 전환 계획([`../../plans/MIGRATION_PLAN.md`](../../plans/MIGRATION_PLAN.md)).

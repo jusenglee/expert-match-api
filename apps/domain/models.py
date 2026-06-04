@@ -59,7 +59,8 @@ def _normalize_int(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# flat chunk payload (실제 적재 데이터 = 1 chunk = 1 Point). Point ID == chunk_id.
+# flat chunk payload (실제 적재 데이터 = 1 chunk = 1 Point).
+# payload.chunk_id가 evidence authoritative id이며 Point ID와 다를 수 있다.
 # 연구자 공통 메타는 root에 비정규화, doc_type별 상세만 doc_attrs(passthrough).
 # ---------------------------------------------------------------------------
 
@@ -112,6 +113,9 @@ class ChunkHit(BaseModel):
     score: float = 0.0
     payload: ChunkPayload
     rank: int | None = None
+    # v2.1 관련도 검색: 이 chunk가 충족하는 concept id 목록 + 어느 검색 view에서 잡혔나.
+    concepts: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
 
     @property
     def chunk_id(self) -> str:
@@ -140,6 +144,11 @@ class ResearcherCandidate(BaseModel):
     group_score: float = 0.0
     rank_score: float = 0.0
     chunks: list[ChunkHit] = Field(default_factory=list)
+    # v2.1 관련도 검색: concept 커버리지 + capped evidence score 분해.
+    matched_concepts: list[str] = Field(default_factory=list)
+    coverage_type: str = ""  # "joint" | "separate" | "partial" | ""
+    evidence_by_concept: dict[str, list[ChunkHit]] = Field(default_factory=dict)  # {"joint","<concept>","optional"}
+    score_breakdown: dict[str, float] = Field(default_factory=dict)
 
     @property
     def doc_types_present(self) -> list[str]:
@@ -154,7 +163,7 @@ class ResearcherCandidate(BaseModel):
 
 
 class ChunkEvidence(BaseModel):
-    """표시/grounding용 evidence 단위(doc_type 무관 통일 모델). 참조 id == chunk_id."""
+    """표시/grounding용 evidence 단위(doc_type 무관 통일 모델). 참조 id == payload chunk_id."""
 
     chunk_id: str
     doc_type: str
@@ -163,6 +172,33 @@ class ChunkEvidence(BaseModel):
     snippet: str = ""
     doc_attrs: dict[str, Any] = Field(default_factory=dict)
     score: float = 0.0
+
+
+class ConceptSpec(BaseModel):
+    """질의별 동적 Concept Evidence Plan 단위(planner 산출, registry 보강).
+
+    하드코딩 사전 대신 planner(LLM)가 질의마다 concept를 만들고, app-layer는 이를 검증 규칙으로만 쓴다.
+    - query_terms: 검색(recall)용 — concept별 SPLADE 검색문 생성.
+    - evidence_terms: 태깅 '확정'(strong) — 이 term이 chunk에 직접 등장해야 concept 확정.
+    - weak_terms: 약신호(확정 불가) — 단독으로는 concept 근거가 되지 못함(초기엔 보관만).
+    source/confidence는 디버깅·추적용(planner/registry/fallback/query_exact 구분).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    label: str = ""
+    role: Literal["required", "optional"] = "required"
+    query_terms: list[str] = Field(default_factory=list)
+    evidence_terms: list[str] = Field(default_factory=list)
+    weak_terms: list[str] = Field(default_factory=list)
+    source: Literal["planner", "registry", "fallback", "query_exact"] = "planner"
+    confidence: float = 1.0
+
+    @field_validator("query_terms", "evidence_terms", "weak_terms", mode="before")
+    @classmethod
+    def _normalize_term_lists(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
 
 
 class PlannerOutput(BaseModel):
@@ -179,6 +215,16 @@ class PlannerOutput(BaseModel):
     intent_flags: dict[str, Any] = Field(default_factory=dict)
     semantic_query: str = ""
     top_k: int = 15
+    # v2.1 관련도 검색 view + concept (planner 동적 산출; 실패 시 raw_query/빈값 fallback).
+    dense_query: str = ""
+    sparse_raw: str = ""
+    focused_sparse_query: str = ""
+    concept_queries: dict[str, str] = Field(default_factory=dict)  # {concept_id: sparse query text}
+    required_concepts: list[str] = Field(default_factory=list)
+    optional_concepts: list[str] = Field(default_factory=list)
+    planner_concept_terms: dict[str, list[str]] = Field(default_factory=dict)  # {concept_id: [alias...]} 동적 alias(구버전 compat)
+    # ⭐ 동적 Concept Evidence Plan(권장). 채워지면 resolve_concept_plan이 이걸 최우선 사용한다.
+    concept_specs: list[ConceptSpec] = Field(default_factory=list)
 
     @field_validator(
         "include_orgs",
@@ -189,6 +235,8 @@ class PlannerOutput(BaseModel):
         "role_terms",
         "action_terms",
         "bundle_ids",
+        "required_concepts",
+        "optional_concepts",
         mode="before",
     )
     @classmethod

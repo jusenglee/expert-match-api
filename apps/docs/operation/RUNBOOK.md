@@ -16,7 +16,8 @@ python -m pip install -e .[dev]
 - Qdrant 서버 구동 및 `NTIS_QDRANT_URL` 접근 확인.
 - 기본 컬렉션 이름은 `ntis_researcher_chunks`(`NTIS_QDRANT_COLLECTION_NAME`으로 override).
 - 컬렉션 스키마(필수):
-  - Point ID = `chunk_id` 문자열 (`<doc_type>_<숫자doc_id>_c<NNN>`, 예: `paper_100000045256_c000`)
+  - payload root `chunk_id` 문자열 (`<doc_type>_<숫자doc_id>_c<NNN>`, 예: `paper_100000045256_c000`)이 authoritative evidence id.
+  - Point ID는 신규/멱등 컬렉션에서는 `chunk_id`를 권장하나, 운영 컬렉션이 UUID Point ID를 쓰더라도 런타임은 `payload.chunk_id`를 기준으로 evidence를 resolve한다.
   - named vector: `vector_e5i`(1024, Cosine) + `vector_splade`. doc_type은 named vector가 아니라 payload 필터.
   - payload 인덱스: `researcher_id`(keyword), `doc_type`(keyword), 연구자 공통 count 5종(`publication_count`/`scie_publication_count`/`intellectual_property_count`/`research_project_count`/`researcher_assessor_activity_count`, integer), `doc_date`(datetime, recency), `affiliated_organization`/`highest_degree` 및 주요 `doc_attrs.*` keyword 필드 ([`DATA_MODEL.md §5`](../architecture/DATA_MODEL.md))
 - 시작 시, 실제 선택된 sparse backend에 맞춰 sparse vector modifier(`IDF` 또는 없음)를 자동 확인·복구한다.
@@ -24,7 +25,7 @@ python -m pip install -e .[dev]
 ### 2.1 적재(ingestion) 불변식 점검
 
 적재는 **외부 제공자 소관**이며(구 `apps/ingest`는 `legacy_v1x/ingest/`로 격리), 적재 데이터는 [`DATA_MODEL.md §6`](../architecture/DATA_MODEL.md)의 불변식을 만족해야 한다. 운영 표본 점검 항목:
-- Point ID == `chunk_id`, 전역 유일.
+- `payload.chunk_id`가 전역 유일하고 evidence id 코덱을 따른다. Point ID와 다르면 `payload.chunk_id`를 기준으로 진단한다.
 - 한 `researcher_id`의 모든 chunk에서 flat root 공통 메타(`researcher_name`/`affiliated_organization`/`highest_degree` + count 5종) 동일.
 - `doc_type` ∈ 정의된 5종(`paper`/`patent`/`project`/`assessor_activity`/`specialty`).
 - `doc_date`는 단일 문자열(`"NONE"` 또는 결측 허용); recency는 datetime 인덱스에 매칭되는 값만 대상.
@@ -45,7 +46,7 @@ NTIS_QDRANT_COLLECTION_NAME=ntis_researcher_chunks python -m apps.tools.bootstra
 ```
 
 - **blue/green 가드:** 부트스트래퍼는 레거시 `researcher_recommend_proto`를 **절대 재생성/삭제하지 않는다**(`recreate=True`라도 no-op). v2.0 컬렉션만 단일 벡터 스키마로 생성·재생성.
-- **스모크 벡터:** 임베딩 서버 없이 스키마·필터 동작만 검증하도록 pseudo 벡터를 쓴다(실제 임베딩 적재는 WO-A/WO-D). Point ID는 WO-0 `chunk_id` 코덱 그대로 → 동일 chunk_id 재upsert 시 Point 수 불변(멱등) 확인.
+- **스모크 벡터:** 임베딩 서버 없이 스키마·필터 동작만 검증하도록 pseudo 벡터를 쓴다(실제 임베딩 적재는 WO-A/WO-D). 신규 멱등 적재 스모크에서는 Point ID를 `chunk_id`로 쓰면 동일 chunk_id 재upsert 시 Point 수 불변을 확인할 수 있다. 운영 진단과 evidence resolve는 Point ID가 아니라 payload `chunk_id` 기준으로 수행한다.
 
 #### sparse modifier 정합 — PATCH vs drop&recreate (B-5)
 
@@ -108,7 +109,7 @@ curl -X POST http://127.0.0.1:8011/recommend `
 - **요청 컨텍스트:** Trace ID, method/path, client, content type/length, user agent, 처리 시간
 - **사용자 질의:** endpoint, 정규화 전/후 길이, `top_k`, include/exclude 기관 수, filter override key
 - **Planner:** `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, hard filter 값
-- **Retriever:** 실제 `retrieval_keywords`, 1차 sparse 키워드 쿼리, 2차 하이브리드 쿼리, `researcher_id` 풀 미리보기, doc_type 경로별 hit count, hard filter 통과/탈락 수, 연구자 집계 후보 수
+- **Retriever:** 실제 `retrieval_keywords`, `search_query_plan`(dense/raw, sparse joint, sparse concept queries), `researcher_id` 그룹 수, hard filter 통과/탈락 수, post-group relevance gate 활성 개념과 필터링 수, 연구자 집계 후보 수
 - **Recommendation:** Top-k 확정, evidence 선별 chunk 수, 사유 생성 배치 수, 최종 추천/데이터 공백 수
 - **Fallback:** LLM 오류/JSON 파싱 실패 시 휴리스틱·결정론적 전환 안내
 - **Data Gap:** 특정 연구자의 데이터 누락 경고
@@ -117,10 +118,10 @@ curl -X POST http://127.0.0.1:8011/recommend `
 ```
 [09:45:51.125] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend top_k=5 exclude_orgs=1 query='드론 화재 진압 평가위원 추천'
 [09:45:52.010] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 완료: retrieval_core=['드론','화재 진압'] core_keywords=['드론','화재 진압'] role_terms=['평가위원'] action_terms=['추천'] semantic_query='드론 기반 화재 진압 기술 전문가' exclude_orgs=['A기관'] hard_filters={} top_k=5
-[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 컴파일: mode=keyword_pool_then_hybrid retrieval_keywords=['드론','화재','진압'] doc_types=5 limits={prefetch:100, output:50, chunk_cap:3, retrieval:80}
-[09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 1차 키워드 검색 완료: elapsed_ms=82.1 researcher_pool=37 doc_type_counts={'paper':15,'project':9,'assessor_activity':6,'patent':2}
-[09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 2차 하이브리드+집계 완료: raw_doc_type_counts={...} aggregated_candidates=24 support_pass=15 support_filtered=9 final=15
+[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 쿼리 컴파일: mode=grouped_hybrid_rrf retrieval_keywords=['드론','화재','진압'] dense_query='드론 화재 진압 평가위원 추천' sparse_queries={'sparse_joint':'드론 화재 진압'} limits={prefetch:256,group_size:10,groups:80}
+[09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] relevance gate: version=v1 active_concepts=[]
+[09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 집계 완료: elapsed_ms=210.0 groups=37 candidates=24 org_filtered=1 final_hits=23
 [09:45:54.330] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms':880,'search_ms':210,'total_ms':3205}
 ```
 
-`trace.query_payload`에서 `retrieval_mode`, `retrieval_keywords`, `semantic_query`, `keyword_stage_queries`, `hybrid_stage_queries`, `keyword_stage_candidate_count`, `keyword_stage_doc_type_counts`, `hybrid_stage_raw_doc_type_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있다(벡터 값·전체 payload는 미노출).
+`trace.query_payload`에서 `retrieval_mode`, `retrieval_keywords`, `search_query_plan`, `semantic_query`, `group_count`, `aggregated_candidate_count`, `relevance_gate_active_concepts`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`를 확인할 수 있다(벡터 값·전체 payload는 미노출).

@@ -263,7 +263,9 @@ class RecommendationService:
             "retrieved_count": len(retrieval.hits),
             "candidates": cards,
             "hits_with_support": display_hits,
-            "support_rule_applied": True,
+            # v2.0 집계(RRF 누적 + chunk_cap)에는 branch-cross support omission rule이 없다.
+            # support_rule_*_min=0(비활성)인 deprecated legacy trace 필드 → 항상 미적용(False).
+            "support_rule_applied": False,
             "cache_hit": retrieval.cache_hit,
             "filtered_out_candidates": retrieval.filtered_out_candidates,
             "query_payload": retrieval.query_payload,
@@ -369,6 +371,7 @@ class RecommendationService:
                 final_sort_policy=search_result["final_sort_policy"],
                 top_k_used=top_k_used,
                 timers=search_result.get("timers"),
+                retrieval_cache_hit=search_result.get("cache_hit", False),
             )
 
         logger.info(
@@ -485,6 +488,7 @@ class RecommendationService:
             final_sort_policy=search_result["final_sort_policy"],
             top_k_used=top_k_used,
             timers=timers,
+            retrieval_cache_hit=search_result.get("cache_hit", False),
         )
 
     def save_feedback(
@@ -742,9 +746,9 @@ class RecommendationService:
         generated: Any | None,
         relevant_bundle: RelevantEvidenceBundle,
     ) -> tuple[list[EvidenceItem], dict[str, Any]]:
-        # 구조 리팩토링: EvidenceSelector가 이미 최상위 3개를 엄선했으므로
-        # LLM의 선택 결과와 상관없이 relevant_bundle의 모든 항목을 최종 증거로 확정함.
-        # 이를 통해 추천 사유와 증거 간의 100% 싱크를 보장함.
+        # EvidenceSelector가 doc_type/family cap(FAMILY_EVIDENCE_CAP: achievement=10/assessment=6/
+        # expertise=6/identity=1)으로 grounding evidence를 선별해 둔 상태다. LLM의 selected_evidence_ids와
+        # 무관하게 relevant_bundle의 모든 항목을 최종 증거로 확정해 추천 사유-증거 100% 싱크를 보장한다.
         resolved_items = relevant_bundle.all_items()
         provided_evidence_ids = [item.item_id for item in resolved_items]
         
@@ -892,6 +896,7 @@ class RecommendationService:
         final_sort_policy: str,
         top_k_used: int,
         timers: dict[str, Any] | None,
+        retrieval_cache_hit: bool = False,
         expanded_shadow_hits: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         merged_data_gaps = _merge_unique_strings(data_gaps)
@@ -910,7 +915,7 @@ class RecommendationService:
                 "raw_query": raw_query,
                 "cache": {
                     "canonical_plan": (planner_trace or {}).get("cache", {}).get("canonical_plan", "miss"),
-                    "retrieval": "hit" if timers and timers.get("search_ms", 0) < 5 else "miss" 
+                    "retrieval": "hit" if retrieval_cache_hit else "miss",
                 },
                 "planner_keywords": (
                     (planner_trace or {}).get("planner_keywords") or []

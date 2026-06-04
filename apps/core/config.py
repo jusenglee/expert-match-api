@@ -207,6 +207,42 @@ class Settings(BaseSettings):
     ce_max_pairs_per_request: int = 256
     ce_top_n_per_type: int = 5
 
+    # =========================================================================
+    # 9. 관련도 기반 검색·정렬 (v2.1 multi-view + capped evidence scoring)
+    # =========================================================================
+    # per-chunk 멀티뷰 융합: raw score 합산 금지 — source별 normalized rank score × view_weight.
+    # 개념별 sparse view(sparse_concept)는 required_concepts마다 1개씩이며 동일 가중을 쓴다.
+    search_view_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "dense_full": 1.0,
+            "sparse_raw": 0.25,
+            "sparse_focus": 0.7,
+            "sparse_concept": 0.5,
+        }
+    )
+    view_rrf_k: int = 60  # view_rank_score = 1.0 / (view_rrf_k + rank0)
+
+    # researcher capped evidence score 가중(단순 합산 금지).
+    # joint=한 chunk가 required 다개념 동시충족 / balance=min(개념별 best) / concept=개념별 best 합 / support=보조 근거.
+    researcher_score_weights: dict[str, float] = Field(
+        default_factory=lambda: {"joint": 1.5, "balance": 1.2, "concept": 0.8, "support": 0.3}
+    )
+    researcher_support_top_k: int = 3  # best 외 보조 근거 cap(volume-bias 방지)
+
+    # doc_type별 근거 품질 가중(실적 ≥ 선언 > 활동).
+    doc_type_quality_weight: dict[str, float] = Field(
+        default_factory=lambda: {
+            "specialty": 1.0, "project": 1.0, "paper": 0.9, "patent": 0.8, "assessor_activity": 0.55,
+        }
+    )
+
+    # required concept gate: main top-K는 required_concepts 전부 충족. 부분 충족은 fallback tier로 분리.
+    relevance_gate_enabled: bool = True
+    relevance_fallback_tier: bool = True
+    # weak evidence: 융합 관련도가 이 값 이하인 근거만 가진 후보는 감점(0=비활성, 튜닝).
+    weak_evidence_floor: float = 0.0
+    recency_bonus_weight: float = 0.0  # 최근 doc_date 가산(0=비활성, 튜닝)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

@@ -46,7 +46,7 @@
 
 | 항목 | 최종 결정 | 설계 의미 |
 |---|---|---|
-| 저장 단위 | chunk 1개 = 1 Point, Point ID=`chunk_id` | 데이터 도착 단위와 저장 단위 일치, 멱등 적재 |
+| 저장 단위 | chunk 1개 = 1 Point, payload `chunk_id` authoritative | 데이터 도착 단위와 저장 단위 일치, evidence id 안정성 |
 | payload 형태 | **flat** — 공통 메타 root 비정규화 + `doc_attrs{}` | 실데이터 형태와 일치, nested 폐기 |
 | 후보 단위 | 검색 후 `researcher_id` 집계 = 연구자 1명 | 저장은 chunk, 추천은 연구자 |
 | 검색 표현 | 단일 `vector_e5i`(dense) + `vector_splade`(sparse) | doc_type은 named vector가 아니라 payload 필터 |
@@ -100,12 +100,24 @@
    - hard_filters / include·exclude_orgs / top_k
    - (선택) intent flags: 최근성·평가이력 강조 등 prior 힌트
    ↓
+[Search Query Builder]
+   - raw_query 보존
+   - dense_query = 사용자 원문 중심 자연문
+   - sparse_joint_query = SPLADE용 짧은 핵심 자연문/명사구
+   - sparse_concept_queries = 필수 개념별 보조 검색문
+   - required_concepts = 연구자 집계/coverage gate 조건
+   ↓
 [Retrieval Orchestrator]  (chunk 단위, flat payload)
-   1) 키워드 풀: vector_splade(sparse) 키워드 검색 → researcher_id 후보 풀
-   2) 하이브리드: 풀 내부에서 doc_type별 vector_e5i(dense)+vector_splade(sparse) prefetch → equal RRF (chunk hit)
-   3) 집계: researcher_id로 chunk hit 묶어 RRF 누적 (doc_type별 chunk cap) → 연구자 후보
-   4) hard filter: doc_date 최근성 / flat root *_count / exclude org (deterministic, recency=OR)
-   5) 결정론적 정렬: score desc → name asc → researcher_id asc
+   1) query_points_groups(group_by="researcher_id") 1회
+      - dense_full: dense_query
+      - sparse_joint: sparse_joint_query
+      - sparse_<concept>: sparse_concept_queries
+      - Qdrant FusionQuery(RRF), equal RRF
+   2) chunk gate: 필수 개념과 무관한 chunk 제거
+   3) researcher coverage gate: required_concepts를 모두 만족하는 연구자만 후보화
+   4) 집계: researcher_id로 chunk hit 묶어 RRF 누적 (doc_type별 chunk cap) → 연구자 후보
+   5) hard filter: doc_date 최근성 / flat root *_count / exclude org (deterministic, recency=OR)
+   6) 결정론적 정렬: score desc → name asc → researcher_id asc
    ↓
 [Evidence Selector]  (chunk이 곧 근거)
    - 후보별 매칭 chunk을 doc_type별로 모아 query 관련도 재랭크(cross-encoder→lexical 강등)
@@ -122,8 +134,9 @@
 
 | 구성요소 | 역할 | 절대 하지 않는 것 |
 |---|---|---|
-| Query Planner | 의도/키워드/필터/top_k 추출 (JSON-only) | 검색 재작성 문장 생성, doc_type on/off 결정 |
-| Retrieval Orchestrator | chunk 하이브리드 검색 + 연구자 집계 + 필터 + 정렬 | 최종 추천 판단 |
+| Query Planner | 의도/키워드/필터/top_k 추출 (JSON-only) | 최종 추천 판단, doc_type on/off 결정 |
+| Search Query Builder | 채널별 검색 쿼리와 required concept 생성 | SPLADE에 사용자 원문 그대로 투입 |
+| Retrieval Orchestrator | chunk 하이브리드 검색 + concept coverage gate + 연구자 집계 + 필터 + 정렬 | 최종 추천 판단 |
 | Evidence Selector | 후보 내부 chunk 관련도 선별 | 후보(연구자) 순위 변경 |
 | LLM Reasoner | 적합도·사유·근거 chunk 선택 | 재정렬·탈락·ID 생성 |
 
@@ -134,15 +147,33 @@
 ### 5.1 철학
 검색의 목적은 정답 1명을 고르는 것이 아니라 **적절한 후보군을 넓게 확보**하는 것이다. retrieval은 recall 우선, recommendation은 reasoning 우선.
 
-### 5.2 2단계 검색 (`keyword_pool_then_hybrid` 계승)
-1. **키워드 풀 단계:** `vector_splade`(sparse named vector)로 sparse 키워드 검색 → `researcher_id` 후보 풀을 중복 없이 수집. (lexical 그라운딩 우선 확보)
-2. **하이브리드 단계:** 후보 풀을 `researcher_id MatchAny`로 제한한 뒤, doc_type(또는 family)별로 `vector_e5i`(dense)+`vector_splade`(sparse) `prefetch`를 조립하고 `FusionQuery(RRF)`로 chunk hit을 만든다. doc_type은 named vector가 아니라 **payload 필터**로 분기한다.
+### 5.2 채널별 검색 쿼리 (`grouped_hybrid_rrf`)
+검색 쿼리는 사용자 원문 하나를 그대로 모든 채널에 넣지 않는다. `SearchQueryPlan`으로 목적별 쿼리를 분리한다.
 
-> v1.x의 "브랜치"는 v2.x에서 "doc_type(또는 family) 경로"로 대체된다. 키워드 풀 단계가 빈 풀을 내면 하이브리드는 건너뛰고 빈 결과 + `keyword_stage_candidate_count=0`을 trace에 남긴다.
+```python
+SearchQueryPlan = {
+    "raw_query": "...",
+    "dense_query": "...",
+    "sparse_joint_query": "...",
+    "sparse_concept_queries": {"ai": "...", "semiconductor": "..."},
+    "required_concepts": ["ai", "semiconductor"],
+    "optional_concepts": [...],
+}
+```
+
+1. **dense_full:** `dense_query`는 사용자 원문 자연어 의미를 보존한다.
+2. **sparse_joint:** `sparse_joint_query`는 SPLADE용 짧은 핵심 자연문/명사구다. `전문`, `분야`, `연구자`, `또는`, `상세` 같은 일반어를 제거하고, 예: `인공지능 반도체 연구개발 산업 경험`.
+3. **sparse_<concept>:** 필수 개념별 SPLADE 보조 검색으로 근거 chunk를 넓게 확보한다. 예: `ai`, `semiconductor`, `semiconductor_experience`.
+4. **grouped RRF:** dense 1개 + sparse 여러 개를 `query_points_groups(group_by="researcher_id")`의 prefetch로 넣고, Qdrant `FusionQuery(RRF)` equal RRF로 chunk hit을 회수한다.
+
+> SPLADE에 사용자 원문을 그대로 넣으면 일반어가 과확장되고, 순수 키워드 나열은 OR 검색처럼 넓어진다. 따라서 SPLADE는 짧은 자연문/명사구, dense는 원문 중심으로 분리한다.
+
+> v1.x의 "브랜치"는 v2.x에서 "doc_type(또는 family) 경로"로 대체된다. 현재 active 검색 모드는 `grouped_hybrid_rrf`이며, `keyword_pool_then_hybrid`의 1차 후보 풀 단계는 사용하지 않는다.
 
 ### 5.3 연구자 집계 (v2.x 핵심)
 chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
 - 각 연구자 점수 = 그 연구자의 chunk hit들에 대한 **RRF 누적**.
+- **concept coverage gate:** `required_concepts`가 있는 질의는 연구자 단위로 필수 개념을 모두 만족해야 한다. 개념 근거가 없는 chunk는 제거하고, 남은 chunk의 concept union이 부족하면 해당 연구자는 탈락한다.
 - **doc_type별 캡:** 한 doc_type에서 상위 `N`개 chunk까지만 점수에 기여(`doc_type_chunk_cap`, 기본 3). 다작 연구자가 한 영역 chunk 수로 순위를 독식하지 못하게 한다.
 - **doc_type prior(기본 equal):** intent에 따라 family별 기여 가중을 줄 수 있으나 기본값은 equal. (§6)
 - 연구자당 최종 1 Point로 dedupe.

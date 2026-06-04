@@ -32,7 +32,7 @@
 
 ### 7. chunk = 1 Point 적재 (NEW)
 - Input: 한 연구자에 paper 3건 + project 2건이 적재됨
-- Expected: Qdrant에 5개 Point(각 ID=`chunk_id`)가 존재, 모두 동일 `researcher_id` 및 동일 flat root 공통 메타(`researcher_name`/`affiliated_organization`/`highest_degree` + count 5종).
+- Expected: Qdrant에 5개 Point가 존재하고 각 payload root의 `chunk_id`가 전역 유일하며 authoritative evidence id다. 모두 동일 `researcher_id` 및 동일 flat root 공통 메타(`researcher_name`/`affiliated_organization`/`highest_degree` + count 5종)를 갖는다. Point ID는 `chunk_id` 권장이나 런타임 계약은 `payload.chunk_id` 기준이다.
 
 ### 8. 연구자 집계와 dedupe (NEW)
 - Input: 한 연구자의 여러 doc_type chunk이 동시에 hit
@@ -45,6 +45,10 @@
 ### 10. 통합 recency는 OR 결합 (NEW, 과거 장애 회귀 방지)
 - Input: "최근 3년 활동" 의도(여러 doc_type 대상)
 - Expected: `doc_date >= 올해-3년` 조건이 doc_type들에 대해 **OR(min_should, min_count=1)** 로 결합, 세 영역 모두 동시 충족하는 극소수만 남는 AND 회귀가 발생하지 않음. `doc_date`가 `"NONE"`/결측인 chunk은 datetime range에 매칭되지 않아 recency 대상에서 제외된다.
+
+### 10.1 grouped relevance gate prevents sibling leakage
+- Input: query asks for both AI and semiconductor expertise, and one researcher group contains an AI assessor chunk plus an unrelated paper chunk.
+- Expected: unrelated sibling chunks do not contribute to candidate score or evidence. If the kept chunks do not collectively cover all active concepts, the researcher is filtered with `reason="relevance_concepts_missing"` and trace exposes `relevance_dropped_chunk_count` and `relevance_filtered_candidate_count`.
 
 ### 11. flat root 메타 기반 hard filter (NEW)
 - Input: `publication_count_min` / `highest_degree` 필터
@@ -70,9 +74,9 @@
 - Input: 매칭 chunk이 매우 많은 후보
 - Expected: family별 캡(`achievement:10` 등) 적용, 후보 **순위는 변하지 않음**(evidence 선별은 grounding 한정).
 
-### 17. keyword_pool_then_hybrid 고정
-- Input: sparse 키워드 단계가 직접 하이브리드보다 좁은 풀을 내는 질의
-- Expected: 1차 sparse 풀 수집이 항상 먼저, 2차 하이브리드는 `researcher_id MatchAny` 풀 내부로 제한, 풀 밖 연구자는 하이브리드에 떠도 최종 제외, trace에 `retrieval_mode="keyword_pool_then_hybrid"`와 `keyword_stage_candidate_count`.
+### 17. channel-specific SearchQueryPlan 고정
+- Input: "인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"
+- Expected: `search_query_plan.dense_query`는 사용자 원문이고, `sparse_joint_query`는 `인공지능 반도체 연구개발 산업 경험`처럼 짧은 자연문/명사구다. `sparse_concept_queries`는 `ai`, `semiconductor`, `semiconductor_experience`를 포함하고, `required_concepts=["ai","semiconductor"]`가 post-group coverage gate에 쓰인다.
 
 ### 18. 확장 사전 제거
 - Input: planner 출력에 legacy `bundle_ids`가 포함된 질의
@@ -88,14 +92,14 @@
 
 ## Acceptance Criteria
 
-- 저장 단위는 chunk(Point ID=`chunk_id`), 한 연구자는 다수 Point.
-- 검색은 항상 `keyword_pool_then_hybrid`: sparse 키워드 풀 → 풀 내부 하이브리드 RRF.
+- 저장 단위는 chunk이며, evidence id는 payload root `chunk_id`다. 한 연구자는 다수 Point.
+- 검색은 항상 `grouped_hybrid_rrf`: dense_full + sparse_joint + sparse_concept_queries prefetch → equal RRF → post-group concept coverage gate.
 - v1.x 확장 사전은 active 검색 경로에 없으며 `expanded` 쿼리는 별도 확장어를 추가하지 않는다.
 - 검색 후 `researcher_id`로 집계해 연구자당 1건, 점수는 RRF 누적, doc_type별 `chunk_cap` 적용.
 - hard filter는 시스템이 deterministic 보장(flat root 메타 기준), 다중 doc_type `doc_date` recency는 OR 결합.
 - `/search/candidates`와 `/recommend`는 검색·집계 순서를 유지하고 `/recommend`는 Top-k만 LLM에 전달.
 - evidence 선별은 family별 캡을 적용하되 후보 순위를 바꾸지 않는다.
 - `recommendation.evidence`는 LLM이 고른 `chunk_id`로 resolve, 무효 시 결정론적 fallback.
-- Trace는 `planner_keywords`, `retrieval_keywords`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.keyword_stage_candidate_count`, `query_payload.keyword_stage_doc_type_counts`, `query_payload.hybrid_stage_raw_doc_type_counts`, `query_payload.aggregated_candidate_count`, `query_payload.support_pass_count`, `query_payload.support_filtered_count`, `server_logs`, `reason_generation_trace.*`, 후보별 evidence resolution 상세를 노출한다.
+- Trace는 `planner_keywords`, `retrieval_keywords`, `retrieval_skipped_reason`, `retrieval_score_traces`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.search_query_plan`, `query_payload.group_count`, `query_payload.aggregated_candidate_count`, `query_payload.relevance_gate_active_concepts`, `query_payload.relevance_kept_chunk_count`, `query_payload.relevance_dropped_chunk_count`, `query_payload.relevance_filtered_candidate_count`, `server_logs`, `reason_generation_trace.*`, 후보별 evidence resolution 상세를 노출한다.
 - evidence id는 `chunk_id`이며, 구 `paper:N`/`project:N`/`patent:N` 형식은 더 이상 계약에 없다.
 - 구 verifier / multi-view retrieval / branch named vector / judge-as-core 구조는 active 계약이 아니다.

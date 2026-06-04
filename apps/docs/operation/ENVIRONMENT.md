@@ -27,7 +27,7 @@
 | `NTIS_QDRANT_COLLECTION_NAME` | `ntis_researcher_chunks` | **chunk 컬렉션** (구 `researcher_recommend_proto` 폐기) |
 | `NTIS_QDRANT_CLOUD_INFERENCE` | `false` | 클라우드 추론 활성화 |
 
-> chunk 컬렉션은 Point 1개 = chunk 1개, ID=`chunk_id`, named vector는 `vector_e5i`(dense) + `vector_splade`(sparse) 단일 쌍이다. doc_type은 named vector가 아니라 **payload 필터**다. 적재(ingestion)는 외부 제공자 소관(구 `apps/ingest`는 `legacy_v1x/ingest/`로 격리).
+> chunk 컬렉션은 Point 1개 = chunk 1개이며 payload root `chunk_id`가 authoritative evidence id다. Point ID는 `chunk_id` 권장이지만 운영 컬렉션이 UUID를 쓰더라도 런타임은 `payload.chunk_id`를 기준으로 evidence를 resolve한다. named vector는 `vector_e5i`(dense) + `vector_splade`(sparse) 단일 쌍이다. doc_type은 named vector가 아니라 **payload 필터**다. 적재(ingestion)는 외부 제공자 소관(구 `apps/ingest`는 `legacy_v1x/ingest/`로 격리).
 
 ## LLM 백엔드
 

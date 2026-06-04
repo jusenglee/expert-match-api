@@ -524,7 +524,7 @@ def create_app(
             "planner_retry_count": (
                 (result.get("planner_trace") or {}).get("planner_retry_count", 0)
             ),
-            "support_rule_applied": True,
+            "support_rule_applied": result.get("support_rule_applied", False),
             "filtered_out_count": len(result.get("filtered_out_candidates") or []),
             "filtered_out_candidates": result.get("filtered_out_candidates") or [],
             "retrieval_skipped_reason": result.get("retrieval_skipped_reason"),

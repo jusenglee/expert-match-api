@@ -1,18 +1,17 @@
-"""QdrantHybridRetriever 테스트 (flat chunk 모델, v2.1 — query_points_groups 기반).
+"""QdrantHybridRetriever 테스트 (flat chunk 모델, v2.1 — 멀티뷰 flat 검색 + 관련도 재점수).
 
 검증 계약:
-- 단일 grouped 하이브리드 검색(query_points_groups, group_by=researcher_id) 1콜.
-  prefetch=[dense(vector_e5i), sparse(vector_splade)], query=FusionQuery.RRF, group_size/limit 설정값.
-- 그룹 → ResearcherCandidate. group_score = Σ chunk_score × doc_type_prior (doc_type별 chunk cap).
-- evidence chunk는 cap과 무관하게 모두 보관. exclude_orgs 후처리 배제.
-- search_weighted()는 grouped RRF로 통일(search()와 동일 경로).
-네트워크/실모델 금지 — FakeGroupsClient + Recording 인코더 스텁만.
+- search()는 view별 flat query_points를 1콜씩(dense_full + sparse_raw/focus + concept:<id>).
+  질의를 정규식으로 깎지 않고 원문을 dense/sparse_raw로 보존한다.
+- 결과는 payload.chunk_id 기준 병합(point_id 아님). chunk 점수 = Σ view_weight × normalized rank.
+- chunk는 검색 후 concept 태깅(view hit ∪ alias). 후보 점수 = capped evidence score(relevance).
+- required_concepts 전부 충족(joint/separate)은 main tier, 부분충족(partial)은 fallback tier.
+- query_points_groups는 search_grouped_diagnostic()로 분리(진단/AB 전용).
+네트워크/실모델 금지 — FakeFlatClient + Recording 인코더 스텁만.
 """
 
 import asyncio
 from types import SimpleNamespace
-
-from qdrant_client import models
 
 from apps.core.config import Settings
 from apps.domain.models import PlannerOutput, ResearcherCandidate
@@ -21,27 +20,54 @@ from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
 from apps.search.sparse_runtime import SparseRuntimeConfig
 
+# concept view 텍스트 = concept_registry의 query_terms join (planner 미산출 시 registry 감지).
+AI_VIEW_TEXT = "인공지능 AI 머신러닝 딥러닝 신경망"
+SEMI_VIEW_TEXT = "반도체 시스템반도체 반도체소자"
+JOINT_FOCUS_TEXT = "인공지능 반도체"  # sparse_focus = ConceptPlan.focus_query(concept label 중심)
+
 
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
-class FakeGroupsClient:
-    """query_points_groups를 흉내. groups_spec: [(researcher_id, [(payload, score), ...]), ...]."""
+class FakeFlatClient:
+    """query_points/query_points_groups를 흉내.
 
-    def __init__(self, groups_spec: list[tuple[str, list[tuple[dict, float]]]]) -> None:
-        self._spec = groups_spec
+    points_by_view: {view_key: [(payload, score), ...]} — view_key = "dense" 또는 ("sparse", text).
+    default_points: view_key 미지정 시 모든 view가 반환할 기본 목록.
+    """
+
+    def __init__(self, *, default_points=None, points_by_view=None, groups_spec=None) -> None:
+        self.default_points = default_points or []
+        self.points_by_view = points_by_view or {}
+        self.groups_spec = groups_spec or []
         self.calls: list[dict] = []
+        self.group_calls: list[dict] = []
+
+    def query_points(self, **kwargs):
+        self.calls.append(kwargs)
+        spec = self.points_by_view.get(self._view_key(kwargs), self.default_points)
+        points = [
+            SimpleNamespace(id=payload.get("chunk_id"), payload=payload, score=score)
+            for payload, score in spec
+        ]
+        return SimpleNamespace(points=points)
 
     def query_points_groups(self, **kwargs):
-        self.calls.append(kwargs)
+        self.group_calls.append(kwargs)
         groups = []
-        for rid, hits in self._spec:
-            points = [
+        for rid, hits in self.groups_spec:
+            pts = [
                 SimpleNamespace(id=payload.get("chunk_id"), payload=payload, score=score)
                 for payload, score in hits
             ]
-            groups.append(SimpleNamespace(id=rid, hits=points))
+            groups.append(SimpleNamespace(id=rid, hits=pts))
         return SimpleNamespace(groups=groups)
+
+    @staticmethod
+    def _view_key(kwargs):
+        if kwargs.get("using") == DENSE_VECTOR_NAME:
+            return "dense"
+        return ("sparse", getattr(kwargs.get("query"), "text", None))
 
 
 class RecordingDenseEncoder:
@@ -100,6 +126,15 @@ def _chunk_payload(
     }
 
 
+def _retriever(client, **settings_overrides) -> QdrantHybridRetriever:
+    return QdrantHybridRetriever(
+        client=client,
+        settings=_settings(**settings_overrides),
+        dense_encoder=RecordingDenseEncoder(),
+        query_builder=QueryTextBuilder(),
+    )
+
+
 def _run(retriever, *, query="검색 질의", core=None, **plan_kwargs):
     plan = PlannerOutput(
         intent_summary=query,
@@ -108,15 +143,6 @@ def _run(retriever, *, query="검색 질의", core=None, **plan_kwargs):
         **plan_kwargs,
     )
     return asyncio.run(retriever.search(query=query, plan=plan, query_filter=None))
-
-
-def _retriever(client, **settings_overrides) -> QdrantHybridRetriever:
-    return QdrantHybridRetriever(
-        client=client,
-        settings=_settings(**settings_overrides),
-        dense_encoder=RecordingDenseEncoder(),
-        query_builder=QueryTextBuilder(),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -131,133 +157,196 @@ def test_sort_hits_breaks_ties_by_name_then_researcher_id():
 
 
 # ---------------------------------------------------------------------------
-# search() — grouped hybrid RRF
+# view shape — one flat query_points per view, raw query preserved
 # ---------------------------------------------------------------------------
-def test_search_groups_into_researcher_candidates():
-    client = FakeGroupsClient(
-        [
-            ("M2", [(_chunk_payload("M2", "Bravo"), 0.91)]),
-            ("M1", [(_chunk_payload("M1", "Alpha"), 0.90)]),
-        ]
-    )
-    result = _run(_retriever(client), core=["AI semiconductor", "chip design"])
-
-    assert all(isinstance(hit, ResearcherCandidate) for hit in result.hits)
-    assert {hit.researcher_id for hit in result.hits} == {"M1", "M2"}
-    assert all(len(hit.chunks) >= 1 for hit in result.hits)
-    assert isinstance(result.queries, CompiledQueries)
-    assert result.retrieval_keywords == ["AI", "semiconductor", "chip", "design"]
-
-    # query_points_groups 단일 콜.
-    assert len(client.calls) == 1
-    assert result.query_payload["retrieval_mode"] == "grouped_hybrid_rrf"
-    assert result.query_payload["group_count"] == 2
-    assert result.query_payload["aggregated_candidate_count"] == 2
-    assert result.query_payload["final_hit_count"] == 2
-
-    # score traces: 후보별 1건 + doc_types/family_contributions.
-    assert len(result.retrieval_score_traces) == 2
-    trace = result.retrieval_score_traces[0]
-    assert trace["expert_id"] in {"M1", "M2"}
-    assert set(trace["doc_types"]) == {"paper"}
-    assert "achievement" in trace["family_contributions"]
-
-
-def test_search_uses_grouped_hybrid_query_shape():
-    client = FakeGroupsClient([("M1", [(_chunk_payload("M1", "Alpha"), 0.9)])])
-    settings_obj = _settings()
+def test_search_runs_one_flat_query_per_view_dense_first():
+    raw_query = "인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"
+    dense_encoder = RecordingDenseEncoder()
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Alpha"), 0.9)])
     retriever = QdrantHybridRetriever(
-        client=client, settings=settings_obj,
-        dense_encoder=RecordingDenseEncoder(), query_builder=QueryTextBuilder(),
+        client=client, settings=_settings(),
+        dense_encoder=dense_encoder, query_builder=QueryTextBuilder(),
     )
-    asyncio.run(retriever.search(
-        query="single vector check",
-        plan=PlannerOutput(intent_summary="x", retrieval_core=["alpha"], core_keywords=["alpha"]),
-        query_filter=None,
-    ))
+    result = asyncio.run(
+        retriever.search(
+            query=raw_query,
+            plan=PlannerOutput(
+                intent_summary=raw_query,
+                retrieval_core=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
+                core_keywords=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
+                semantic_query="인공지능 반도체 경험 연구자",
+            ),
+            query_filter=None,
+        )
+    )
 
-    assert len(client.calls) == 1
-    call = client.calls[0]
-    assert call["collection_name"] == settings_obj.qdrant_collection_name
-    assert call["group_by"] == "researcher_id"
-    assert call["group_size"] == settings_obj.group_size
-    assert call["limit"] == settings_obj.retrieval_limit
-    prefetch = call["prefetch"]
-    assert len(prefetch) == 2
-    assert prefetch[0].using == DENSE_VECTOR_NAME
-    assert prefetch[1].using == SPARSE_VECTOR_NAME
-    assert prefetch[0].limit == settings_obj.prefetch_limit
-    assert isinstance(call["query"], models.FusionQuery)
-    assert call["query"].fusion == models.Fusion.RRF
-
-
-def test_search_app_side_rrf_accumulation_with_doc_type_prior():
-    # 그룹에 paper(prior 1.0) + specialty(prior 0.5) → group_score = 0.8*1.0 + 0.4*0.5 = 1.0
-    group_hits = [
-        (_chunk_payload("M1", "Alpha", doc_type="paper", chunk_index=0), 0.8),
-        (_chunk_payload("M1", "Alpha", doc_type="specialty", chunk_index=0), 0.4),
+    # 질의 원문 보존: dense는 원문 그대로 임베드(regex 정제 없음).
+    assert dense_encoder.inputs == [raw_query]
+    # dense_full + sparse_raw + sparse_focus + concept:ai + concept:semiconductor = 5 view.
+    assert len(client.calls) == 5
+    assert client.calls[0]["using"] == DENSE_VECTOR_NAME
+    assert all(call["using"] == SPARSE_VECTOR_NAME for call in client.calls[1:])
+    sparse_texts = [call["query"].text for call in client.calls[1:]]
+    assert sparse_texts == [
+        raw_query,
+        JOINT_FOCUS_TEXT,
+        AI_VIEW_TEXT,
+        SEMI_VIEW_TEXT,
     ]
-    client = FakeGroupsClient([("M1", group_hits)])
-    retriever = _retriever(client, doc_type_priors={"specialty": 0.5})
-    result = _run(retriever)
+    assert result.query_payload["retrieval_mode"] == "multiview_flat_relevance"
+    assert result.query_payload["search_query_plan"]["dense_query"] == raw_query
+    assert result.query_payload["relevance_gate_active_concepts"] == ["ai", "semiconductor"]
+    assert isinstance(result.queries, CompiledQueries)
+
+
+# ---------------------------------------------------------------------------
+# chunk_id merge across views
+# ---------------------------------------------------------------------------
+def test_search_merges_chunks_by_chunk_id_across_views():
+    points = [
+        (_chunk_payload("M1", "Alpha", chunk_index=0, text="인공지능 반도체 설계"), 0.9),
+        (_chunk_payload("M1", "Alpha", chunk_index=1, text="반도체 공정 인공지능 가속기"), 0.8),
+    ]
+    client = FakeFlatClient(default_points=points)
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
 
     assert len(result.hits) == 1
-    assert result.hits[0].group_score == 0.8 * 1.0 + 0.4 * 0.5
+    candidate = result.hits[0]
+    assert candidate.researcher_id == "M1"
+    # 같은 chunk가 여러 view에서 회수돼도 chunk_id로 1건 병합(중복 아님).
+    assert len(candidate.chunks) == 2
+    # dense + sparse view 모두에서 잡혔으므로 sources 다중.
+    assert "dense_full" in candidate.chunks[0].sources
+    assert any(src.startswith("sparse") or src.startswith("concept:") for src in candidate.chunks[0].sources)
+    assert candidate.coverage_type == "joint"  # 두 concept view가 동일 chunk를 잡음
+    assert candidate.group_score > 0.0
+    assert result.query_payload["merged_chunk_count"] == 2
 
 
-def test_search_doc_type_chunk_cap_limits_score_contribution():
-    # 같은 (researcher, doc_type)에서 chunk가 cap보다 많아도 점수 기여는 cap개까지만.
-    hits = [(_chunk_payload("M1", "Prolific", doc_type="paper", chunk_index=i), 0.9) for i in range(5)]
-    client = FakeGroupsClient([("M1", hits)])
-    result = _run(_retriever(client, doc_type_chunk_cap=2))
+# ---------------------------------------------------------------------------
+# concept tagging + required gate (main vs fallback tier)
+# ---------------------------------------------------------------------------
+def test_search_partial_coverage_routed_to_fallback_tier():
+    # concept:ai view에서만 잡힌 중립 텍스트 chunk → 'ai'만 태깅 → 부분충족(partial).
+    neutral = _chunk_payload("M1", "Alpha", text="인공지능 데이터 분석 연구")
+    client = FakeFlatClient(points_by_view={("sparse", AI_VIEW_TEXT): [(neutral, 0.5)]})
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
 
     assert len(result.hits) == 1
-    hit = result.hits[0]
-    assert len(hit.chunks) == 5  # evidence chunk는 모두 보관
-    # 점수 기여는 cap(2)개 × 0.9 = 1.8
-    assert hit.group_score == 0.9 * 2
+    candidate = result.hits[0]
+    assert candidate.matched_concepts == ["ai"]
+    assert candidate.coverage_type == "partial"
+    assert result.query_payload["main_count"] == 0
+    assert result.query_payload["fallback_count"] == 1
+
+
+def test_search_main_tier_ranks_above_fallback_tier():
+    joint_chunk = _chunk_payload("1", "Full", chunk_index=0, text="인공지능 반도체 설계 연구")
+    partial_chunk = _chunk_payload("2", "Half", chunk_index=0, text="인공지능 데이터 분석 연구")
+    client = FakeFlatClient(
+        points_by_view={
+            "dense": [(joint_chunk, 0.9)],
+            ("sparse", AI_VIEW_TEXT): [(joint_chunk, 0.9), (partial_chunk, 0.5)],
+            ("sparse", SEMI_VIEW_TEXT): [(joint_chunk, 0.9)],
+        }
+    )
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
+
+    ids = [hit.researcher_id for hit in result.hits]
+    assert ids == ["1", "2"]  # required 충족 후보가 부분충족보다 항상 위.
+    assert result.hits[0].coverage_type in {"joint", "separate"}
+    assert result.hits[1].coverage_type == "partial"
+
+
+def test_search_gate_drops_partial_when_fallback_disabled():
+    neutral = _chunk_payload("M1451331", "나관식", text="인공지능 데이터 분석 연구")
+    client = FakeFlatClient(points_by_view={("sparse", AI_VIEW_TEXT): [(neutral, 0.5)]})
+    result = _run(
+        _retriever(client, relevance_fallback_tier=False),
+        query="인공지능 반도체",
+        core=["인공지능", "반도체"],
+    )
+
+    assert result.hits == []
+    assert result.filtered_out_candidates == [
+        {
+            "expert_id": "M1451331",
+            "name": "나관식",
+            "reason": "relevance_concepts_missing",
+            "matched_concepts": ["ai"],
+            "missing_concepts": ["semiconductor"],
+        }
+    ]
+
+
+def test_search_generic_query_without_concepts_ranks_by_evidence():
+    # 전부 일반어(GENERIC_SEARCH_TERMS) → query_exact 합성도 비어 source=none, generic 폴백.
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Generic", text="모호성 가설 재검토"), 0.8)])
+    result = _run(_retriever(client), query="연구 산업 개발", core=["연구", "산업", "개발"])
+
+    assert [hit.researcher_id for hit in result.hits] == ["M1"]
+    assert result.hits[0].group_score > 0.0
+    assert result.hits[0].coverage_type == ""  # concept 미감지 → generic 폴백
+    assert result.query_payload["relevance_gate_active_concepts"] == []
+    assert result.query_payload["concept_plan"]["source"] == "none"
+
+
+def test_search_query_exact_when_planner_and_registry_miss():
+    # registry 밖 도메인 + 비일반어 retrieval_core → query_exact concept(optional) 합성으로 정렬 견고화.
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Meta", text="메타물질 음굴절 광학 소자"), 0.8)])
+    result = _run(_retriever(client), query="메타물질 음굴절 전문가", core=["메타물질", "음굴절"])
+
+    assert result.query_payload["concept_plan"]["source"] == "query_exact"
+    assert result.query_payload["relevance_gate_active_concepts"] == []  # optional이라 gate 미작동
+    assert result.hits[0].researcher_id == "M1"
+    assert set(result.hits[0].matched_concepts) == {"메타물질", "음굴절"}
+
+
+# ---------------------------------------------------------------------------
+# org exclusion / invalid / empty
+# ---------------------------------------------------------------------------
+def test_search_excludes_candidates_by_org():
+    points = [
+        (_chunk_payload("1", "Keep", text="인공지능 반도체", organization="서울대학교"), 0.9),
+        (_chunk_payload("2", "Drop", text="인공지능 반도체", organization="한국전자통신연구원"), 0.9),
+    ]
+    client = FakeFlatClient(default_points=points)
+    result = asyncio.run(
+        _retriever(client).search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(
+                intent_summary="x", retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"], exclude_orgs=["한국전자통신연구원"],
+            ),
+            query_filter=None,
+        )
+    )
+    assert {hit.researcher_id for hit in result.hits} == {"1"}
+    assert any(f["expert_id"] == "2" and f["reason"] == "excluded_org" for f in result.filtered_out_candidates)
 
 
 def test_search_skips_invalid_points():
-    hits = [
+    points = [
         ({"researcher_id": "bad", "researcher_name": "Broken"}, 0.9),  # chunk_id/doc_type 없음
-        (_chunk_payload("good", "Valid"), 0.8),
+        (_chunk_payload("good", "Valid", text="인공지능 반도체"), 0.8),
     ]
-    client = FakeGroupsClient([("good", hits)])
-    result = _run(_retriever(client))
+    client = FakeFlatClient(default_points=points)
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
 
-    assert len(result.hits) == 1
-    assert result.hits[0].researcher_id == "good"
-    assert len(result.hits[0].chunks) == 1  # 깨진 point는 skip
-
-
-def test_search_excludes_candidates_by_org():
-    client = FakeGroupsClient(
-        [
-            ("1", [(_chunk_payload("1", "Keep", organization="서울대학교"), 0.9)]),
-            ("2", [(_chunk_payload("2", "Drop", organization="한국전자통신연구원"), 0.9)]),
-        ]
-    )
-    retriever = _retriever(client)
-    result = asyncio.run(retriever.search(
-        query="exclude org",
-        plan=PlannerOutput(intent_summary="x", core_keywords=["x"], exclude_orgs=["한국전자통신연구원"]),
-        query_filter=None,
-    ))
-    ids = {hit.researcher_id for hit in result.hits}
-    assert ids == {"1"}
-    assert any(f["expert_id"] == "2" for f in result.filtered_out_candidates)
+    assert [hit.researcher_id for hit in result.hits] == ["good"]
+    assert len(result.hits[0].chunks) == 1
 
 
-def test_search_returns_empty_when_no_groups():
-    client = FakeGroupsClient([])
+def test_search_returns_empty_when_no_points():
+    client = FakeFlatClient(default_points=[])
     result = _run(_retriever(client))
     assert result.hits == []
-    assert result.query_payload["group_count"] == 0
+    assert result.query_payload["merged_chunk_count"] == 0
+    assert result.query_payload["final_hit_count"] == 0
 
 
 def test_search_uses_active_sparse_runtime_model():
-    client = FakeGroupsClient([("M1", [(_chunk_payload("M1", "Alpha"), 0.9)])])
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Alpha"), 0.9)])
     retriever = QdrantHybridRetriever(
         client=client, settings=_settings(),
         dense_encoder=RecordingDenseEncoder(), query_builder=QueryTextBuilder(),
@@ -267,19 +356,40 @@ def test_search_uses_active_sparse_runtime_model():
         ),
     )
     _run(retriever)
-    # sparse prefetch(Document)의 model이 활성 런타임 모델.
-    sparse_prefetch = client.calls[0]["prefetch"][1]
-    assert sparse_prefetch.query.model == "Qdrant/bm25"
+    sparse_calls = [c for c in retriever.client.calls if c["using"] == SPARSE_VECTOR_NAME]
+    assert sparse_calls
+    assert all(c["query"].model == "Qdrant/bm25" for c in sparse_calls)
 
 
-def test_search_weighted_is_grouped_alias():
-    client = FakeGroupsClient([("M1", [(_chunk_payload("M1", "Alpha"), 0.9)])])
+# ---------------------------------------------------------------------------
+# search_weighted alias + grouped diagnostic
+# ---------------------------------------------------------------------------
+def test_search_weighted_is_multiview_alias():
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Alpha", text="인공지능 반도체"), 0.9)])
     retriever = _retriever(client)
     result = asyncio.run(retriever.search_weighted(
-        query="weighted unified",
-        plan=PlannerOutput(intent_summary="x", retrieval_core=["alpha"], core_keywords=["alpha"]),
+        query="인공지능 반도체",
+        plan=PlannerOutput(intent_summary="x", retrieval_core=["인공지능", "반도체"], core_keywords=["인공지능", "반도체"]),
+        query_filter=None,
+    ))
+    assert [hit.researcher_id for hit in result.hits] == ["M1"]
+    assert result.query_payload["retrieval_mode"] == "multiview_flat_relevance"
+    assert client.calls  # flat 검색 사용
+    assert client.group_calls == []  # grouped 미사용
+
+
+def test_search_grouped_diagnostic_uses_query_points_groups():
+    client = FakeFlatClient(
+        groups_spec=[("M1", [(_chunk_payload("M1", "Alpha", text="인공지능 반도체 설계"), 0.9)])]
+    )
+    retriever = _retriever(client)
+    result = asyncio.run(retriever.search_grouped_diagnostic(
+        query="인공지능 반도체",
+        plan=PlannerOutput(intent_summary="x", retrieval_core=["인공지능", "반도체"], core_keywords=["인공지능", "반도체"]),
         query_filter=None,
     ))
     assert [hit.researcher_id for hit in result.hits] == ["M1"]
     assert result.query_payload["retrieval_mode"] == "grouped_hybrid_rrf"
-    assert len(client.calls) == 1  # grouped 단일 콜(가중 fan-out 폐기)
+    assert len(client.group_calls) == 1
+    assert client.group_calls[0]["group_by"] == "researcher_id"
+    assert result.query_payload["group_count"] == 1

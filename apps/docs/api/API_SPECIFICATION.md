@@ -172,9 +172,11 @@
   },
   "issues": [],
   "collection_name": "ntis_researcher_chunks",
-  "sample_point_id": "paper_100000045256_c000"
+  "sample_point_id": "11008395"
 }
 ```
+
+`sample_point_id`는 Qdrant의 실제 Point ID 표본이다. 운영 컬렉션에서는 UUID/숫자형 문자열일 수 있으며, evidence 식별자는 payload root의 `chunk_id`를 기준으로 한다.
 
 ### 5) 헬스체크 — `GET /health`
 앱 생존만 반환(의존성 미검증).

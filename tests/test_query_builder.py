@@ -71,3 +71,46 @@ def test_query_builder_does_not_expand_bundle_ids():
     assert queries.expanded == queries.stable
     assert keyword_queries.stable == "드론 화재 진압"
     assert keyword_queries.expanded == keyword_queries.stable
+
+
+def test_query_builder_derives_concept_fields_from_concept_plan():
+    # concept 필드(required/sparse_concept_queries/sparse_focus)는 동적 ConceptPlan에서 파생.
+    from apps.search.relevance import resolve_concept_plan
+
+    builder = QueryTextBuilder()
+    raw_query = "인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"
+    plan = PlannerOutput(
+        intent_summary=raw_query,
+        retrieval_core=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
+        core_keywords=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
+        semantic_query="인공지능과 반도체 경험을 함께 보유한 연구자",
+    )
+    concept_plan = resolve_concept_plan(plan, raw_query)  # registry 감지 → ai, semiconductor
+
+    query_plan = builder.build_search_query_plan(raw_query, plan, concept_plan)
+
+    assert query_plan.raw_query == raw_query
+    assert query_plan.dense_query == raw_query
+    # sparse_focus = concept label 중심 짧은 명사구(과확장 억제).
+    assert query_plan.sparse_joint_query == "인공지능 반도체"
+    assert set(query_plan.sparse_concept_queries) == {"ai", "semiconductor"}
+    assert query_plan.required_concepts == ["ai", "semiconductor"]
+    assert "전문성" in query_plan.drop_terms_for_sparse
+
+
+def test_query_builder_without_concept_plan_leaves_concepts_empty():
+    # concept_plan 없이 호출하면 concept 필드는 비고, sparse_focus는 키워드 폴백(일반어 제거).
+    builder = QueryTextBuilder()
+    raw_query = "AI반도체 설계 경험 연구자"
+    plan = PlannerOutput(
+        intent_summary=raw_query,
+        retrieval_core=["AI반도체", "설계 경험"],
+        core_keywords=["AI반도체", "설계 경험"],
+    )
+
+    query_plan = builder.build_search_query_plan(raw_query, plan)
+
+    assert query_plan.required_concepts == []
+    assert query_plan.sparse_concept_queries == {}
+    assert "AI반도체" in query_plan.sparse_joint_query  # 키워드 폴백
+    assert "경험" not in query_plan.sparse_joint_query   # 일반어 제거

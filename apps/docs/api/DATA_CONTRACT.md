@@ -10,6 +10,7 @@
 > `researcher_meta` 같은 중첩 객체는 **없다.** 날짜는 단일 `doc_date`(문자열, 결측은 `"NONE"`).
 > doc_type은 **정확히 5종**: `paper` / `patent` / `project` / `assessor_activity` / `specialty`. (구 11종 분기 폐기)
 > 적재는 외부 제공자 소관이며(이전 `apps/ingest`는 `legacy_v1x/`로 격리), 본 서비스는 검색·집계·근거 선별·사유 생성만 담당한다.
+> 런타임 evidence 식별자는 **payload root의 `chunk_id`** 가 authoritative 하다. Qdrant Point ID는 운영 컬렉션에 따라 `chunk_id`와 같을 수도 있고 UUID일 수도 있으나, evidence resolve와 trace는 `payload.chunk_id`를 기준으로 한다.
 
 ---
 
@@ -72,24 +73,27 @@
 
 ## 2. 쿼리 빌더 규약 (Query Builder Contract)
 
-`QueryTextBuilder`는 플래너 출력으로 검색 텍스트를 만든다.
-- 원본 사용자 질의, `intent_summary`, `role_terms`, `action_terms`는 검색 텍스트(임베딩 입력)에서 제외.
-- 1단계 sparse 키워드 텍스트는 `retrieval_core`/`core_keywords` 결합으로 생성.
-- 2단계 하이브리드 텍스트는 `semantic_query`가 있으면 사용, 없으면 동일 키워드 텍스트.
-- v1.x의 확장 사전(`basic`/`art`/`pat`/`pjt`, `bundle_ids`)은 active 검색 경로에서 제거됐다. trace 호환용 stable/expanded 쌍은 유지하지만, `expanded`는 추가 확장어 없이 `stable`과 동일한 텍스트다.
-- doc_type별 별도 텍스트 hint를 만들지 않는다. doc_type은 **payload 필터**로 분기하며 임베딩 텍스트는 단일하다(별도 named vector 없음).
+`QueryTextBuilder`는 플래너 출력과 사용자 원문으로 `SearchQueryPlan`을 만든다.
+- `raw_query`: 사용자 원문. 로그, trace, dense 의미 검색의 기준.
+- `dense_query`: 기본적으로 `raw_query`. Dense encoder에는 원문 의미를 보존해 넣는다.
+- `sparse_joint_query`: SPLADE 1차 회수용 짧은 자연문/명사구. 예: `인공지능 반도체 연구개발 산업 경험`.
+- `sparse_concept_queries`: 필수 개념별 보조 SPLADE query. 예: `ai`, `semiconductor`, `semiconductor_experience`.
+- `required_concepts`: 연구자 집계 후 반드시 coverage를 확인할 개념. 현재 좁은 gate는 `ai`, `semiconductor`를 지원한다.
+- `optional_concepts`: 점수/근거 확보 힌트이며 hard gate가 아니다. 예: `research_development`, `industry_experience`.
+- SPLADE query에는 `전문`, `분야`, `연구자`, `가진`, `또는`, `상세` 같은 역할/일반어를 넣지 않는다. `연구/개발/산업/경험`은 단독어가 아니라 `반도체 연구개발`, `반도체 산업 경험` 같은 도메인 결합 문맥에서만 남긴다.
+- v1.x의 확장 사전(`basic`/`art`/`pat`/`pjt`, `bundle_ids`)은 active 검색 경로에서 제거됐다. trace 호환용 stable/expanded 쌍은 유지하지만, 현재 검색기의 stable/expanded는 dense query와 동일하다.
 
 ---
 
 ## 3. 검색 규약 (Retrieval Contract)
 
-`QdrantHybridRetriever`는 모드 `keyword_pool_then_hybrid` 고정. 컬렉션 1개(`ntis_researcher_chunks`), 단일 dense named vector `vector_e5i`(1024, Cosine) + 단일 sparse named vector `vector_splade`.
+`QdrantHybridRetriever`는 모드 `grouped_hybrid_rrf` 고정. 컬렉션 1개(`researcher_recommend_v1` 또는 운영 override), 단일 dense named vector `vector_e5i`(1024, Cosine) + 단일 sparse named vector `vector_splade`.
 
-- **1단계:** `vector_splade` 키워드 검색 → `researcher_id` 후보 풀 수집(중복 제거).
-- **2단계:** 풀을 `researcher_id MatchAny`로 제한 → dense(`vector_e5i`)+sparse(`vector_splade`) `prefetch` → `FusionQuery(RRF)` (**equal RRF — Qdrant 가중 RRF 금지**). chunk hit 산출.
-- **집계:** chunk hit을 `researcher_id`로 묶어 RRF 누적(연구자 점수). 한 연구자의 동일 doc_type은 상위 N chunk(`doc_type_chunk_cap`, 기본 3)만 점수에 기여, doc_type prior 적용(기본 equal — 앱단 랭크 가중일 뿐 Qdrant score 가중합 아님), 연구자당 1건으로 dedupe.
-- 1단계 풀이 비면 2단계 생략, `keyword_stage_candidate_count=0`.
-- `trace.query_payload`는 1차 풀 크기(`keyword_stage_candidate_count`), 1차 경로별 count(`keyword_stage_path_counts`), 2차 경로별 count(`hybrid_stage_path_counts`), 집계 후보 수(`aggregated_candidate_count`)를 포함한다.
+- **검색:** `query_points_groups(group_by="researcher_id")` 1회. prefetch는 `dense_full` 1개와 `sparse_joint`, `sparse_<concept>` 여러 개로 구성한다. 모든 prefetch는 `FusionQuery(RRF)` (**equal RRF — Qdrant 가중 RRF 금지**)로 융합한다.
+- **chunk gate:** `required_concepts`가 있으면 concept hit가 없는 sibling chunk는 점수와 evidence에서 제거한다.
+- **연구자 coverage gate:** 남은 chunk들이 `required_concepts`를 모두 덮지 못하면 후보를 `reason="relevance_concepts_missing"`로 제거한다.
+- **집계:** 남은 chunk hit을 `researcher_id`로 묶어 RRF 누적(연구자 점수). 한 연구자의 동일 doc_type은 상위 N chunk(`doc_type_chunk_cap`, 기본 3)만 점수에 기여하고, 추가 chunk는 harmonic decay로 체감 반영한다. doc_type prior는 기본 equal이며 앱단 랭크 가중일 뿐 Qdrant score 가중합이 아니다.
+- `trace.query_payload`는 `search_query_plan`, `group_count`, `aggregated_candidate_count`, `relevance_gate_active_concepts`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`를 포함한다.
 - `trace.query_payload`는 검색 키워드/텍스트만 노출하며 dense/sparse 벡터 값과 전체 payload는 노출하지 않는다.
 
 ---

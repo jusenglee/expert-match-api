@@ -5,7 +5,7 @@
 
 런타임 파이프라인은 `planner → retrieval(chunk 검색 → 연구자 집계) → evidence_selector → reasoner` 4단계다. `RecommendationService.search_candidates()`가 진입점이며, `/recommend`는 여기에 evidence 선별 + 사유 생성을 더한다.
 
-> **데이터 단위 전제(실데이터 기준).** 1 chunk = 1 Qdrant Point, Point ID == `chunk_id`. payload는 **flat**이다 — 연구자 공통 메타(`researcher_id`, `researcher_name`, `affiliated_organization`, `highest_degree`, `publication_count`, `scie_publication_count`, `intellectual_property_count`, `research_project_count`, `researcher_assessor_activity_count`)가 **root에 비정규화 반복**되고, doc_type별 상세만 `doc_attrs{}`에 들어간다. 날짜는 단일 `doc_date`(문자열, 결측이면 `"NONE"`)다. doc_type은 **paper / patent / project / assessor_activity / specialty 5종**이며, 모든 chunk에 동일하게 존재한다. 적재(ingestion)는 외부 제공자 소관이고 본 시스템은 검색·집계·추천만 담당한다.
+> **데이터 단위 전제(실데이터 기준).** 1 chunk = 1 Qdrant Point이며 payload는 **flat**이다 — 연구자 공통 메타(`researcher_id`, `researcher_name`, `affiliated_organization`, `highest_degree`, `publication_count`, `scie_publication_count`, `intellectual_property_count`, `research_project_count`, `researcher_assessor_activity_count`)가 **root에 비정규화 반복**되고, doc_type별 상세만 `doc_attrs{}`에 들어간다. 날짜는 단일 `doc_date`(문자열, 결측이면 `"NONE"`)다. doc_type은 **paper / patent / project / assessor_activity / specialty 5종**이며, 모든 chunk에 동일하게 존재한다. evidence 식별자는 payload root의 **`chunk_id`** 가 authoritative 하며, Qdrant Point ID가 UUID인 컬렉션에서도 런타임은 `payload.chunk_id`를 기준으로 검색 근거를 resolve한다. 적재(ingestion)는 외부 제공자 소관이고 본 시스템은 검색·집계·추천만 담당한다.
 
 ---
 
@@ -27,15 +27,16 @@
 
 ## 2. 검색 및 집계 (Retrieval & Aggregation)
 
-`QueryTextBuilder`는 1단계 sparse 키워드 검색에 `retrieval_core`/`core_keywords` 텍스트를, 2단계 하이브리드에 `semantic_query`(없으면 동일 키워드 텍스트)를 만든다. role/action 용어와 원본 질의는 검색 텍스트로 쓰지 않는다. v1.x 확장 사전은 제거됐으므로 trace 호환용 `expanded` 경로도 별도 확장어 없이 `stable`과 같은 텍스트를 사용한다.
+`QueryTextBuilder`는 채널별 `SearchQueryPlan`을 만든다. dense는 사용자 원문(`raw_query`) 중심이고, SPLADE는 원문 전체가 아니라 짧은 `sparse_joint_query`와 concept별 `sparse_concept_queries`를 사용한다. 예: `raw_query="인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"` → `dense_query=raw_query`, `sparse_joint_query="인공지능 반도체 연구개발 산업 경험"`, concept query는 `ai`, `semiconductor`, `semiconductor_experience`로 분리한다.
 
-`QdrantHybridRetriever` 동작 (모드 `keyword_pool_then_hybrid` 고정):
+`QdrantHybridRetriever` 동작 (모드 `grouped_hybrid_rrf` 고정):
 
-1. **1단계 — 키워드 풀:** `vector_splade`(sparse named vector)로 sparse 키워드 검색 → `researcher_id` 후보 풀을 중복 없이 수집. 풀이 비면 2단계 생략, 빈 결과 + `keyword_stage_candidate_count=0`.
-2. **2단계 — 하이브리드:** 후보 풀을 `researcher_id MatchAny` 필터로 제한. doc_type(또는 family) 경로별로 `vector_e5i`(dense)+`vector_splade`(sparse) `prefetch` 조립 → `FusionQuery(RRF)`로 chunk hit 산출. doc_type은 named vector가 아니라 **payload 필터**로 분기한다.
-3. **3단계 — 연구자 집계:** chunk hit을 `researcher_id`로 묶고 RRF 누적으로 연구자 점수 산출. 한 연구자의 동일 doc_type에서는 상위 N개 chunk만 점수에 기여(`doc_type_chunk_cap`, 기본 3), 집계 prior 적용(기본 equal), 연구자당 1건으로 dedupe.
-4. **4단계 — hard filter:** `doc_date` 최근성(여러 doc_type은 OR/min_should), flat root `*_count` 최소 실적, 학위, 제외 기관을 deterministic 적용. 제외 기관은 root `affiliated_organization`(Qdrant 필터) + 매칭 chunk의 `doc_attrs.performing_organization`/`doc_attrs.managing_agency`(앱단 post-filter)로 교차 배제한다.
-5. **5단계 — 결정론적 정렬:** score 내림차순 → `researcher_name` 오름차순 → `researcher_id` 오름차순.
+1. **검색 — grouped hybrid RRF:** `query_points_groups(group_by="researcher_id")` 1회. prefetch는 `dense_full` + `sparse_joint` + `sparse_<concept>`로 구성하고, Qdrant `FusionQuery(RRF)` equal로 chunk hit을 산출한다.
+2. **chunk concept gate:** `required_concepts`가 있으면 concept hit가 없는 sibling chunk를 제거한다.
+3. **연구자 coverage gate:** 남은 chunk들이 `required_concepts` 전체를 덮는 연구자만 후보로 남긴다.
+4. **연구자 집계:** chunk hit을 `researcher_id`로 묶고 RRF 누적으로 연구자 점수 산출. 한 연구자의 동일 doc_type에서는 상위 N개 chunk만 점수에 기여(`doc_type_chunk_cap`, 기본 3), 같은 doc_type 추가 chunk는 harmonic decay로 체감 반영한다. 집계 prior는 기본 equal, 연구자당 1건으로 dedupe.
+5. **hard filter:** `doc_date` 최근성(여러 doc_type은 OR/min_should), flat root `*_count` 최소 실적, 학위, 제외 기관을 deterministic 적용. 제외 기관은 root `affiliated_organization`(Qdrant 필터) + 매칭 chunk의 `doc_attrs.performing_organization`/`doc_attrs.managing_agency`(앱단 post-filter)로 교차 배제한다.
+6. **결정론적 정렬:** score 내림차순 → `researcher_name` 오름차순 → `researcher_id` 오름차순.
 
 각 후보에는 어떤 doc_type/chunk이 어떤 순위로 매칭됐는지 `retrieval_score_traces`로 기록한다.
 
@@ -79,17 +80,17 @@
 - `raw_query`, `planner_keywords`, `retrieval_keywords` — 원본 질의/추출/실제 검색 키워드
 - `reason_generation_trace` — 사유 생성 상세
 - `retrieval_score_traces` — 후보별 매칭 doc_type/chunk과 순위 근거
-- `query_payload.retrieval_mode` — `keyword_pool_then_hybrid` 고정
-- `query_payload.retrieval_keywords` / `semantic_query` — 실제 검색 키워드/의미 문장
-- `branch_queries.stable` / `branch_queries.expanded` — 1·2차 경로 호환용 검색 텍스트. lexicon 확장 제거 후 두 값은 보통 동일하다.
-- `query_payload.keyword_stage_candidate_count` — 1차 sparse가 수집한 `researcher_id` 풀 크기
-- `query_payload.hybrid_stage_raw_doc_type_counts` — 2차 doc_type 경로별 raw chunk hit 수
+- `query_payload.retrieval_mode` — `grouped_hybrid_rrf` 고정
+- `query_payload.search_query_plan` — raw/dense/sparse joint/concept query와 required/optional concept
+- `query_payload.retrieval_keywords` / `semantic_query` — planner 키워드/의미 문장
+- `branch_queries.stable` / `branch_queries.expanded` — trace 호환용 검색 텍스트. 현재는 dense query와 동일하다.
+- `query_payload.group_count` — Qdrant grouped 결과 수
+- `query_payload.relevance_gate_active_concepts` / `relevance_*_count` — concept coverage gate 동작
 - `query_payload.aggregated_candidate_count` — 연구자 집계 후 후보 수
-- `query_payload.support_pass_count` / `support_filtered_count` — hard filter 통과/탈락 수
 - `server_logs` — Trace ID + `METHOD /path` 컨텍스트의 단계별 한글 로그
 - `timers` — 구간별 실행 시간
 
-> v1.x 대비 변경: `query_payload.keyword_stage_branch_counts`/`hybrid_stage_raw_branch_counts`의 "branch"가 "doc_type"으로 바뀐다(`*_doc_type_counts`). 외부 trace 변경은 [`../api/EXTERNAL_API_CHANGELOG.md`](../api/EXTERNAL_API_CHANGELOG.md) 참조.
+> v1.x 대비 변경: branch/doc_type fan-out trace와 keyword pool trace는 active grouped path에서 제거됐다. 외부 trace 변경은 [`../api/EXTERNAL_API_CHANGELOG.md`](../api/EXTERNAL_API_CHANGELOG.md) 참조.
 
 ---
 
