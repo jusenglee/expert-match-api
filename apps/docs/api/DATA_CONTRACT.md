@@ -41,6 +41,7 @@
 - `role_terms`/`action_terms`("평가위원", "추천" 등)는 검색 텍스트(임베딩 입력)에 넣지 않는다(벡터 오염 방지).
 - `hard_filters`는 허용 키만 사용한다(아래 §1.1). 미허용 키는 검색 컴파일러가 무시한다.
 - 명시 요청 파라미터(`top_k`, `filters_override`, `exclude_orgs`)는 자연어 추출보다 우선.
+- 사용자 노출 결과 수는 최대 15명이다. 요청 `top_k`는 1~15만 허용하고, planner가 더 큰 `top_k`를 내도 런타임이 15로 clamp한다.
 - 출력이 무효이거나 `core_keywords`가 비면 1회 재시도, 그래도 비면 검색 생략.
 - planner는 doc_type on/off를 결정하지 않는다. 검색 대상 doc_type 축소는 운영 화이트리스트(`NTIS_RETRIEVAL_DOC_TYPES`)로만 한다.
 
@@ -75,8 +76,8 @@
 ## 2. 쿼리 빌더 규약 (Query Builder Contract)
 
 `QueryTextBuilder`는 플래너 출력과 사용자 원문으로 `SearchQueryPlan`을 만든다.
-- `raw_query`: 사용자 원문. 로그, trace, dense 의미 검색의 기준.
-- `dense_query`: 기본적으로 `raw_query`. Dense encoder에는 원문 의미를 보존해 넣는다.
+- `raw_query`: 사용자 원문. 로그, trace, sparse raw 검색의 기준.
+- `dense_query`: `planner.semantic_query` 우선, 없으면 `raw_query` fallback. Dense encoder에는 플래너가 정리한 의미 문장을 먼저 넣는다.
 - `sparse_joint_query`: SPLADE 1차 회수용 짧은 자연문/명사구. 예: `인공지능 반도체 연구개발 산업 경험`.
 - `sparse_concept_queries`: 필수 개념별 보조 SPLADE query. 예: `ai`, `semiconductor`, `semiconductor_experience`.
 - `required_concepts`: 연구자 집계 후 반드시 coverage를 확인할 개념. 현재 좁은 gate는 `ai`, `semiconductor`를 지원한다.
@@ -88,12 +89,14 @@
 
 ## 3. 검색 규약 (Retrieval Contract)
 
-`QdrantHybridRetriever`는 모드 `grouped_hybrid_rrf` 고정. 컬렉션 1개(`researcher_recommend_v1` 또는 운영 override), 단일 dense named vector `vector_e5i`(1024, Cosine) + 단일 sparse named vector `vector_splade`.
+`QdrantHybridRetriever`는 컬렉션 1개(`researcher_recommend_v1` 또는 운영 override), 단일 dense named vector `vector_e5i`(1024, Cosine) + 단일 sparse named vector `vector_splade`를 사용한다.
 
-- **검색:** `query_points_groups(group_by="researcher_id")` 1회. prefetch는 `dense_full` 1개와 `sparse_joint`, `sparse_<concept>` 여러 개로 구성한다. 모든 prefetch는 `FusionQuery(RRF)` (**equal RRF — Qdrant 가중 RRF 금지**)로 융합한다.
-- **chunk gate:** `required_concepts`가 있으면 concept hit가 없는 sibling chunk는 점수와 evidence에서 제거한다.
-- **연구자 coverage gate:** 남은 chunk들이 `required_concepts`를 모두 덮지 못하면 후보를 `reason="relevance_concepts_missing"`로 제거한다.
-- **집계:** 남은 chunk hit을 `researcher_id`로 묶어 RRF 누적(연구자 점수). 한 연구자의 동일 doc_type은 상위 N chunk(`doc_type_chunk_cap`, 기본 3)만 점수에 기여하고, 추가 chunk는 harmonic decay로 체감 반영한다. doc_type prior는 기본 equal이며 앱단 랭크 가중일 뿐 Qdrant score 가중합이 아니다.
+- **검색:** view별 flat `query_points`를 병렬 실행한다. view는 `dense_full`, `sparse_raw`, `sparse_focus`, `concept:<id>`로 구성된다.
+- **융합:** raw score를 더하지 않고 view별 등수 기반 RRF 점수(`rank → 1/(k+rank)`)와 view weight로 chunk 점수를 계산한다.
+- **chunk 병합:** 동일 근거는 Qdrant point id가 아니라 payload root `chunk_id` 기준으로 병합한다.
+- **concept 확정:** `required_concepts` 확인은 `chunk_text`/`doc_id`에 evidence term이 직접 등장할 때만 confirmed로 본다. `doc_attrs` 값은 표시·상세 메타로만 쓰며 concept 확정/gate 근거로 쓰지 않는다.
+- **연구자 coverage gate:** 남은 chunk들이 `required_concepts`를 모두 덮지 못하면 후보를 `reason="relevance_concepts_missing"`로 fallback/제거한다(운영 설정에 따라 fallback tier 유지 가능).
+- **집계:** 남은 chunk hit을 `researcher_id`로 묶어 capped evidence score를 계산한다. 점수는 required-concept best, balance, joint, capped support의 합이며, doc_type prior는 기본 equal이다.
 - `trace.query_payload`는 `search_query_plan`, `group_count`, `aggregated_candidate_count`, `relevance_gate_active_concepts`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`를 포함한다.
 - `trace.query_payload`는 검색 키워드/텍스트만 노출하며 dense/sparse 벡터 값과 전체 payload는 노출하지 않는다.
 - 기관 include/exclude는 정규화된 root 필드가 없으므로 Qdrant exact pre-filter가 아니라 앱단 post-filter에서 root `affiliated_organization`만 기준으로 처리한다. `doc_attrs.performing_organization`/`managing_agency`는 과제 속성이며 소속 필터에 쓰지 않는다.
@@ -148,3 +151,35 @@
 - 심사는 배치(`llm_judge_batch_size`, 기본 10) 단위 순차/병렬로 진행한다.
 
 > v1.x의 evidence id 형식 `paper:N`/`project:N`/`patent:N`은 폐기되고 `chunk_id`로 통일된다. 상세 정책은 [`REASONER_RUNTIME_POLICY.md`](REASONER_RUNTIME_POLICY.md).
+
+---
+
+## 7. 추천 결과 UI/UX 보조 필드 (Additive Response Metadata)
+
+`/recommend.recommendations[*]`는 기존 필드(`name`, `organization`, `fit`, `recommendation_reason`, `evidence`, `rank_score`, `reasons`)를 유지하고, 화면 설명력을 높이기 위한 보조 필드를 추가로 제공한다. 신규 필드는 모두 additive이며 기존 클라이언트가 무시해도 기존 렌더링은 동작한다.
+
+- `match_badges` (list[string]): 카드 상단 조건 충족 배지. 예: `["AI 충족", "반도체 충족", "직접 수행 근거 있음"]`.
+- `match_summary` (string): 카드용 짧은 매칭 요약. `recommendation_reason`을 대체하지 않는다.
+- `match_details` (object):
+  - `matched_concepts`: 충족 concept id 목록.
+  - `missing_concepts`: 미충족 required concept id 목록.
+  - `coverage_type`: `joint` / `separate` / `partial` / 빈 문자열.
+  - `matched_doc_types`: 이번 질의에 매칭되어 최종 evidence로 노출된 doc_type 목록.
+  - `direct_evidence_count`: 합성 `profile`을 제외한 직접 evidence 수.
+- `score_explanation` (object):
+  - `final_score`: 검색 집계 원점수.
+  - `rank_score`: 기존 `rank_score`와 동일한 표시용 0~100 정규화 점수.
+  - `score_breakdown`: concept/joint/support 등 검색 점수 분해.
+  - `top_chunks`: 상위 검색 chunk의 `doc_type`, `title`, `concepts`, `sources`, `score`.
+- `evidence_summary` (object):
+  - `total_profile_counts`: 기존 후보 카드의 누적 실적 count.
+  - `matched_evidence_count`: 이번 질의에서 selector가 매칭한 evidence 수.
+  - `shown_evidence_count`: 응답 `evidence`에 실제 노출된 항목 수.
+
+`trace.strict_filter`는 concept gate에서 제외된 후보를 운영/디버그 화면에 설명하기 위한 trace 필드다.
+`/recommend` 기본 추천 목록은 `missing_concepts`가 없는 후보만 반환하며, 미충족 후보는 이 trace에 남긴다. `/search/candidates`는 검색 후보 관찰용이므로 정렬된 후보 목록과 trace를 그대로 제공한다.
+
+- `enabled`: required concept gate 활성 여부.
+- `required_concepts`: gate에 사용된 required concept 목록.
+- `excluded_candidate_count`: `relevance_concepts_missing`으로 제외된 후보 수.
+- `excluded_reasons`: 제외 후보별 `expert_id`, `name`, `reason`, `matched_concepts`, `missing_concepts`.

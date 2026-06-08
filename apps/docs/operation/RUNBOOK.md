@@ -118,7 +118,7 @@ curl -X POST http://127.0.0.1:8011/recommend `
 ```
 [09:45:51.125] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend top_k=5 exclude_orgs=1 query='드론 화재 진압 평가위원 추천'
 [09:45:52.010] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 완료: retrieval_core=['드론','화재 진압'] core_keywords=['드론','화재 진압'] role_terms=['평가위원'] action_terms=['추천'] semantic_query='드론 기반 화재 진압 기술 전문가' exclude_orgs=['A기관'] hard_filters={} top_k=5
-[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 쿼리 컴파일: mode=grouped_hybrid_rrf retrieval_keywords=['드론','화재','진압'] dense_query='드론 화재 진압 평가위원 추천' sparse_queries={'sparse_joint':'드론 화재 진압'} limits={prefetch:256,group_size:10,groups:80}
+[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 쿼리 컴파일: mode=multiview_flat_relevance retrieval_keywords=['드론','화재','진압'] dense_query='드론 기반 화재 진압 기술 전문가' sparse_queries={'sparse_joint':'드론 화재 진압'} limits={prefetch:256,groups:80}
 [09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] relevance gate: version=v1 active_concepts=[]
 [09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 집계 완료: elapsed_ms=210.0 groups=37 candidates=24 org_filtered=1 final_hits=23
 [09:45:54.330] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms':880,'search_ms':210,'total_ms':3205}

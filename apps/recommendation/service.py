@@ -219,6 +219,7 @@ class RecommendationService:
                 "branch_queries": {},
                 "retrieval_keywords": retrieval_keywords,
                 "retrieval_score_traces": [],
+                "filtered_out_candidates": [],
                 "raw_query": query,
                 "retrieval_skipped_reason": EMPTY_RETRIEVAL_KEYWORDS_REASON,
                 "final_sort_policy": FINAL_SORT_POLICY,
@@ -332,12 +333,24 @@ class RecommendationService:
             search_result.get("top_k_used")
             or _clamp_result_limit(top_k, default=plan.top_k)
         )
-        shortlist = candidate_cards[:top_k_used]
+        recommendation_strict_exclusions = self._build_recommendation_strict_exclusions(
+            candidate_cards
+        )
+        filtered_out_candidates = [
+            *(search_result.get("filtered_out_candidates") or []),
+            *recommendation_strict_exclusions,
+        ]
+        eligible_candidate_cards = [
+            card for card in candidate_cards if not card.missing_concepts
+        ]
+        shortlist = eligible_candidate_cards[:top_k_used]
 
         logger.info(
-            "추천 후보 확정: retrieved_count=%d candidate_cards=%d top_k_used=%d selected=%d shortlist_ids=%s",
+            "추천 후보 확정: retrieved_count=%d candidate_cards=%d strict_eligible=%d strict_excluded=%d top_k_used=%d selected=%d shortlist_ids=%s",
             search_result["retrieved_count"],
             len(candidate_cards),
+            len(eligible_candidate_cards),
+            len(recommendation_strict_exclusions),
             top_k_used,
             len(shortlist),
             [candidate.expert_id for candidate in shortlist],
@@ -372,6 +385,7 @@ class RecommendationService:
                 raw_query=search_result["raw_query"],
                 retrieval_keywords=search_result.get("retrieval_keywords") or [],
                 retrieval_score_traces=search_result.get("retrieval_score_traces") or [],
+                filtered_out_candidates=filtered_out_candidates,
                 retrieval_skipped_reason=search_result.get("retrieval_skipped_reason"),
                 retrieved_count=search_result["retrieved_count"],
                 recommendations=[],
@@ -464,7 +478,9 @@ class RecommendationService:
         ) = self._build_recommendations(
             shortlist,
             reason_output,
+            plan=plan,
             relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+            retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
         )
         reason_generation_trace = dict(reason_generation_trace)
         reason_generation_trace["selected_evidence"] = selected_evidence_trace
@@ -493,6 +509,7 @@ class RecommendationService:
             raw_query=search_result["raw_query"],
             retrieval_keywords=search_result.get("retrieval_keywords") or [],
             retrieval_score_traces=search_result.get("retrieval_score_traces") or [],
+            filtered_out_candidates=filtered_out_candidates,
             retrieval_skipped_reason=search_result.get("retrieval_skipped_reason"),
             retrieved_count=search_result["retrieved_count"],
             recommendations=recommendations,
@@ -538,6 +555,22 @@ class RecommendationService:
         if isinstance(trace, dict):
             return trace
         return None
+
+    @staticmethod
+    def _build_recommendation_strict_exclusions(
+        cards: list[CandidateCard],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "expert_id": card.expert_id,
+                "name": card.name,
+                "reason": "relevance_concepts_missing",
+                "matched_concepts": list(card.matched_concepts),
+                "missing_concepts": list(card.missing_concepts),
+            }
+            for card in cards
+            if card.missing_concepts
+        ]
 
     @staticmethod
     def _batch_candidates(
@@ -700,6 +733,187 @@ class RecommendationService:
         )
 
     @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _concept_label_map(plan: PlannerOutput) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        for spec in plan.concept_specs:
+            labels[spec.id] = spec.label or spec.id
+        for concept in [*plan.required_concepts, *plan.optional_concepts]:
+            labels.setdefault(concept, concept)
+        return labels
+
+    @staticmethod
+    def _format_concept_labels(concepts: list[str], labels: dict[str, str]) -> str:
+        return ", ".join(labels.get(concept, concept) for concept in concepts)
+
+    @classmethod
+    def _build_match_details(
+        cls, *, card: CandidateCard, evidence: list[EvidenceItem]
+    ) -> dict[str, Any]:
+        direct_evidence = [item for item in evidence if item.type != "profile"]
+        coverage_type = card.coverage_type
+        if not coverage_type and card.missing_concepts:
+            coverage_type = "partial"
+        return {
+            "matched_concepts": list(card.matched_concepts),
+            "missing_concepts": list(card.missing_concepts),
+            "coverage_type": coverage_type,
+            "matched_doc_types": _merge_unique_strings(
+                [item.type for item in direct_evidence]
+            ),
+            "direct_evidence_count": len(direct_evidence),
+        }
+
+    @classmethod
+    def _build_match_badges(
+        cls, *, plan: PlannerOutput, match_details: dict[str, Any]
+    ) -> list[str]:
+        labels = cls._concept_label_map(plan)
+        badges = [
+            f"{labels.get(concept, concept)} 충족"
+            for concept in match_details.get("matched_concepts", [])
+        ]
+        coverage_type = match_details.get("coverage_type")
+        if coverage_type == "joint":
+            badges.append("복합 조건 동시 근거")
+        elif coverage_type == "separate":
+            badges.append("조건별 근거 충족")
+        if int(match_details.get("direct_evidence_count") or 0) > 0:
+            badges.append("직접 수행 근거 있음")
+        return _merge_unique_strings(badges)
+
+    @classmethod
+    def _build_match_summary(
+        cls, *, plan: PlannerOutput, match_details: dict[str, Any]
+    ) -> str:
+        labels = cls._concept_label_map(plan)
+        matched = list(match_details.get("matched_concepts") or [])
+        missing = list(match_details.get("missing_concepts") or [])
+        direct_count = int(match_details.get("direct_evidence_count") or 0)
+        if missing:
+            missing_text = cls._format_concept_labels(missing, labels)
+            if matched:
+                matched_text = cls._format_concept_labels(matched, labels)
+                return (
+                    f"{matched_text} 근거는 확인되었지만 "
+                    f"{missing_text} 근거는 아직 부족합니다."
+                )
+            return f"{missing_text} 근거는 아직 부족합니다."
+        if matched:
+            matched_text = cls._format_concept_labels(matched, labels)
+            return f"{matched_text} 근거가 확인되었습니다."
+        if direct_count:
+            return f"질의와 매칭된 직접 근거 {direct_count}건이 확인되었습니다."
+        return "직접적인 질의 일치 근거는 제한적입니다."
+
+    @classmethod
+    def _build_score_explanation(
+        cls,
+        *,
+        card: CandidateCard,
+        retrieval_trace: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        trace = retrieval_trace or {}
+        title_by_chunk_id = {
+            item.get("chunk_id"): item.get("title")
+            for item in card.top_chunks
+            if item.get("chunk_id")
+        }
+        top_chunks: list[dict[str, Any]] = []
+        trace_matches = trace.get("matches") if isinstance(trace.get("matches"), list) else []
+        for item in trace_matches[:10]:
+            if not isinstance(item, dict):
+                continue
+            chunk_id = item.get("chunk_id")
+            score = item.get("score", item.get("fused_score", item.get("contribution", 0.0)))
+            top_chunks.append(
+                {
+                    "doc_type": item.get("doc_type", ""),
+                    "title": item.get("title") or title_by_chunk_id.get(chunk_id),
+                    "concepts": list(item.get("concepts") or []),
+                    "sources": list(item.get("sources") or []),
+                    "score": round(cls._safe_float(score), 6),
+                }
+            )
+        if not top_chunks:
+            top_chunks = [
+                {
+                    "doc_type": item.get("doc_type", ""),
+                    "title": item.get("title"),
+                    "concepts": list(item.get("concepts") or []),
+                    "sources": list(item.get("sources") or []),
+                    "score": round(cls._safe_float(item.get("score")), 6),
+                }
+                for item in card.top_chunks[:10]
+                if isinstance(item, dict)
+            ]
+        return {
+            "final_score": round(
+                cls._safe_float(trace.get("final_score", card.raw_score)), 6
+            ),
+            "rank_score": round(cls._safe_float(card.rank_score), 6),
+            "score_breakdown": dict(
+                trace.get("score_breakdown") or card.score_breakdown
+            ),
+            "top_chunks": top_chunks,
+        }
+
+    @staticmethod
+    def _build_evidence_summary(
+        *,
+        card: CandidateCard,
+        evidence: list[EvidenceItem],
+        relevant_bundle: RelevantEvidenceBundle,
+    ) -> dict[str, Any]:
+        return {
+            "total_profile_counts": dict(card.counts),
+            "matched_evidence_count": len(relevant_bundle.all_items()),
+            "shown_evidence_count": len(evidence),
+        }
+
+    @staticmethod
+    def _build_strict_filter_trace(
+        query_payload: dict[str, Any] | None,
+        filtered_out_candidates: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        payload = query_payload or {}
+        search_query_plan = payload.get("search_query_plan") or {}
+        required_concepts = list(
+            payload.get("relevance_gate_active_concepts")
+            or search_query_plan.get("required_concepts")
+            or []
+        )
+        enabled_value = payload.get("relevance_gate_enabled")
+        enabled = bool(enabled_value) if enabled_value is not None else bool(required_concepts)
+        strict_exclusions: list[dict[str, Any]] = []
+        for item in filtered_out_candidates or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("reason") != "relevance_concepts_missing":
+                continue
+            strict_exclusions.append(
+                {
+                    "expert_id": item.get("expert_id"),
+                    "name": item.get("name"),
+                    "reason": item.get("reason"),
+                    "matched_concepts": list(item.get("matched_concepts") or []),
+                    "missing_concepts": list(item.get("missing_concepts") or []),
+                }
+            )
+        return {
+            "enabled": enabled,
+            "required_concepts": required_concepts,
+            "excluded_candidate_count": len(strict_exclusions),
+            "excluded_reasons": strict_exclusions,
+        }
+
+    @staticmethod
     def _sort_relevant_items(
         bundle: RelevantEvidenceBundle,
     ) -> list[RelevantEvidenceItem]:
@@ -713,12 +927,17 @@ class RecommendationService:
         *,
         evidence: list[EvidenceItem],
         fallback: str,
+        match_summary: str = "",
     ) -> str:
+        # concept-aware match_summary(예: '인공지능, 반도체 근거가 확인되었습니다')를 앞세우고
+        # 실제 evidence 제목을 구체적으로 인용한 뒤, 직접 근거 부족을 정직하게 명시한다.
+        summary = " ".join((match_summary or "").split())
         if not evidence:
-            return "직접적인 질의 일치 근거를 확인하지 못했습니다."
+            return summary or "직접적인 질의 일치 근거를 확인하지 못했습니다."
 
         if all(item.type == "profile" for item in evidence):
-            return "직접적인 질의 일치 근거는 제한적이지만 프로필 기반 후보로 검토되었습니다."
+            lead = summary or "질의와 직접 매칭된 근거는 제한적입니다."
+            return f"{lead} 프로필 기반으로 검토된 후보입니다."
 
         type_labels = {
             "project": "과제",
@@ -742,15 +961,14 @@ class RecommendationService:
                 break
 
         if not referenced_items:
-            return "직접적인 질의 일치 근거는 제한적이지만 프로필 기반 후보로 검토되었습니다."
+            lead = summary or "질의와 직접 매칭된 근거는 제한적입니다."
+            return f"{lead} 프로필 기반으로 검토된 후보입니다."
 
-        if len(referenced_items) == 1:
-            return (
-                f"{referenced_items[0]}이 확인되어 질의와 관련된 전문성 근거로 참고할 수 있습니다."
-            )
+        referenced = "와 ".join(referenced_items)
+        lead = summary or "질의와 관련된 전문성 근거가 확인되었습니다."
         return (
-            f"{referenced_items[0]}와 {referenced_items[1]}이 확인되어 "
-            "질의와 관련된 전문성 근거로 참고할 수 있습니다."
+            f"{lead} 구체적으로 {referenced} 등에서 관련 내용이 확인되었으며, "
+            "직접 근거 수가 제한적이라 추가 검토가 권장됩니다."
         )
 
     @classmethod
@@ -804,7 +1022,9 @@ class RecommendationService:
         cards: list[CandidateCard],
         reason_output: ReasonGenerationOutput,
         *,
+        plan: PlannerOutput,
         relevant_evidence_by_expert_id: dict[str, RelevantEvidenceBundle],
+        retrieval_score_traces_by_expert_id: dict[str, dict[str, Any]],
     ) -> tuple[list[RecommendationDecision], list[dict[str, Any]], list[dict[str, Any]]]:
         generated_by_expert_id = {
             item.expert_id: item for item in reason_output.items
@@ -831,6 +1051,26 @@ class RecommendationService:
                 generated=generated,
                 relevant_bundle=relevant_bundle,
             )
+            match_details = self._build_match_details(card=card, evidence=evidence)
+            match_badges = self._build_match_badges(
+                plan=plan,
+                match_details=match_details,
+            )
+            match_summary = self._build_match_summary(
+                plan=plan,
+                match_details=match_details,
+            )
+            score_explanation = self._build_score_explanation(
+                card=card,
+                retrieval_trace=retrieval_score_traces_by_expert_id.get(
+                    card.expert_id
+                ),
+            )
+            evidence_summary = self._build_evidence_summary(
+                card=card,
+                evidence=evidence,
+                relevant_bundle=relevant_bundle,
+            )
             selected_evidence_trace.append(evidence_trace)
             if not recommendation_reason:
                 logger.warning(
@@ -848,6 +1088,7 @@ class RecommendationService:
                 recommendation_reason = self._build_server_fallback_reason(
                     evidence=evidence,
                     fallback=fallback_source,
+                    match_summary=match_summary,
                 )
                 server_fallback_reasons.append(
                     {
@@ -873,6 +1114,11 @@ class RecommendationService:
                     organization=card.organization,
                     fit=fit,
                     recommendation_reason=recommendation_reason,
+                    match_badges=match_badges,
+                    match_summary=match_summary,
+                    match_details=match_details,
+                    score_explanation=score_explanation,
+                    evidence_summary=evidence_summary,
                     evidence=evidence,
                     risks=risks,
                     rank_score=card.rank_score,
@@ -901,6 +1147,7 @@ class RecommendationService:
         raw_query: str,
         retrieval_keywords: list[str],
         retrieval_score_traces: list[dict[str, Any]],
+        filtered_out_candidates: list[dict[str, Any]],
         retrieval_skipped_reason: str | None,
         retrieved_count: int,
         recommendations: list[RecommendationDecision],
@@ -938,7 +1185,12 @@ class RecommendationService:
                 "retrieval_keywords": retrieval_keywords,
                 "bundle_ids": plan.bundle_ids,
                 "expanded_shadow_hits": expanded_shadow_hits or [],
-                "filtered_out_candidates": (planner_trace or {}).get("filtered_out_candidates") or [],
+                "filtered_out_count": len(filtered_out_candidates),
+                "filtered_out_candidates": filtered_out_candidates,
+                "strict_filter": RecommendationService._build_strict_filter_trace(
+                    query_payload,
+                    filtered_out_candidates,
+                ),
                 "planner_retry_count": (
                     (planner_trace or {}).get("planner_retry_count", 0)
                 ),

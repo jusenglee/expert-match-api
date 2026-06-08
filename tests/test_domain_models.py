@@ -244,6 +244,10 @@ def test_researcher_candidate_defaults():
     assert candidate.group_score == 0.0
     assert candidate.rank_score == 0.0
     assert candidate.chunks == []
+    assert candidate.matched_concepts == []
+    assert candidate.missing_concepts == []
+    assert candidate.coverage_type == ""
+    assert candidate.score_breakdown == {}
     assert candidate.doc_types_present == []
 
 
@@ -376,6 +380,12 @@ def test_candidate_card_defaults():
     assert card.data_gaps == []
     assert card.shortlist_score == 0.0
     assert card.rank_score == 0.0
+    assert card.raw_score == 0.0
+    assert card.matched_concepts == []
+    assert card.missing_concepts == []
+    assert card.coverage_type == ""
+    assert card.score_breakdown == {}
+    assert card.top_chunks == []
     assert card.doc_types_present == []
     assert card.all_evidence() == []
 

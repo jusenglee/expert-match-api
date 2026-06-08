@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from apps.api.main import create_app
+from apps.api.playground import PLAYGROUND_HTML
 from apps.api.schemas import RecommendationResponse, ReadinessResponse
 from apps.core.config import Settings
 from apps.domain.models import RecommendationDecision
@@ -56,7 +57,7 @@ class FakeRecommendationService:
                     }
                 ],
                 "final_sort_policy": "rrf_score_desc_name_asc",
-                "top_k_used": top_k or 1,
+                "top_k_used": top_k or 15,
                 "query_payload": {},
             },
         }
@@ -112,6 +113,7 @@ class FakeRecommendationService:
             "raw_query": query,
             "retrieval_skipped_reason": None,
             "final_sort_policy": "rrf_score_desc_name_asc",
+            "top_k_used": top_k or 15,
             "timers": {},
         }
 
@@ -178,6 +180,12 @@ def test_recommend_endpoint_contract():
     assert any("추천 응답 준비 완료" in line for line in server_logs)
 
 
+def test_playground_distinguishes_profile_counts_from_query_evidence_counts():
+    assert "누적 논문" in PLAYGROUND_HTML
+    assert "이번 매칭 근거" in PLAYGROUND_HTML
+    assert "화면 표시 근거" in PLAYGROUND_HTML
+
+
 def test_recommend_endpoint_normalizes_multiline_query_with_commas():
     service = FakeRecommendationService()
     app = create_app(
@@ -195,6 +203,22 @@ def test_recommend_endpoint_normalizes_multiline_query_with_commas():
         "인공지능 모델 개발, 벡터DB 구축, 파인튜닝, 학습데이터 구축"
     )
     assert response.json()["intent_summary"] == service.last_recommend_query
+
+
+def test_recommend_endpoint_rejects_top_k_above_user_facing_maximum():
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=FakeRecommendationService(),
+        validator=FakeValidator(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/recommend",
+            json={"query": "Recommend AI semiconductor reviewers", "top_k": 16},
+        )
+
+    assert response.status_code == 422
 
 
 def test_playground_route_serves_local_chat_ui():
@@ -259,6 +283,22 @@ def test_search_candidates_endpoint_normalizes_multiline_query_with_commas():
         "인공지능 모델 개발, 벡터DB 구축, 파인튜닝, 학습데이터 구축"
     )
     assert response.json()["intent_summary"] == service.last_search_query
+
+
+def test_search_candidates_endpoint_rejects_top_k_above_user_facing_maximum():
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=FakeRecommendationService(),
+        validator=FakeValidator(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/search/candidates",
+            json={"query": "Recommend AI semiconductor reviewers", "top_k": 16},
+        )
+
+    assert response.status_code == 422
 
 
 def test_feedback_endpoint_contract():

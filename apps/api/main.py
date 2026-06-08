@@ -496,9 +496,10 @@ def create_app(
 
         planner_payload = result["planner"].model_dump(mode="json")
         logger.info(
-            "후보자 검색 응답 준비 완료: retrieved_count=%d candidates=%d planner_keywords=%s retrieval_keywords=%s timers=%s",
+            "후보자 검색 응답 준비 완료: retrieved_count=%d candidates=%d top_k_used=%s planner_keywords=%s retrieval_keywords=%s timers=%s",
             result["retrieved_count"],
             len(candidate_items),
+            result.get("top_k_used"),
             (result.get("planner_trace") or {}).get("planner_keywords") or [],
             result.get("retrieval_keywords") or [],
             result.get("timers") or {},
@@ -527,6 +528,10 @@ def create_app(
             "support_rule_applied": result.get("support_rule_applied", False),
             "filtered_out_count": len(result.get("filtered_out_candidates") or []),
             "filtered_out_candidates": result.get("filtered_out_candidates") or [],
+            "strict_filter": RecommendationService._build_strict_filter_trace(
+                result.get("query_payload") or {},
+                result.get("filtered_out_candidates") or [],
+            ),
             "retrieval_skipped_reason": result.get("retrieval_skipped_reason"),
             "branch_queries": result["branch_queries"],
             "include_orgs": result["planner"].include_orgs,
@@ -538,6 +543,7 @@ def create_app(
             ],
             "retrieval_score_traces": result.get("retrieval_score_traces") or [],
             "final_sort_policy": result.get("final_sort_policy"),
+            "top_k_used": result.get("top_k_used"),
             "query_payload": service._serialize_query_payload(result["query_payload"]),
             "retrieval_mode": (result.get("query_payload") or {}).get("retrieval_mode"),
             "weights": (result.get("query_payload") or {}).get("weights"),

@@ -76,7 +76,7 @@ Sparse fallback 체인: `로컬 PIXIE-Splade-v1.0 → online telepix/PIXIE-Splad
 | `NTIS_SHORTLIST_LIMIT` | `40` | 사유 생성 단계로 넘길 숏리스트 크기 |
 | `NTIS_DOC_TYPE_PRIORS` | (미설정=equal) | family/doc_type 집계 가중. 예: `assessment:1.3,achievement:1.0`. **앱단 랭크 누적 가중**이며 Qdrant weighted RRF가 아님 |
 | `NTIS_FINAL_RECOMMENDATION_MIN` | `1` | 최소 최종 추천 수 |
-| `NTIS_FINAL_RECOMMENDATION_MAX` | `20` | 최대 최종 추천 수 |
+| `NTIS_FINAL_RECOMMENDATION_MAX` | `15` | 최대 최종 추천 수 |
 
 > `NTIS_DOC_TYPE_PRIORS`는 [`../architecture/DESIGN_GUIDELINES.md §6.2`](../architecture/DESIGN_GUIDELINES.md)의 옵트인 레버다. 기본 equal을 권장하며, intent가 명확할 때만 조정한다.
 

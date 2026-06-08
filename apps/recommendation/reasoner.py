@@ -209,12 +209,14 @@ class OpenAICompatReasonGenerator:
         - 이 후보자들은 시스템에 의해 질의와 관련된 인물로 이미 판별된 상태입니다.
         - **[중요]** 절대 없는 사실을 지어내지 마세요(환각 금지). 반드시 제공된 증거(`relevant_evidence`, `context_evidence`)의 내용에 기반하여 작성해야 합니다.
         - 각 증거는 `type`(paper/patent/project/assessor_activity/specialty)과 `evidence_id`를 갖습니다. 인용 시 반드시 제공된 `evidence_id` 문자열을 그대로 사용하세요.
+        - 각 후보는 `matched_concepts`(시스템이 이미 충족으로 판정한 질의 조건)와 `missing_concepts`를 가지며, 각 증거는 `satisfied_concepts`(그 증거가 충족하는 조건)를 가집니다. 조건 id는 영문(예: ai=인공지능, semiconductor=반도체)일 수 있습니다.
         - `counts`(누적 실적 수)는 보조적으로만 활용하세요.
 
         [출력 규칙]
         - `fit`은 다음 중 하나여야 합니다: {FIT_HIGH}, {FIT_MEDIUM}, {FIT_NORMAL}
         - `recommendation_reason`은 1~2문장의 간결하고 구체적인 한국어 문장으로 작성하며, 320자를 넘지 마세요.
         - **추천 사유는 반드시 제공된 증거의 실적명이나 연구 내용을 언급하여 작성해야 합니다.**
+        - **어떤 증거가 어떤 조건(concept)을 충족하는지 연결해 서술하세요** (예: 'OOO 과제로 반도체 설계를, △△△ 논문으로 인공지능을 충족'). 단, `matched_concepts`에 없는 조건을 충족했다고 주장하지 마세요(환각 금지).
         - `selected_evidence_ids`는 인용한 증거의 `evidence_id` 문자열을 그대로 포함시키세요 (최대 {MAX_SELECTED_EVIDENCE_IDS}개).
         - `selected_evidence_ids`에는 제공된 증거의 `evidence_id`(예: `paper_100000045256_c000`)만 넣으세요.
         - 적절한 직접 증거 ID가 없으면 `selected_evidence_ids`는 빈 배열(`[]`)로 두세요.
@@ -274,9 +276,14 @@ class OpenAICompatReasonGenerator:
 
     @classmethod
     def _serialize_relevant(
-        cls, bundle: RelevantEvidenceBundle, *, limit: int, profile: dict[str, Any]
+        cls,
+        bundle: RelevantEvidenceBundle,
+        *,
+        limit: int,
+        profile: dict[str, Any],
+        chunk_concepts: dict[str, list[str]],
     ) -> list[dict[str, Any]]:
-        """선별된 evidence(doc_type별 top-N)를 평탄화해 직렬화."""
+        """선별된 evidence(doc_type별 top-N)를 평탄화해 직렬화. satisfied_concepts로 어떤 조건을 충족하는지 표기."""
         out: list[dict[str, Any]] = []
         for doc_type, items in bundle.by_doc_type.items():
             for item in items[:limit]:
@@ -289,15 +296,21 @@ class OpenAICompatReasonGenerator:
                         "detail": _truncate_text(item.detail, profile["detail_char_limit"]),
                         "snippet": _truncate_text(item.snippet, profile["snippet_char_limit"]),
                         "matched_keywords": list(item.matched_keywords)[: profile["matched_keywords_limit"]],
+                        "satisfied_concepts": chunk_concepts.get(item.item_id, []),
                     }
                 )
         return out
 
     @classmethod
     def _serialize_context(
-        cls, candidate: CandidateCard, *, limit: int, profile: dict[str, Any]
+        cls,
+        candidate: CandidateCard,
+        *,
+        limit: int,
+        profile: dict[str, Any],
+        chunk_concepts: dict[str, list[str]],
     ) -> list[dict[str, Any]]:
-        """후보의 doc_type별 evidence를 간략 맥락으로 직렬화(제목/날짜 위주)."""
+        """후보의 doc_type별 evidence를 간략 맥락으로 직렬화(제목/날짜/충족조건 위주)."""
         out: list[dict[str, Any]] = []
         for doc_type, evidences in candidate.evidence_by_type.items():
             for ev in evidences[:limit]:
@@ -307,6 +320,7 @@ class OpenAICompatReasonGenerator:
                         "type": doc_type,
                         "title": _truncate_text(ev.title, profile["detail_char_limit"]),
                         "date": ev.date,
+                        "satisfied_concepts": chunk_concepts.get(ev.chunk_id, []),
                     }
                 )
         return out
@@ -342,6 +356,12 @@ class OpenAICompatReasonGenerator:
             bundle = relevant_evidence_by_expert_id.get(
                 candidate.expert_id, RelevantEvidenceBundle(expert_id=candidate.expert_id)
             )
+            # chunk_id -> 충족 concept (top_chunks가 보유한 per-chunk 검색 신호를 evidence에 다시 붙인다).
+            chunk_concepts = {
+                str(chunk.get("chunk_id")): list(chunk.get("concepts", []))
+                for chunk in candidate.top_chunks
+                if chunk.get("chunk_id")
+            }
             serialized.append(
                 {
                     "expert_id": candidate.expert_id,
@@ -352,16 +372,21 @@ class OpenAICompatReasonGenerator:
                     "shortlist_score": candidate.shortlist_score,
                     "counts": dict(candidate.counts),
                     "doc_types_present": candidate.doc_types_present,
+                    "matched_concepts": list(candidate.matched_concepts),
+                    "missing_concepts": list(candidate.missing_concepts),
+                    "coverage_type": candidate.coverage_type,
                     "matched_filter_summary": list(candidate.matched_filter_summary)[: profile["matched_filter_limit"]],
                     "data_gaps": list(candidate.data_gaps),
                     "retrieval_grounding": cls._compact_retrieval_grounding(
                         retrieval_score_traces_by_expert_id.get(candidate.expert_id, {})
                     ),
                     "relevant_evidence": cls._serialize_relevant(
-                        bundle, limit=profile["relevant_limit"], profile=profile
+                        bundle, limit=profile["relevant_limit"], profile=profile,
+                        chunk_concepts=chunk_concepts,
                     ),
                     "context_evidence": cls._serialize_context(
-                        candidate, limit=profile["context_limit"], profile=profile
+                        candidate, limit=profile["context_limit"], profile=profile,
+                        chunk_concepts=chunk_concepts,
                     ),
                 }
             )
@@ -572,6 +597,26 @@ class OpenAICompatReasonGenerator:
         }
         return normalized, trace
 
+    @staticmethod
+    def _merge_targeted_retry(
+        base: ReasonGenerationOutput,
+        retry: ReasonGenerationOutput,
+        incomplete_ids: set[str],
+    ) -> tuple[ReasonGenerationOutput, list[str]]:
+        """targeted 재시도 결과로 base의 빈 사유 후보만 덮어쓴다(다른 후보는 보존)."""
+        retry_by_id = {item.expert_id: item for item in retry.items}
+        filled: list[str] = []
+        merged_items: list[ReasonedCandidate] = []
+        for item in base.items:
+            if item.expert_id in incomplete_ids and not item.recommendation_reason.strip():
+                replacement = retry_by_id.get(item.expert_id)
+                if replacement is not None and replacement.recommendation_reason.strip():
+                    merged_items.append(replacement)
+                    filled.append(item.expert_id)
+                    continue
+            merged_items.append(item)
+        return ReasonGenerationOutput(items=merged_items, data_gaps=base.data_gaps), filled
+
     async def generate(
         self,
         *,
@@ -597,6 +642,8 @@ class OpenAICompatReasonGenerator:
             {"use_tools": False, "profile": RETRY_PAYLOAD_PROFILE},
         ]
         attempt_history: list[dict[str, Any]] = []
+        primary_output: ReasonGenerationOutput | None = None
+        primary_trace: dict[str, Any] = {}
 
         for retry_index, attempt_spec in enumerate(attempt_specs):
             try:
@@ -612,8 +659,8 @@ class OpenAICompatReasonGenerator:
                 )
                 trace["retry_count"] = retry_index
                 trace["attempts"] = [*attempt_history, dict(trace)]
-                self.last_trace = trace
-                return output
+                primary_output, primary_trace = output, trace
+                break
             except Exception as exc:
                 failed_mode = "tool_call" if attempt_spec["use_tools"] else "json_fallback_retry"
                 logger.warning(
@@ -630,34 +677,77 @@ class OpenAICompatReasonGenerator:
                     }
                 )
 
-        logger.warning("Reason generator fallback activated after retries: attempts=%s", attempt_history)
-        fallback_output = await self.fallback.generate(
-            query=query,
-            plan=plan,
-            candidates=candidates,
-            relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
-            retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+        if primary_output is None:
+            logger.warning("Reason generator fallback activated after retries: attempts=%s", attempt_history)
+            fallback_output = await self.fallback.generate(
+                query=query,
+                plan=plan,
+                candidates=candidates,
+                relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+                retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+            )
+            fallback_trace = dict(self.fallback.last_trace)
+            self.last_trace = {
+                "mode": "fallback",
+                "candidate_count": len(candidates),
+                "output_count": len(fallback_output.items),
+                "raw_output_count": fallback_trace.get("raw_output_count", len(fallback_output.items)),
+                "seed": seed,
+                "retry_count": len(attempt_specs),
+                "returned_ratio": fallback_trace.get("returned_ratio", 1.0),
+                "prompt_budget_mode": "fallback",
+                "trim_applied": True,
+                "reason": "; ".join(
+                    attempt.get("reason", "") for attempt in attempt_history if attempt.get("reason")
+                ),
+                "returned_ids": list(fallback_trace.get("returned_ids", [])),
+                "missing_candidate_ids": list(fallback_trace.get("missing_candidate_ids", [])),
+                "empty_reason_candidate_ids": list(fallback_trace.get("empty_reason_candidate_ids", [])),
+                "empty_selected_evidence_candidate_ids": list(
+                    fallback_trace.get("empty_selected_evidence_candidate_ids", [])
+                ),
+                "attempts": attempt_history,
+            }
+            return fallback_output
+
+        # 누락/빈 사유 후보만 targeted 재시도(부분 실패를 서버 fallback 문장으로 묻지 않는다).
+        # 재시도 seed를 본 시도와 다르게 둬 동일 출력 재생산을 피한다.
+        incomplete_ids = sorted(
+            set(primary_trace.get("missing_candidate_ids", []))
+            | set(primary_trace.get("empty_reason_candidate_ids", []))
         )
-        fallback_trace = dict(self.fallback.last_trace)
-        self.last_trace = {
-            "mode": "fallback",
-            "candidate_count": len(candidates),
-            "output_count": len(fallback_output.items),
-            "raw_output_count": fallback_trace.get("raw_output_count", len(fallback_output.items)),
-            "seed": seed,
-            "retry_count": len(attempt_specs),
-            "returned_ratio": fallback_trace.get("returned_ratio", 1.0),
-            "prompt_budget_mode": "fallback",
-            "trim_applied": True,
-            "reason": "; ".join(
-                attempt.get("reason", "") for attempt in attempt_history if attempt.get("reason")
-            ),
-            "returned_ids": list(fallback_trace.get("returned_ids", [])),
-            "missing_candidate_ids": list(fallback_trace.get("missing_candidate_ids", [])),
-            "empty_reason_candidate_ids": list(fallback_trace.get("empty_reason_candidate_ids", [])),
-            "empty_selected_evidence_candidate_ids": list(
-                fallback_trace.get("empty_selected_evidence_candidate_ids", [])
-            ),
-            "attempts": attempt_history,
-        }
-        return fallback_output
+        if incomplete_ids:
+            incomplete_set = set(incomplete_ids)
+            retry_candidates = [c for c in candidates if c.expert_id in incomplete_set]
+            retry_seed = build_deterministic_seed(
+                "reason_generation_retry", query, plan.model_dump(mode="json"), incomplete_ids
+            )
+            try:
+                retry_output, retry_trace = await self._invoke_attempt(
+                    query=query,
+                    plan=plan,
+                    candidates=retry_candidates,
+                    relevant_evidence_by_expert_id=relevant_evidence_by_expert_id,
+                    retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
+                    seed=retry_seed,
+                    use_tools=True,
+                    profile=RETRY_PAYLOAD_PROFILE,
+                )
+                primary_output, filled_ids = self._merge_targeted_retry(
+                    primary_output, retry_output, incomplete_set
+                )
+                primary_trace["targeted_retry"] = {
+                    "requested_ids": incomplete_ids,
+                    "filled_ids": filled_ids,
+                    "retry_trace": retry_trace,
+                }
+            except Exception as exc:
+                logger.warning("Targeted reason retry failed: ids=%s reason=%s", incomplete_ids, exc)
+                primary_trace["targeted_retry"] = {
+                    "requested_ids": incomplete_ids,
+                    "filled_ids": [],
+                    "error": str(exc),
+                }
+
+        self.last_trace = primary_trace
+        return primary_output

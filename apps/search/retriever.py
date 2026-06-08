@@ -46,6 +46,7 @@ from apps.search.relevance import (
     CONCEPT_VIEW_PREFIX,
     ConceptPlan,
     fuse_chunk_score,
+    has_operation_marker,
     resolve_concept_plan,
     score_researcher,
     tag_chunk_concepts,
@@ -152,6 +153,10 @@ class QdrantHybridRetriever:
         self._sparse_idf, self._sparse_idf_default = self._load_sparse_idf(settings)
         self._sparse_idf_ref = max(1e-6, float(getattr(settings, "sparse_idf_ref", 3.5)))
         self._sparse_idf_hard_floor = float(getattr(settings, "sparse_idf_hard_floor", 0.0))
+        self._operation_markers = frozenset(
+            m.casefold() for m in getattr(settings, "operation_evidence_markers", []) if m
+        )
+        self._operation_factor = float(getattr(settings, "operation_evidence_factor", 1.0))
 
     # ------------------------------------------------------------------ utils
     @staticmethod
@@ -418,6 +423,7 @@ class QdrantHybridRetriever:
                 doc_type_quality=self.settings.doc_type_quality_weight,
                 support_top_k=self.settings.researcher_support_top_k,
                 weak_evidence_floor=self.settings.weak_evidence_floor,
+                require_distinct_tokens_for_joint=self.settings.joint_requires_distinct_tokens,
             )
             return ResearcherCandidate(
                 researcher_id=researcher_id,
@@ -429,6 +435,9 @@ class QdrantHybridRetriever:
                 rank_score=scored.score,
                 chunks=chunks,
                 matched_concepts=scored.matched_concepts,
+                missing_concepts=sorted(
+                    set(concept_plan.required) - set(scored.matched_concepts)
+                ),
                 coverage_type=scored.coverage_type,
                 evidence_by_concept=scored.evidence_by_concept,
                 score_breakdown=scored.breakdown,
@@ -533,6 +542,9 @@ class QdrantHybridRetriever:
                 group_score=score_sum,
                 rank_score=score_sum,
                 chunks=chunks,
+                matched_concepts=sorted(matched_concepts),
+                missing_concepts=[],
+                coverage_type="separate" if required else "",
             ),
             kept_chunks=kept_chunks,
             dropped_chunks=dropped_chunks,
@@ -687,9 +699,19 @@ class QdrantHybridRetriever:
 
         view_weights = self.settings.search_view_weights
         rrf_k = self.settings.view_rrf_k
+        # 운영성/교육/행정 과제 근거 하향은 '질의 자체가 운영/교육을 찾는' 경우엔 끈다(역효과 방지).
+        op_query = " ".join(query.split()).casefold().replace(" ", "")
+        op_penalty_active = (
+            self._operation_factor < 1.0
+            and bool(self._operation_markers)
+            and not any(marker in op_query for marker in self._operation_markers)
+        )
         by_researcher: dict[str, list[ChunkHit]] = {}
         for entry in merge.values():
             fused = fuse_chunk_score(entry.view_best_rank0, view_weights=view_weights, rrf_k=rrf_k)
+            # 운영성/교육/행정 과제(프로그램 운영비)는 근거 가치 하향(설계 실적 아님).
+            if op_penalty_active and has_operation_marker(entry.payload, self._operation_markers):
+                fused *= self._operation_factor
             concepts = tag_chunk_concepts(
                 entry.payload, view_concept_hits=entry.concept_hits, concept_plan=concept_plan
             )

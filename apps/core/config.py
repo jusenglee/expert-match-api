@@ -240,6 +240,10 @@ class Settings(BaseSettings):
         default_factory=lambda: {"joint": 1.5, "balance": 1.2, "concept": 0.8, "support": 0.3}
     )
     researcher_support_top_k: int = 3  # best 외 보조 근거 cap(volume-bias 방지)
+    # 개념 충족을 '서로 다른 토큰'으로만 인정(True). 붙은 단일 합성어(예: '인공지능반도체대학원')가 두 개념을
+    # 한 토큰에서 동시 confirm해 만드는 거짓 joint + concept/balance 중복 계상을 차단한다. 같은 토큰값으로만
+    # 확정되는 개념은 독립 근거가 없어 partial(→fallback)로 강등. off면 기존 동작(개념별 독립 best, 중복 허용).
+    joint_requires_distinct_tokens: bool = True
 
     # doc_type별 근거 품질 가중(실적 ≥ 선언 > 활동).
     doc_type_quality_weight: dict[str, float] = Field(
@@ -247,6 +251,17 @@ class Settings(BaseSettings):
             "specialty": 1.0, "project": 1.0, "paper": 0.9, "patent": 0.8, "assessor_activity": 0.55,
         }
     )
+
+    # 운영성/교육/행정 과제(연구자 본인 설계 실적이 아닌 '프로그램 운영비': 대학원 운영·인력양성 등)는
+    # 근거 가치를 낮춘다. 마커(도메인 무관 generic 행정어)가 chunk 본문/제목에 있으면 융합점수에 factor를
+    # 곱한다. factor=1.0이면 무효. 실데이터 분포에 맞춰 마커/계수 튜닝 대상.
+    operation_evidence_markers: list[str] = Field(
+        default_factory=lambda: [
+            "대학원", "인력양성", "전문인력양성", "부트캠프", "교육과정", "양성사업",
+            "센터운영", "사업단운영", "운영지원",
+        ]
+    )
+    operation_evidence_factor: float = 0.5
 
     # required concept gate: main top-K는 required_concepts 전부 충족. 부분 충족은 fallback tier로 분리.
     relevance_gate_enabled: bool = True

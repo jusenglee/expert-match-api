@@ -146,6 +146,7 @@ class ResearcherCandidate(BaseModel):
     chunks: list[ChunkHit] = Field(default_factory=list)
     # v2.1 관련도 검색: concept 커버리지 + capped evidence score 분해.
     matched_concepts: list[str] = Field(default_factory=list)
+    missing_concepts: list[str] = Field(default_factory=list)
     coverage_type: str = ""  # "joint" | "separate" | "partial" | ""
     evidence_by_concept: dict[str, list[ChunkHit]] = Field(default_factory=dict)  # {"joint","<concept>","optional"}
     score_breakdown: dict[str, float] = Field(default_factory=dict)
@@ -269,6 +270,12 @@ class CandidateCard(BaseModel):
     data_gaps: list[str] = Field(default_factory=list)
     shortlist_score: float = 0.0
     rank_score: float = 0.0
+    raw_score: float = 0.0
+    matched_concepts: list[str] = Field(default_factory=list)
+    missing_concepts: list[str] = Field(default_factory=list)
+    coverage_type: str = ""
+    score_breakdown: dict[str, Any] = Field(default_factory=dict)
+    top_chunks: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def doc_types_present(self) -> list[str]:
@@ -291,6 +298,11 @@ class RecommendationDecision(BaseModel):
     organization: str | None = None
     fit: Literal["높음", "중간", "보통"]
     recommendation_reason: str = ""
+    match_badges: list[str] = Field(default_factory=list)
+    match_summary: str = ""
+    match_details: dict[str, Any] = Field(default_factory=dict)
+    score_explanation: dict[str, Any] = Field(default_factory=dict)
+    evidence_summary: dict[str, Any] = Field(default_factory=dict)
     evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0

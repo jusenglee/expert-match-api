@@ -64,7 +64,7 @@ TITLE_KEYS = (
 
 DEFAULT_QUERY = "인공지능 분야와 관련된 반도체 설계 경험이 있는 연구자 추천" 
 DEFAULT_TARGET_CHUNK_ID = "paper_100003957045_c000"
-DIAGNOSTIC_LLM_REASONING_EFFORT = "low"
+DIAGNOSTIC_LLM_REASONING_EFFORT = "high"
 DIAGNOSTIC_LLM_INCLUDE_REASONING = False
 DIAGNOSTIC_LLM_DISABLE_THINKING = False
 
@@ -214,12 +214,11 @@ def _offline_corpus() -> list[dict[str, Any]]:
         _offline_payload("M0001", "이상헌", doc_type="specialty", doc_num="M0001",
                          chunk_index=0, text="인공지능 반도체 시스템반도체 설계"),
         # R2 — AI/반도체 분리 균형. main tier(separate) 기대.
-        # patent의 '반도체' 신호는 chunk_text가 아니라 doc_attrs에만 존재 → production의
-        # doc_attrs 기반 concept 태깅 경로(relevance._payload_text)를 오프라인에서 실제로 검증.
+        # concept 확정은 chunk_text/doc_id 직접 evidence만 사용한다(doc_attrs 값은 제외).
         _offline_payload("M0002", "권영수", doc_type="paper", doc_num="100000000002",
                          chunk_index=0, text="딥러닝 신경망 기반 영상 인식 인공지능 연구"),
         _offline_payload("M0002", "권영수", doc_type="patent", doc_num="300000000002",
-                         chunk_index=0, text="지식재산권명: 저전력 신호처리 회로 설계",
+                         chunk_index=0, text="지식재산권명: 시스템반도체 집적회로 저전력 신호처리 회로 설계",
                          doc_attrs={"intellectual_property_title": "시스템반도체 집적회로 저전력 설계",
                                     "keywords": "반도체;집적회로;저전력"}),
         # R3 — AI 강, 반도체 약(한쪽 몰빵). balance가 R1/R2 아래로 눌러야 함.

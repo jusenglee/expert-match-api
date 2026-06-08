@@ -12,6 +12,7 @@ from apps.search.relevance import (
     CONCEPT_VIEW_PREFIX,
     ConceptPlan,
     fuse_chunk_score,
+    has_operation_marker,
     resolve_concept_plan,
     score_researcher,
     tag_chunk_concepts,
@@ -263,3 +264,103 @@ def test_score_evidence_by_concept_populated():
         _hit("F", "project", "project_f2_c000", ["semiconductor"], 0.4),
     ])
     assert set(scored.evidence_by_concept) >= {"ai", "semiconductor"}
+
+
+# ---------------------------------------------------------------------------
+# joint 토큰 변별 — 붙은 단일 합성어('인공지능반도체대학원')의 거짓 joint 차단
+# ---------------------------------------------------------------------------
+def _joint_hit(rid: str, chunk_id: str, text: str, score: float = 0.5, doc_type: str = "project") -> ChunkHit:
+    # ai+semiconductor를 직접 부여하되, joint 적격성은 payload 텍스트(토큰)에서 재판정된다.
+    return ChunkHit(score=score, payload=_payload(rid, doc_type, chunk_id, text),
+                    concepts=["ai", "semiconductor"])
+
+
+def test_glued_program_name_confirms_both_but_not_joint():
+    # '인공지능반도체대학원' = 한 토큰에 두 개념 → 개별 confirm은 되나(태깅), 독립 토큰 없어 joint도
+    # separate도 아니고 partial(semi 독립근거 없음).
+    plan = _ai_semi_plan()
+    text = "국문과제명: 인공지능반도체대학원 수행기관: 서울대학교"
+    assert set(tag_chunk_concepts(_payload("M", "project", "project_g_c000", text),
+                                  concept_plan=plan)) == {"ai", "semiconductor"}
+    scored = _score([_joint_hit("M", "project_g_c000", text)])
+    assert scored.coverage_type == "partial"
+    assert scored.breakdown["joint"] == 0.0
+
+
+def test_two_glued_chunks_same_compound_still_partial():
+    # 관측 #2 김성철: '인공지능반도체대학원' chunk가 2개여도 같은 토큰값 → semi 독립근거 없음 → partial.
+    # (chunk_id 기준 중복제거로는 못 막고, 토큰값 기준 배정이라야 차단된다.)
+    plan = _ai_semi_plan()
+    chunks = [
+        ChunkHit(score=0.6, payload=_payload("M", "project", "project_k1_c000", "인공지능반도체대학원"),
+                 concepts=["ai", "semiconductor"]),
+        ChunkHit(score=0.5, payload=_payload("M", "project", "project_k2_c000", "인공지능반도체대학원"),
+                 concepts=["ai", "semiconductor"]),
+    ]
+    scored = score_researcher(chunks, plan, weights=WEIGHTS, doc_type_quality=QUALITY, support_top_k=3)
+    assert scored.coverage_type == "partial"
+    assert scored.breakdown["joint"] == 0.0
+
+
+def test_distinct_tokens_keep_joint():
+    # '인공지능 ... 반도체 설계' = 서로 다른 토큰 → joint 유지.
+    scored = _score([_joint_hit("M", "project_d_c000", "인공지능 기반 반도체 설계 연구")])
+    assert scored.coverage_type == "joint"
+    assert scored.breakdown["joint"] > 0.0
+
+
+def test_glued_token_not_rescued_by_repetition():
+    # 붙은 프로그램명이 본문에 2회 등장해도 동일 토큰값 → distinct 아님 → joint/separate 아님(partial).
+    scored = _score([_joint_hit("M", "project_r_c000",
+                                "인공지능반도체대학원 사업 인공지능반도체대학원 운영")])
+    assert scored.coverage_type == "partial"
+    assert scored.breakdown["joint"] == 0.0
+
+
+def test_single_concept_glued_compound_still_joins_with_separate_ai():
+    # '차세대지능형반도체'(붙은 단일 semiconductor 합성어) + 별도 '인공지능' 토큰 → distinct → joint.
+    plan = _ai_semi_plan()
+    text = "인공지능 응용 차세대지능형반도체 기술개발"
+    assert set(tag_chunk_concepts(_payload("M", "project", "project_s_c000", text),
+                                  concept_plan=plan)) == {"ai", "semiconductor"}
+    scored = _score([_joint_hit("M", "project_s_c000", text)])
+    assert scored.coverage_type == "joint"
+
+
+def test_glued_program_outranked_by_real_joint():
+    # 붙은 프로그램명(더 높은 raw score)이 실제 distinct-token joint보다 낮게 평가(관측 #2 vs #3 재현).
+    glued = _score([_joint_hit("A", "project_a_c000", "인공지능반도체대학원", score=0.6)])
+    real = _score([_joint_hit("B", "project_b_c000", "인공지능 프로세서 반도체 설계코드 개발", score=0.5)])
+    assert glued.coverage_type == "partial"
+    assert real.coverage_type == "joint"
+    assert real.score > glued.score
+
+
+def test_joint_distinct_token_guard_can_be_disabled():
+    # 플래그 off면 기존 동작(붙은 단일 토큰도 joint).
+    plan = _ai_semi_plan()
+    hit = _joint_hit("M", "project_g_c000", "인공지능반도체대학원")
+    off = score_researcher([hit], plan, weights=WEIGHTS, doc_type_quality=QUALITY,
+                           support_top_k=3, require_distinct_tokens_for_joint=False)
+    assert off.coverage_type == "joint"
+
+
+# ---------------------------------------------------------------------------
+# 운영성/교육/행정 과제 마커 (근거 가치 하향)
+# ---------------------------------------------------------------------------
+def test_has_operation_marker_detects_education_program():
+    markers = frozenset({"대학원", "인력양성", "부트캠프"})
+    # 붙은 합성어 안에서도 검출('인공지능반도체대학원' → '대학원')
+    assert has_operation_marker(_payload("M", "project", "p_c000", "국문과제명: 인공지능반도체대학원"), markers)
+    # 표기 공백차 흡수('전문인력 양성' despaced → '인력양성' 매칭)
+    assert has_operation_marker(
+        _payload("M", "project", "p_c001", "차세대시스템반도체설계 전문인력 양성"), frozenset({"인력양성"})
+    )
+
+
+def test_has_operation_marker_negative_for_design_project():
+    markers = frozenset({"대학원", "인력양성", "부트캠프"})
+    assert not has_operation_marker(
+        _payload("M", "project", "p_c000", "지능형 반도체 설계 핵심기술 개발"), markers
+    )
+    assert not has_operation_marker(_payload("M", "project", "p_c001", "x"), frozenset())

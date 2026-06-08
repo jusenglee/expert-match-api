@@ -102,18 +102,19 @@
    ↓
 [Search Query Builder]
    - raw_query 보존
-   - dense_query = 사용자 원문 중심 자연문
+   - dense_query = planner semantic_query 우선, 없으면 사용자 원문 fallback
    - sparse_joint_query = SPLADE용 짧은 핵심 자연문/명사구
    - sparse_concept_queries = 필수 개념별 보조 검색문
    - required_concepts = 연구자 집계/coverage gate 조건
    ↓
 [Retrieval Orchestrator]  (chunk 단위, flat payload)
-   1) query_points_groups(group_by="researcher_id") 1회
+   1) view별 query_points
       - dense_full: dense_query
+      - sparse_raw: raw_query
       - sparse_joint: sparse_joint_query
       - sparse_<concept>: sparse_concept_queries
-      - Qdrant FusionQuery(RRF), equal RRF
-   2) chunk gate: 필수 개념과 무관한 chunk 제거
+      - 앱단 등수 기반 RRF 융합
+   2) chunk gate: chunk_text/doc_id evidence term으로 필수 개념 확정(doc_attrs 값은 확정 근거 제외)
    3) researcher coverage gate: required_concepts를 모두 만족하는 연구자만 후보화
    4) 집계: researcher_id로 chunk hit 묶어 RRF 누적 (doc_type별 chunk cap) → 연구자 후보
    5) hard filter: doc_date 최근성 / flat root *_count / exclude org (deterministic, recency=OR)
@@ -147,7 +148,7 @@
 ### 5.1 철학
 검색의 목적은 정답 1명을 고르는 것이 아니라 **적절한 후보군을 넓게 확보**하는 것이다. retrieval은 recall 우선, recommendation은 reasoning 우선.
 
-### 5.2 채널별 검색 쿼리 (`grouped_hybrid_rrf`)
+### 5.2 채널별 검색 쿼리 (`multiview_flat_relevance`)
 검색 쿼리는 사용자 원문 하나를 그대로 모든 채널에 넣지 않는다. `SearchQueryPlan`으로 목적별 쿼리를 분리한다.
 
 ```python
@@ -161,14 +162,14 @@ SearchQueryPlan = {
 }
 ```
 
-1. **dense_full:** `dense_query`는 사용자 원문 자연어 의미를 보존한다.
+1. **dense_full:** `dense_query`는 planner `semantic_query`를 우선 사용하고, 없을 때 사용자 원문으로 fallback한다.
 2. **sparse_joint:** `sparse_joint_query`는 SPLADE용 짧은 핵심 자연문/명사구다. `전문`, `분야`, `연구자`, `또는`, `상세` 같은 일반어를 제거하고, 예: `인공지능 반도체 연구개발 산업 경험`.
 3. **sparse_<concept>:** 필수 개념별 SPLADE 보조 검색으로 근거 chunk를 넓게 확보한다. 예: `ai`, `semiconductor`, `semiconductor_experience`.
-4. **grouped RRF:** dense 1개 + sparse 여러 개를 `query_points_groups(group_by="researcher_id")`의 prefetch로 넣고, Qdrant `FusionQuery(RRF)` equal RRF로 chunk hit을 회수한다.
+4. **multiview RRF:** dense 1개 + sparse 여러 개를 view별 `query_points`로 회수한 뒤, 앱단에서 view별 등수 기반 RRF로 chunk hit을 융합한다.
 
-> SPLADE에 사용자 원문을 그대로 넣으면 일반어가 과확장되고, 순수 키워드 나열은 OR 검색처럼 넓어진다. 따라서 SPLADE는 짧은 자연문/명사구, dense는 원문 중심으로 분리한다.
+> SPLADE에 사용자 원문을 그대로 넣으면 일반어가 과확장되고, 순수 키워드 나열은 OR 검색처럼 넓어진다. 따라서 SPLADE는 짧은 자연문/명사구, dense는 planner semantic_query 중심으로 분리한다.
 
-> v1.x의 "브랜치"는 v2.x에서 "doc_type(또는 family) 경로"로 대체된다. 현재 active 검색 모드는 `grouped_hybrid_rrf`이며, `keyword_pool_then_hybrid`의 1차 후보 풀 단계는 사용하지 않는다.
+> v1.x의 "브랜치"는 v2.x에서 "doc_type(또는 family) 경로"로 대체된다. 현재 active 검색 모드는 `multiview_flat_relevance`이며, `keyword_pool_then_hybrid`의 1차 후보 풀 단계는 사용하지 않는다.
 
 ### 5.3 연구자 집계 (v2.x 핵심)
 chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
@@ -196,7 +197,7 @@ chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
 > 2026-05-28 사용자가 "일부 고정 제약 재검토 개방"을 택했다. chunk 단위 score가 생기면서 weighted fusion·후보 리랭커가 기술적으로 더 자연스러워졌기 때문이다. 아래는 그 재검토의 **확정 결정**이다.
 
 ### 6.1 Qdrant 융합: equal RRF 유지
-컬렉션 내 dense+sparse 융합은 `FusionQuery(RRF)`(equal)로 고정한다. Qdrant 단의 weighted RRF/score 가중합은 **여전히 쓰지 않는다**. 이유: RRF는 스케일이 다른 dense·sparse score를 순위로만 결합해 안정적이고, 버전·재현성 리스크가 낮다.
+컬렉션 내 dense+sparse 융합은 앱단 등수 기반 RRF로 고정한다. Qdrant 단의 weighted RRF/score 가중합은 **여전히 쓰지 않는다**. 이유: RRF는 스케일이 다른 dense·sparse score를 순위로만 결합해 안정적이고, 버전·재현성 리스크가 낮다.
 
 ### 6.2 집계 가중(doc_type prior): 옵트인, 기본 equal
 연구자 집계 단계의 family/doc_type 가중은 **앱단에서** 조정 가능하다(이미 v1.x도 `BRANCH_WEIGHTS`로 앱단 가중을 적용했다). v2.x 기본값은 **equal**. intent가 명확할 때만(예: "평가 경험이 풍부한" → 평가이력 family prior↑) 옵트인으로 켠다. 이는 Qdrant weighted RRF가 아니라 **랭크 누적 가중**이며, 켜더라도 hard filter와 결정론적 정렬을 침해하지 않는다. 설정: `NTIS_DOC_TYPE_PRIORS`(기본 미설정=equal).

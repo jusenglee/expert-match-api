@@ -563,6 +563,60 @@ PLAYGROUND_HTML = dedent(
           `;
         }
 
+        function renderMatchBadges(badges) {
+          const items = badges || [];
+          if (!items.length) return '';
+          return `<div class="badge-list">${items.map(item => `<span class="tag">${escapeHtml(item)}</span>`).join('')}</div>`;
+        }
+
+        function renderEvidenceSummary(summary) {
+          const data = summary || {};
+          const counts = data.total_profile_counts || {};
+          return `
+            <div class="stat-grid">
+              <div class="stat-box"><span class="label">누적 논문</span><span class="value">${escapeHtml(counts.article_cnt ?? 0)}</span></div>
+              <div class="stat-box"><span class="label">누적 특허</span><span class="value">${escapeHtml(counts.patent_cnt ?? 0)}</span></div>
+              <div class="stat-box"><span class="label">누적 과제</span><span class="value">${escapeHtml(counts.project_cnt ?? 0)}</span></div>
+              <div class="stat-box"><span class="label">이번 매칭 근거</span><span class="value">${escapeHtml(data.matched_evidence_count ?? 0)}</span></div>
+              <div class="stat-box"><span class="label">화면 표시 근거</span><span class="value">${escapeHtml(data.shown_evidence_count ?? 0)}</span></div>
+            </div>
+          `;
+        }
+
+        function renderScoreExplanation(recommendation, retrievalTraceMap) {
+          const explanation = recommendation.score_explanation || {};
+          const chunks = explanation.top_chunks || [];
+          if (!chunks.length) return renderRetrievalTrace(recommendation.expert_id, retrievalTraceMap);
+          const breakdown = explanation.score_breakdown || {};
+          const breakdownText = Object.keys(breakdown).length
+            ? Object.entries(breakdown).map(([key, value]) => `${escapeHtml(key)} ${escapeHtml(value)}`).join(' · ')
+            : '';
+          return `
+            <details>
+              <summary>검색 점수 근거</summary>
+              <div style="font-size: 0.85rem; margin-top: 0.5rem">
+                <div><b>최종 검색 원점수:</b> ${escapeHtml(explanation.final_score ?? '-')}</div>
+                <div><b>표시 순위 점수:</b> ${escapeHtml(explanation.rank_score ?? '-')}</div>
+                ${breakdownText ? `<div><b>점수 분해:</b> ${breakdownText}</div>` : ''}
+              </div>
+              <ul style="font-size: 0.85rem; margin-top: 0.5rem">
+                ${chunks.map(item => {
+                  const meta = [
+                    escapeHtml(item.doc_type || '-'),
+                    item.score != null ? `score ${escapeHtml(item.score)}` : '',
+                    (item.concepts || []).length ? `concepts ${(item.concepts || []).map(escapeHtml).join(', ')}` : '',
+                    (item.sources || []).length ? `sources ${(item.sources || []).map(escapeHtml).join(', ')}` : ''
+                  ].filter(Boolean).join(' · ');
+                  return `<li style="margin-bottom: 0.6rem">
+                    <div>${meta}</div>
+                    ${item.title ? `<div style="font-weight: 600; color: var(--text-main)">${escapeHtml(item.title)}</div>` : ''}
+                  </li>`;
+                }).join('')}
+              </ul>
+            </details>
+          `;
+        }
+
         function renderEvidenceItems(evidence) {
           const items = evidence || [];
           if (!items.length) {
@@ -674,8 +728,11 @@ PLAYGROUND_HTML = dedent(
                 ${data.recommendations.map(r => `
                   <div class="expert-card">
                     <h4>#${r.rank} ${escapeHtml(r.name)} <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500; margin-left: 0.5rem;">${escapeHtml(r.organization || '소속 미상')}</span> <span class="tag" style="margin-left: auto;">${r.fit}</span></h4>
+                    ${renderMatchBadges(r.match_badges)}
+                    ${r.match_summary ? `<div style="font-size: 0.9rem; margin: 0.5rem 0;"><b>매칭 요약:</b> ${escapeHtml(r.match_summary)}</div>` : ''}
+                    ${renderEvidenceSummary(r.evidence_summary)}
                     <div style="font-size: 0.9rem; margin-bottom: 0.5rem"><b>추천 사유:</b> ${escapeHtml(r.recommendation_reason || '')}</div>
-                    ${renderRetrievalTrace(r.expert_id, retrievalTraceMap)}
+                    ${renderScoreExplanation(r, retrievalTraceMap)}
                     <details>
                       <summary>수행 증거 및 실적</summary>
                       ${renderEvidenceItems(r.evidence)}

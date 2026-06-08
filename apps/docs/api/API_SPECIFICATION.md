@@ -31,7 +31,7 @@
 }
 ```
 - `query` (string, 필수): 자연어 질의. 여러 줄은 `, `로 합쳐 단일 질의로 정규화.
-- `top_k` (integer, 선택): 추천 최대 인원 (1~15).
+- `top_k` (integer, 선택): 반환 최대 인원 (1~15). 미지정 시 planner `top_k`를 따르되 런타임은 최대 15명으로 clamp한다.
 - `filters_override` (dict, 선택): hard filter 강제 지정(허용 키는 [`DATA_CONTRACT.md §1.1`](DATA_CONTRACT.md)).
 - `include_orgs` / `exclude_orgs` (list[string], 선택): 포함/배제 기관(root `affiliated_organization` 기준).
 
@@ -49,6 +49,34 @@
       "name": "홍길동",
       "fit": "높음",
       "recommendation_reason": "AI 반도체 국책 과제 수행과 관련 평가위원 활동 이력이 있습니다.",
+      "match_badges": ["AI 충족", "반도체 충족", "직접 수행 근거 있음"],
+      "match_summary": "AI, 반도체 근거가 확인되었습니다.",
+      "match_details": {
+        "matched_concepts": ["ai", "semiconductor"],
+        "missing_concepts": [],
+        "coverage_type": "joint",
+        "matched_doc_types": ["project"],
+        "direct_evidence_count": 1
+      },
+      "score_explanation": {
+        "final_score": 0.77,
+        "rank_score": 95.8,
+        "score_breakdown": { "joint": 0.5, "concept": 0.2 },
+        "top_chunks": [
+          {
+            "doc_type": "project",
+            "title": "차세대 지능형 반도체 설계",
+            "concepts": ["ai", "semiconductor"],
+            "sources": ["dense_full", "concept:semiconductor"],
+            "score": 0.42
+          }
+        ]
+      },
+      "evidence_summary": {
+        "total_profile_counts": { "article_cnt": 15, "scie_cnt": 5, "patent_cnt": 3, "project_cnt": 5, "assessor_cnt": 5 },
+        "matched_evidence_count": 1,
+        "shown_evidence_count": 1
+      },
       "evidence": [
         {
           "type": "project",
@@ -80,6 +108,11 @@
   - `name` (string): 성명.
   - `fit` (string): "높음" / "중간" / "보통".
   - `recommendation_reason` (string): LLM 생성 단일 사유.
+  - `match_badges` (list[string]): UI 카드 조건 충족 배지. 기존 사유 필드를 대체하지 않는 보조 정보다.
+  - `match_summary` (string): 카드 기본 영역에 쓰는 짧은 매칭 요약.
+  - `match_details` (object): `matched_concepts`, `missing_concepts`, `coverage_type`(`joint`/`separate`/`partial`/빈 문자열), `matched_doc_types`, `direct_evidence_count`.
+  - `score_explanation` (object): 검색 점수 상세 펼침용 `final_score`, `rank_score`, `score_breakdown`, `top_chunks`.
+  - `evidence_summary` (object): 누적 실적(`total_profile_counts`)과 이번 질의 매칭 근거 수(`matched_evidence_count`), 화면 표시 근거 수(`shown_evidence_count`)를 분리한다.
   - `evidence` (list[object]): 추천 근거 chunk.
     - `type` (string): doc_type — `paper` / `patent` / `project` / `assessor_activity` / `specialty` 중 하나, 또는 합성 신원 근거 `profile`.
     - `chunk_id` (string): 근거 chunk 식별자(불변, evidence 참조 id). 형식 `<doc_type>_<숫자doc_id>_c<NNN>`(예: `paper_100000045256_c000`).
@@ -91,13 +124,15 @@
   - `rank_score` (float): RRF 집계 점수(0~100 정규화). 절대 적합도 아님.
 - `data_gaps` (list[string]): 상위 추천자 공통 데이터 공백.
 - `not_selected_reasons` (list[string]): 숏리스트에 올랐으나 제외된 사유.
-- `trace` (dict): 디버깅용 추적 데이터. `retrieval_score_traces[*].matches[*]`는 RRF 기여점수(`contribution`), `chunk_id`, 제목, 날짜, snippet을 포함한다.
+- `trace` (dict): 디버깅용 추적 데이터. `top_k_used`는 실제 적용된 반환 상한이다. `retrieval_score_traces[*].matches[*]`는 RRF 기여점수(`contribution`), `chunk_id`, 제목, 날짜, snippet을 포함한다. `trace.strict_filter`는 concept gate 활성 여부, required concept, `relevance_concepts_missing`으로 제외된 후보와 미충족 concept를 기록한다.
+
+`/recommend`의 기본 추천 목록에는 `missing_concepts`가 없는 후보만 포함한다. required concept를 일부만 충족한 후보는 운영/디버그 확인용으로 `trace.strict_filter.excluded_reasons`에 남는다.
 
 ---
 
 ### 2) 후보 목록 조회 — `POST /search/candidates`
 
-추천(사유 생성) 없이 검색·집계·정렬된 숏리스트 전체를 반환한다.
+추천(사유 생성) 없이 검색·집계·정렬된 후보 숏리스트를 반환한다. 사용자 노출 후보 수는 `/recommend`와 동일하게 최대 15명이다.
 
 #### 요청
 - `/recommend`와 동일 스키마.
@@ -141,7 +176,7 @@
 - `data_gaps`, `risks` (list[string]).
 - `shortlist_score` (float): RRF 집계 정규화 점수(0~100).
 
-추가로 `intent_summary`, `applied_filters`, `searched_branches`, `keywords`(검색에 사용된 핵심 키워드), `retrieved_count`, `trace`를 최상위에 반환한다.
+추가로 `intent_summary`, `applied_filters`, `searched_branches`, `keywords`(검색에 사용된 핵심 키워드), `retrieved_count`, `trace`를 최상위에 반환한다. `/search/candidates.trace.top_k_used`는 실제 적용된 후보 반환 상한이다. `/search/candidates.trace.strict_filter`는 `/recommend`와 동일한 strict-filter 요약 구조를 제공한다.
 
 ---
 

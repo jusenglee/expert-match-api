@@ -6,6 +6,8 @@ evidence는 doc_type별 ChunkEvidence 묶음으로 구성한다(assessor_activit
 
 from __future__ import annotations
 
+from typing import Any
+
 from apps.domain.chunk_view import derive_date, derive_title, parse_year, snippet
 from apps.domain.models import (
     CandidateCard,
@@ -33,6 +35,10 @@ _GAP_LABELS: dict[str, str] = {
 
 def _evidence_sort_key(ev: ChunkEvidence) -> tuple[int, float]:
     return (parse_year(ev.date) or 0, ev.score)
+
+
+def _unique_sorted(values: list[str]) -> list[str]:
+    return sorted({value for value in values if value})
 
 
 class CandidateCardBuilder:
@@ -74,6 +80,26 @@ class CandidateCardBuilder:
             items.sort(key=_evidence_sort_key, reverse=True)
         return buckets
 
+    def _build_top_chunks(self, candidate: ResearcherCandidate) -> list[dict[str, Any]]:
+        chunks: list[dict[str, Any]] = []
+        for hit in candidate.chunks[:10]:
+            payload = hit.payload
+            chunks.append(
+                {
+                    "chunk_id": payload.chunk_id,
+                    "doc_type": payload.doc_type,
+                    "title": derive_title(
+                        payload.doc_type,
+                        payload.doc_attrs,
+                        fallback=payload.chunk_text,
+                    ),
+                    "concepts": list(hit.concepts),
+                    "sources": list(hit.sources),
+                    "score": round(float(hit.score), 6),
+                }
+            )
+        return chunks
+
     def _build_card(self, candidate: ResearcherCandidate, plan: PlannerOutput) -> CandidateCard:
         counts_root = candidate.counts
         counts = {
@@ -109,4 +135,19 @@ class CandidateCardBuilder:
             matched_filter_summary=matched_filter_summary,
             risks=risks,
             data_gaps=data_gaps,
+            raw_score=round(float(candidate.group_score), 6),
+            matched_concepts=list(candidate.matched_concepts),
+            missing_concepts=_unique_sorted(
+                [
+                    *candidate.missing_concepts,
+                    *[
+                        concept
+                        for concept in plan.required_concepts
+                        if concept not in candidate.matched_concepts
+                    ],
+                ]
+            ),
+            coverage_type=candidate.coverage_type,
+            score_breakdown=dict(candidate.score_breakdown),
+            top_chunks=self._build_top_chunks(candidate),
         )

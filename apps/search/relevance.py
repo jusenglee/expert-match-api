@@ -175,6 +175,18 @@ def _payload_text(payload: ChunkPayload) -> str:
     return _normalize_text(payload.chunk_text, payload.doc_id)
 
 
+def has_operation_marker(payload: ChunkPayload, markers: frozenset[str]) -> bool:
+    """운영성/교육/행정 과제 마커가 chunk 본문에 등장하는가(근거 가치 하향용, 융합점수에 factor 적용).
+
+    markers는 casefold 가정. 공백 제거본과도 대조해 '사업단 운영'↔'사업단운영' 같은 표기차를 흡수한다.
+    """
+    if not markers:
+        return False
+    text = _payload_text(payload)
+    despaced = text.replace(" ", "")
+    return any(marker in despaced for marker in markers)
+
+
 def chunk_concept_signals(
     payload: ChunkPayload,
     concept_plan: ConceptPlan,
@@ -263,6 +275,128 @@ def _chunk_value(hit: ChunkHit, doc_type_quality: dict[str, float]) -> float:
     return hit.score * doc_type_quality.get(hit.doc_type, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# joint 토큰 변별 — 붙은 단일 합성어(예: '인공지능반도체대학원')가 두 required 개념을 한 토큰에서
+# 동시에 confirm해 거짓 joint(×joint weight)를 만드는 것을 차단한다. 개별 concept 확정
+# (tag_chunk_concepts)은 그대로 두고, joint는 'required 개념들이 서로 다른 토큰으로 확정될 때'만
+# 인정한다. 한국어 정상 단일개념 합성어('차세대지능형반도체' 등)는 영향 없음.
+# ---------------------------------------------------------------------------
+_WORD_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _text_tokens(text: str) -> list[str]:
+    """공백/문장부호로 분리한 단어 토큰(한글·영숫자 run). text는 이미 casefold/정규화 가정."""
+    return _WORD_TOKEN_RE.findall(text)
+
+
+def _concept_confirming_tokens(tokens: list[str], spec: ConceptSpec) -> set[str]:
+    """evidence_term이 '한 토큰 안에' 등장하는 그 토큰 값들의 집합(값 기준 — 동일 토큰 반복은 1개로)."""
+    evidence = spec.evidence_terms or spec.query_terms
+    return {tok for tok in tokens if any(_contains_term(tok, term) for term in evidence)}
+
+
+def _has_distinct_assignment(token_sets: list[set[str]]) -> bool:
+    """각 개념에 '서로 다른 토큰'을 1:1 배정할 수 있는가(SDR/Hall) — augmenting path 매칭."""
+    owner: dict[str, int] = {}  # token -> 점유 개념 index
+
+    def assign(i: int, seen: set[str]) -> bool:
+        for tok in token_sets[i]:
+            if tok in seen:
+                continue
+            seen.add(tok)
+            if tok not in owner or assign(owner[tok], seen):
+                owner[tok] = i
+                return True
+        return False
+
+    return all(assign(i, set()) for i in range(len(token_sets)))
+
+
+def joint_eligible(payload: ChunkPayload, concept_plan: ConceptPlan) -> bool:
+    """이 chunk가 required 개념들을 '서로 다른 토큰'으로 확정하는가(붙은 단일 토큰 거짓 joint 차단).
+
+    required<2면 항상 True(joint 개념 자체가 단일). 텍스트에서 토큰을 못 잡거나(직접 주입 등)
+    어떤 개념이 토큰 단위로 안 잡히면(멀티워드 evidence 등) 보수적으로 True(강등하지 않음).
+    """
+    required_specs = [s for s in concept_plan.specs if s.role == "required"]
+    if len(required_specs) < 2:
+        return True
+    tokens = _text_tokens(_payload_text(payload))
+    if not tokens:
+        return True
+    token_sets: list[set[str]] = []
+    for spec in required_specs:
+        toks = _concept_confirming_tokens(tokens, spec)
+        if not toks:
+            return True  # 토큰 단위 미검출 → 판단 불가, 보존
+        token_sets.append(toks)
+    return _has_distinct_assignment(token_sets)
+
+
+def _confirming_token_values(
+    hit: ChunkHit, concept: str, concept_plan: ConceptPlan, *, distinct: bool
+) -> set[str]:
+    """이 chunk가 concept을 확정하는 '토큰값' 집합.
+
+    distinct=False거나(플래그 off) 텍스트에서 토큰을 못 잡으면(빈 텍스트/멀티워드 evidence) chunk·concept별
+    synthetic distinct 토큰을 써서 기존 동작(개념별 독립 best)을 보존한다. distinct=True일 때만 실제
+    토큰값을 공유 판정에 쓴다 — '인공지능반도체대학원' 같은 단일 합성 토큰이 두 개념을 동시 충족하는 것을 막는다.
+    """
+    spec = concept_plan.spec(concept) if distinct else None
+    if spec is not None:
+        toks = _concept_confirming_tokens(_text_tokens(_payload_text(hit.payload)), spec)
+        if toks:
+            return toks
+    return {f"{hit.chunk_id}#{concept}"}
+
+
+def _assign_distinct_token_evidence(
+    chunks: list[ChunkHit],
+    concepts: list[str],
+    concept_plan: ConceptPlan,
+    doc_type_quality: dict[str, float],
+    *,
+    distinct: bool,
+) -> dict[str, tuple[float, str]]:
+    """각 concept에 '서로 다른 토큰값'의 최고가치 증거를 1:1 배정(최대 cardinality 매칭).
+
+    반환: concept -> (chunk_value, chunk_id). 같은 합성 토큰('인공지능반도체대학원')으로만 확정되는 두 개념은
+    서로 다른 토큰을 못 잡아 한쪽만 배정된다(chunk가 여러 개여도 토큰값이 같으면 마찬가지) — 단일 chunk든
+    중복 chunk든 거짓 다개념 충족/중복 계상을 차단한다. augmenting-path는 value 내림차순 인접으로 결정적.
+    """
+    units: dict[str, dict[str, tuple[float, str]]] = {}  # concept -> token -> (value, chunk_id)
+    for hit in chunks:
+        value = _chunk_value(hit, doc_type_quality)
+        for concept in hit.concepts:
+            if concept not in concepts:
+                continue
+            slot = units.setdefault(concept, {})
+            for tok in _confirming_token_values(hit, concept, concept_plan, distinct=distinct):
+                prev = slot.get(tok)
+                if prev is None or value > prev[0]:
+                    slot[tok] = (value, hit.chunk_id)
+
+    adjacency = {
+        c: [tok for tok, _ in sorted(units.get(c, {}).items(), key=lambda kv: (-kv[1][0], kv[0]))]
+        for c in concepts
+    }
+    token_owner: dict[str, str] = {}
+
+    def augment(concept: str, seen: set[str]) -> bool:
+        for tok in adjacency.get(concept, []):
+            if tok in seen:
+                continue
+            seen.add(tok)
+            if tok not in token_owner or augment(token_owner[tok], seen):
+                token_owner[tok] = concept
+                return True
+        return False
+
+    for c in concepts:
+        augment(c, set())
+    return {concept: units[concept][tok] for tok, concept in token_owner.items()}
+
+
 def score_researcher(
     chunks: list[ChunkHit],
     concept_plan: ConceptPlan,
@@ -271,13 +405,20 @@ def score_researcher(
     doc_type_quality: dict[str, float],
     support_top_k: int,
     weak_evidence_floor: float = 0.0,
+    require_distinct_tokens_for_joint: bool = True,
 ) -> ResearcherScore:
     """관련 chunk(concept 태깅 완료)로 capped evidence score 계산.
 
     chunk_value = fused_score × doc_type_quality. 개념별 best + balance + joint + capped support.
-    joint/best로 쓰인 chunk는 support에서 제외(중복 계상 방지).
+    개념별 best/balance/concept는 '서로 다른 토큰값'으로 확정된 증거에만 배정(_assign_distinct_token_evidence)
+    하여, 단일 합성 토큰('인공지능반도체대학원')이 두 개념을 동시 충족·중복 계상하는 것을 차단한다.
+    배정/joint로 쓰인 chunk는 support에서 제외(중복 계상 방지).
     """
     required = concept_plan.required
+    scope = list(required) if required else list(concept_plan.all_concepts)
+    distinct = require_distinct_tokens_for_joint
+
+    # 표시용 개념별 chunk(value desc) — 점수 배정과 무관하게 보존(evidence_by_concept).
     by_concept: dict[str, list[ChunkHit]] = {}
     for hit in chunks:
         for concept in hit.concepts:
@@ -287,39 +428,43 @@ def score_researcher(
 
     matched = [c for c in concept_plan.all_concepts if by_concept.get(c)]
 
-    # concept별 best chunk_value + best chunk
-    concept_best: dict[str, float] = {}
-    best_chunk_ids: set[str] = set()
-    for concept in concept_plan.all_concepts:
-        items = by_concept.get(concept, [])
-        if items:
-            concept_best[concept] = _chunk_value(items[0], doc_type_quality)
-            best_chunk_ids.add(items[0].chunk_id)
+    # 개념별 '서로 다른 토큰' 증거 배정: concept -> (chunk_value, chunk_id).
+    assigned = _assign_distinct_token_evidence(
+        chunks, scope, concept_plan, doc_type_quality, distinct=distinct
+    )
 
-    # joint = required 전부를 한 chunk가 동시충족
-    joint_chunks = [h for h in chunks if required and all(c in h.concepts for c in required)]
+    # joint = required 전부를 한 chunk가 동시충족 (붙은 단일 토큰 거짓 joint는 token 변별로 차단)
+    joint_chunks = [
+        h
+        for h in chunks
+        if required
+        and all(c in h.concepts for c in required)
+        and (not distinct or joint_eligible(h.payload, concept_plan))
+    ]
     joint_chunks.sort(key=lambda h: -_chunk_value(h, doc_type_quality))
     joint_best = _chunk_value(joint_chunks[0], doc_type_quality) if joint_chunks else 0.0
-    if joint_chunks:
-        best_chunk_ids.add(joint_chunks[0].chunk_id)
 
-    # required 충족 여부 (gate)
-    required_covered = all(concept_best.get(c, 0.0) > 0.0 for c in required) if required else bool(matched)
+    # required 충족 여부 (gate): 각 required 개념이 '독립 토큰'으로 배정되어야 충족.
+    required_covered = all(c in assigned for c in required) if required else bool(assigned)
     if required_covered:
         coverage_type = "joint" if joint_chunks else "separate"
     else:
         coverage_type = "partial"
 
-    # balance = min(required concept best). 한쪽 몰빵 억제.
+    # balance = min(required 개념 배정값). 한쪽 몰빵 억제.
     if required and required_covered:
-        balance = min(concept_best.get(c, 0.0) for c in required)
+        balance = min(assigned[c][0] for c in required)
     else:
         balance = 0.0
-    concept_sum = sum(concept_best.get(c, 0.0) for c in required) if required else sum(concept_best.values())
+    # concept = 배정된 개념들의 값 합(서로 다른 토큰 → 중복 계상 없음).
+    concept_sum = sum(assigned[c][0] for c in scope if c in assigned)
 
-    # capped support: best/joint로 안 쓰인 관련 chunk를 chunk_value 내림차순 top-k, harmonic decay 합.
+    # capped support: 배정/joint로 안 쓰인 관련 chunk를 chunk_value 내림차순 top-k, harmonic decay 합.
+    used_chunk_ids = {chunk_id for _, chunk_id in assigned.values()}
+    if joint_chunks:
+        used_chunk_ids.add(joint_chunks[0].chunk_id)
     support_pool = sorted(
-        (h for h in chunks if h.concepts and h.chunk_id not in best_chunk_ids),
+        (h for h in chunks if h.concepts and h.chunk_id not in used_chunk_ids),
         key=lambda h: -_chunk_value(h, doc_type_quality),
     )
     support = 0.0

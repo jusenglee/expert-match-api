@@ -12,6 +12,8 @@
 
 | 날짜 | 커밋 | 영향도 | 변경 내용 |
 |---|---|---|---|
+| 2026-06-08 | `pending` | 확장/동작 | `/recommend.recommendations[*]`에 UI 설명 보조 필드 `match_badges`, `match_summary`, `match_details`, `score_explanation`, `evidence_summary`가 추가되었습니다. 기존 `recommendation_reason`, `evidence`, `rank_score`, `reasons`는 유지됩니다. `/recommend` 기본 추천 목록은 required concept 미충족 후보를 제외하고, `/recommend.trace.strict_filter`와 `/search/candidates.trace.strict_filter`는 required concept gate 활성 여부, required concept, `relevance_concepts_missing`으로 제외된 후보별 matched/missing concept를 노출합니다. |
+| 2026-06-08 | `pending` | 동작/trace 변경 | 사용자 노출 결과 수를 `/recommend`와 `/search/candidates` 모두 최대 15명으로 고정했습니다. 요청 `top_k`는 1~15만 허용하고, planner가 15 초과 값을 내도 `trace.top_k_used`가 15로 clamp됩니다. dense 검색은 `planner.semantic_query`를 우선 사용하고, concept 확정/gate는 `chunk_text`/`doc_id` 직접 evidence만 사용합니다(`doc_attrs` 값 제외). `/search/candidates.trace.top_k_used`가 추가되었습니다. |
 | 2026-06-04 | `v2.1.1` | **정책 정정** | hard_filter와 payload index 대상을 flat root 필드로 제한했습니다. `doc_attrs.*`는 유동 상세 필드이므로 `journal_class`→`doc_attrs.indexing_database` 매핑과 project `performing_organization`/`managing_agency` 기반 기관 필터를 제거했습니다. 기관 include/exclude는 root `affiliated_organization` 앱단 post-filter만 사용합니다. |
 | 2026-03-31 | `c4a3cfa` | 기준선 | 공개 응답 스키마 초안이 추가되었습니다. `/recommend`는 `intent_summary`, `applied_filters`, `searched_branches`, `retrieved_count`, `recommendations`, `data_gaps`, `not_selected_reasons`, `trace` 구조를 갖고, `/search/candidates`는 `candidates[*].branch_coverage`를 사용했습니다. |
 | 2026-04-06 | `368cb28` | 동작 변경 | `/recommend`가 더 이상 "후보 없음" 또는 "evidence 없음" 때문에 `500`을 내지 않고, `200 OK`와 함께 `recommendations=[]`를 반환하도록 바뀌었습니다. 빈 결과 사유는 `not_selected_reasons`에 남기도록 정리되었습니다. |
@@ -24,7 +26,7 @@
 | 2026-04-23 | `pending` | 확장 | 운영 로그와 `trace.query_payload`에 실제 키워드 추출 결과와 검색 쿼리 텍스트가 추가되었습니다. `trace.server_logs`는 `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, 실제 `retrieval_keywords`, 1차/2차 검색 텍스트를 값 그대로 보여줍니다. v1.x 확장 사전 기반 `bundle_ids`는 active 검색 경로에서 제거됐습니다. |
 | 2026-05-28 | `v2.0` | **주요 변경(BREAKING)** | chunk 데이터 모델 재설계(저장 단위 "연구자 1 Point" → "chunk 1 Point"). 외부 응답에서 다음이 변경됩니다 — `recommendations[*].evidence[*].type`이 4종(`paper/patent/project/profile`)에서 doc_type 문자열로 확장; `evidence[*]`에 **`chunk_id` 추가**; `counts`가 연구자 누적 실적 기반 명칭(`publication_count` 등)으로 변경. 컬렉션 기본값 `researcher_recommend_proto` → `ntis_researcher_chunks`. *(이 시점 설계 문서는 11 doc_type / `searched_doc_types` 리네임 / `doc_type_coverage`(family) 등을 예고했으나, 실제 적재 데이터와 코드는 아래 v2.1에서 flat·5 doc_type으로 확정되었습니다.)* |
 | 2026-06-02 | `v2.1` | **주요 변경(BREAKING)** | **flat payload 확정.** 실제 적재 데이터는 평탄 chunk payload(연구자 공통 메타 root 비정규화 + doc_type별 `doc_attrs{}`)이며 doc_type은 **정확히 5종**(`paper`/`patent`/`project`/`assessor_activity`/`specialty`)입니다. `recommendations[*].evidence[*].type`은 이 5종 또는 합성 `profile`이고, 식별자는 `chunk_id`(형식 `<doc_type>_<숫자doc_id>_c<NNN>`)입니다. `/search/candidates.candidates[*]`는 family boolean이 아니라 **`doc_types_present`(hit한 doc_type 문자열 목록)** 를 노출하며, `counts`는 flat root 단일 평가위원 카운트를 포함한 5개 키입니다. hard_filter는 flat root 키(`highest_degree`, root count `*_count_min`, `recent_years`+`recent_doc_types` on `doc_date`)입니다. `doc_attrs.*`는 필터/인덱스 대상이 아닙니다. |
-| 2026-06-04 | `pending` | 동작/trace 변경 | 검색 쿼리가 `SearchQueryPlan`으로 분리되었습니다. dense는 사용자 원문 중심 `dense_query`, SPLADE는 짧은 `sparse_joint_query`와 `sparse_<concept>` 보조 쿼리를 사용합니다. `trace.query_payload.search_query_plan`에 `raw_query`, `dense_query`, `sparse_joint_query`, `sparse_concept_queries`, `required_concepts`, `optional_concepts`가 노출됩니다. 검색 모드는 `grouped_hybrid_rrf`이며, 최종 연구자 후보는 `required_concepts` coverage gate를 통과해야 합니다. evidence 식별 기준은 Qdrant Point ID가 아니라 payload root `chunk_id`입니다. |
+| 2026-06-04 | `pending` | 동작/trace 변경 | 검색 쿼리가 `SearchQueryPlan`으로 분리되었습니다. dense는 `dense_query`, SPLADE는 `sparse_raw`, 짧은 `sparse_joint_query`, `sparse_<concept>` 보조 쿼리를 사용합니다. `trace.query_payload.search_query_plan`에 `raw_query`, `dense_query`, `sparse_joint_query`, `sparse_concept_queries`, `required_concepts`, `optional_concepts`가 노출됩니다. 검색 모드는 `multiview_flat_relevance`이며, 최종 연구자 후보는 `required_concepts` coverage gate를 통과해야 합니다. evidence 식별 기준은 Qdrant Point ID가 아니라 payload root `chunk_id`입니다. |
 
 ## v2.1 flat payload 확정 (실데이터 정합, 2026-06-02)
 
@@ -135,7 +137,11 @@
 - 근거 식별자는 `evidence[*].chunk_id`(형식 `<doc_type>_<숫자doc_id>_c<NNN>`)이며, `evidence[*].type`은 doc_type 5종 또는 `profile`입니다.
 - payload는 flat입니다(연구자 공통 메타 root 비정규화, doc_type별 `doc_attrs{}`, 단일 `doc_date`). `researcher_meta` 중첩, `event_date`/`event_year`, `domain_attrs`, `tags`, `chunk_text_len`은 존재하지 않습니다.
 - 컬렉션 기본값은 `ntis_researcher_chunks`, named vector는 단일 `vector_e5i`(dense, 1024, Cosine) + `vector_splade`(sparse)이며 doc_type은 payload 필터입니다.
-- `trace.query_payload.search_query_plan`은 dense/sparse/concept별 실제 검색 텍스트와 `required_concepts`를 담습니다. SPLADE 검색 텍스트는 사용자 원문이 아니라 `sparse_joint_query` 및 `sparse_concept_queries`입니다.
+- `trace.query_payload.search_query_plan`은 dense/sparse/concept별 실제 검색 텍스트와 `required_concepts`를 담습니다. dense 검색 텍스트는 planner `semantic_query` 우선이고, SPLADE 검색 텍스트는 `sparse_raw`, `sparse_joint_query`, `sparse_concept_queries`입니다.
+- 사용자 노출 결과 수는 `/recommend`와 `/search/candidates` 모두 최대 15명입니다. 실제 제한값은 `trace.top_k_used`(`/search/candidates`도 동일)로 확인합니다.
+- concept 확정/gate는 `chunk_text`/`doc_id` 직접 evidence만 사용하며, `doc_attrs` 값은 표시·상세 메타로만 사용합니다.
+- `/recommend.recommendations[*]`의 `match_badges`, `match_summary`, `match_details`, `score_explanation`, `evidence_summary`는 UI 보조 필드입니다. 기존 클라이언트는 무시해도 되고, 신규 UI는 누적 실적 count와 이번 질의 매칭 evidence 수를 `evidence_summary`로 분리 표시해야 합니다.
+- `trace.strict_filter`는 required concept gate의 제외 후보를 설명합니다. 후보별 미충족 concept는 `excluded_reasons[*].missing_concepts`에 있습니다.
 - `/recommend`와 `/search/candidates` 모두 `trace`는 존재하지만, 디버그 목적 필드이므로 안정성이 top-level 계약보다 낮습니다.
 
 ## 근거 파일

@@ -27,16 +27,17 @@
 
 ## 2. 검색 및 집계 (Retrieval & Aggregation)
 
-`QueryTextBuilder`는 채널별 `SearchQueryPlan`을 만든다. dense는 사용자 원문(`raw_query`) 중심이고, SPLADE는 원문 전체가 아니라 짧은 `sparse_joint_query`와 concept별 `sparse_concept_queries`를 사용한다. 예: `raw_query="인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"` → `dense_query=raw_query`, `sparse_joint_query="인공지능 반도체 연구개발 산업 경험"`, concept query는 `ai`, `semiconductor`, `semiconductor_experience`로 분리한다.
+`QueryTextBuilder`는 채널별 `SearchQueryPlan`을 만든다. dense는 planner `semantic_query`를 우선 사용하고(없으면 `raw_query` fallback), SPLADE는 원문 전체가 아니라 `sparse_raw`, 짧은 `sparse_joint_query`, concept별 `sparse_concept_queries`를 분리 사용한다. 예: `raw_query="인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"`, `semantic_query="인공지능과 반도체 경험을 함께 보유한 연구자"` → `dense_query=semantic_query`, `sparse_joint_query="인공지능 반도체 연구개발 산업 경험"`, concept query는 `ai`, `semiconductor`, `semiconductor_experience`로 분리한다.
 
-`QdrantHybridRetriever` 동작 (모드 `grouped_hybrid_rrf` 고정):
+`QdrantHybridRetriever` 동작:
 
-1. **검색 — grouped hybrid RRF:** `query_points_groups(group_by="researcher_id")` 1회. prefetch는 `dense_full` + `sparse_joint` + `sparse_<concept>`로 구성하고, Qdrant `FusionQuery(RRF)` equal로 chunk hit을 산출한다.
-2. **chunk concept gate:** `required_concepts`가 있으면 concept hit가 없는 sibling chunk를 제거한다.
-3. **연구자 coverage gate:** 남은 chunk들이 `required_concepts` 전체를 덮는 연구자만 후보로 남긴다.
-4. **연구자 집계:** chunk hit을 `researcher_id`로 묶고 RRF 누적으로 연구자 점수 산출. 한 연구자의 동일 doc_type에서는 상위 N개 chunk만 점수에 기여(`doc_type_chunk_cap`, 기본 3), 같은 doc_type 추가 chunk는 harmonic decay로 체감 반영한다. 집계 prior는 기본 equal, 연구자당 1건으로 dedupe.
-5. **hard filter:** `doc_date` 최근성(여러 doc_type은 OR/min_should), flat root `*_count` 최소 실적, 학위를 deterministic 적용한다. 기관 include/exclude는 정규화된 root 필드가 없으므로 앱단 post-filter에서 root `affiliated_organization`만 비교한다. `doc_attrs.*`는 유동 상세 필드라 필터 대상으로 쓰지 않는다.
-6. **결정론적 정렬:** score 내림차순 → `researcher_name` 오름차순 → `researcher_id` 오름차순.
+1. **검색 — multiview flat:** view별 `query_points`를 실행한다. view는 `dense_full`, `sparse_raw`, `sparse_focus`, `concept:<id>`다.
+2. **chunk 병합/융합:** 동일 근거는 payload `chunk_id`로 병합하고, raw score가 아니라 view별 등수 기반 RRF 점수와 view weight로 chunk 점수를 계산한다.
+3. **chunk concept 확인:** evidence term이 `chunk_text`/`doc_id`에 직접 등장한 경우만 concept confirmed로 태깅한다. `doc_attrs` 값은 concept 확정/gate에 사용하지 않는다.
+4. **연구자 coverage gate:** 남은 chunk들이 `required_concepts` 전체를 덮는 연구자는 main tier, 부족한 연구자는 fallback/filtered tier로 분리한다.
+5. **연구자 집계:** chunk hit을 `researcher_id`로 묶고 required-concept best, balance, joint, capped support로 연구자 점수 산출. 집계 prior는 기본 equal, 연구자당 1건으로 dedupe.
+6. **hard filter:** `doc_date` 최근성(여러 doc_type은 OR/min_should), flat root `*_count` 최소 실적, 학위를 deterministic 적용한다. 기관 include/exclude는 정규화된 root 필드가 없으므로 앱단 post-filter에서 root `affiliated_organization`만 비교한다. `doc_attrs.*`는 유동 상세 필드라 필터 대상으로 쓰지 않는다.
+7. **결정론적 정렬:** score 내림차순 → `researcher_name` 오름차순 → `researcher_id` 오름차순.
 
 각 후보에는 어떤 doc_type/chunk이 어떤 순위로 매칭됐는지 `retrieval_score_traces`로 기록한다.
 
@@ -45,8 +46,8 @@
 ## 3. 후보자 반환 (Candidate Return)
 
 `/search/candidates`는 정렬된 후보 목록을 즉시 반환한다.
-- `top_k` 명시 시 그 수만큼 제한, 아니면 전체 반환.
-- 각 후보는 family별 보유 여부(`doc_type_coverage`)와 flat root 기반 카운트(`counts`)를 함께 노출.
+- `top_k` 명시 시 그 수만큼 제한하고, 미지정 시 planner `top_k`를 따르되 사용자 노출 후보는 항상 최대 15명이다.
+- 각 후보는 이번 검색에서 hit한 doc_type 목록(`doc_types_present`)과 flat root 기반 카운트(`counts`)를 함께 노출.
 
 ---
 
@@ -60,6 +61,7 @@
 4. LLM은 후보별 `fit`, `recommendation_reason`, `selected_evidence_ids`(=고른 `chunk_id`), `risks`를 반환.
 5. **검색 시 원본 순서 유지.** `selected_evidence_ids`로 최종 `recommendation.evidence`를 조립.
 6. LLM이 사유를 누락/공란으로 두면 서버가 chunk 근거 기반 보수적 fallback 사유를 결정론적으로 생성.
+7. 서버는 기존 추천 필드를 유지한 채 UI 보조 메타데이터(`match_badges`, `match_summary`, `match_details`, `score_explanation`, `evidence_summary`)를 additive로 채운다. `evidence_summary`는 연구자 누적 실적 count와 이번 질의 매칭 evidence 수를 분리한다.
 
 **LLM이 하지 않는 것:** 후보 재정렬, 후보 탈락, 새 ID(연구자/chunk) 생성.
 
@@ -80,12 +82,13 @@
 - `raw_query`, `planner_keywords`, `retrieval_keywords` — 원본 질의/추출/실제 검색 키워드
 - `reason_generation_trace` — 사유 생성 상세
 - `retrieval_score_traces` — 후보별 매칭 doc_type/chunk과 순위 근거
-- `query_payload.retrieval_mode` — `grouped_hybrid_rrf` 고정
+- `query_payload.retrieval_mode` — `multiview_flat_relevance`
 - `query_payload.search_query_plan` — raw/dense/sparse joint/concept query와 required/optional concept
 - `query_payload.retrieval_keywords` / `semantic_query` — planner 키워드/의미 문장
 - `branch_queries.stable` / `branch_queries.expanded` — trace 호환용 검색 텍스트. 현재는 dense query와 동일하다.
-- `query_payload.group_count` — Qdrant grouped 결과 수
+- `query_payload.merged_chunk_count` / `main_count` / `fallback_count` — multiview 병합 및 tier 집계 수
 - `query_payload.relevance_gate_active_concepts` / `relevance_*_count` — concept coverage gate 동작
+- `strict_filter` — required concept gate 활성 여부와 `relevance_concepts_missing`으로 제외된 후보별 matched/missing concept
 - `query_payload.aggregated_candidate_count` — 연구자 집계 후 후보 수
 - `server_logs` — Trace ID + `METHOD /path` 컨텍스트의 단계별 한글 로그
 - `timers` — 구간별 실행 시간
