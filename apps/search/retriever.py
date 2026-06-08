@@ -149,6 +149,9 @@ class QdrantHybridRetriever:
         self.sparse_encoder = sparse_encoder
         self.sparse_runtime = sparse_runtime
         self.l3_cache = l3_cache
+        self._sparse_idf, self._sparse_idf_default = self._load_sparse_idf(settings)
+        self._sparse_idf_ref = max(1e-6, float(getattr(settings, "sparse_idf_ref", 3.5)))
+        self._sparse_idf_hard_floor = float(getattr(settings, "sparse_idf_hard_floor", 0.0))
 
     # ------------------------------------------------------------------ utils
     @staticmethod
@@ -196,9 +199,42 @@ class QdrantHybridRetriever:
             return None
 
     # --------------------------------------------------------- query payloads
+    @staticmethod
+    def _load_sparse_idf(settings: Settings) -> tuple[dict[int, float] | None, float]:
+        """query-side IDF 보정 사전 로드(sparse_stopwords.py --dump-idf 산출물).
+
+        미설정/미존재/파싱실패면 (None, 0.0) → IDF 보정 비활성(현행 sparse 동작 유지).
+        """
+        path = getattr(settings, "sparse_idf_path", None)
+        if not path:
+            return None, 0.0
+        try:
+            with open(path, encoding="utf-8") as fp:
+                data = json.load(fp)
+            idf = {int(k): float(v) for k, v in data["idf"].items()}
+            default = float(data.get("default_idf", 0.0))
+            logger.info("sparse IDF 보정 활성: %d tokens, default=%.3f (%s)", len(idf), default, path)
+            return idf, default
+        except Exception as exc:  # noqa: BLE001 - 보정 사전 문제로 검색이 죽으면 안 됨.
+            logger.warning("sparse IDF 로드 실패(%s): %s — IDF 보정 비활성", path, exc)
+            return None, 0.0
+
+    def _idf_factor(self, idf: float) -> float:
+        """downweight-only 계수 ∈ [0, 1]. 1.0을 넘지 않아(boost 금지) 희귀 토큰을 증폭하지 않고
+        빈출 토큰(상세/detail 등)만 누른다. idf<=hard_floor면 0(하드 마스크)."""
+        if idf <= self._sparse_idf_hard_floor:
+            return 0.0
+        return min(1.0, idf / self._sparse_idf_ref)
+
     def _build_sparse_query(self, query_text: str) -> models.Document | models.SparseVector:
         if self.sparse_encoder:
             sparse_map = self.sparse_encoder.embed(query_text)
+            if self._sparse_idf is not None:
+                # downweight-only IDF: 빈출 토큰만 누르고 희귀 토큰은 보존(증폭 금지). 점수=Σ(q×factor)×d, 재색인 불필요.
+                sparse_map = {
+                    tid: w * self._idf_factor(self._sparse_idf.get(tid, self._sparse_idf_default))
+                    for tid, w in sparse_map.items()
+                }
             return models.SparseVector(
                 indices=list(sparse_map.keys()),
                 values=list(sparse_map.values()),

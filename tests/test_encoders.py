@@ -3,6 +3,7 @@ import types
 from pathlib import Path
 
 import pytest
+import torch
 
 from apps.search.encoders import (
     LocalSentenceTransformerEncoder,
@@ -187,6 +188,52 @@ def test_splade_sparse_encoder_passes_repo_id_with_local_files_only_override(mon
         "telepix/PIXIE-Splade-v1.0",
         {"local_files_only": True},
     )
+
+
+def test_splade_sparse_encoder_prunes_to_top_k_tokens():
+    class FakeInputs(dict):
+        def __init__(self):
+            attention_mask = torch.tensor([[1, 1]])
+            super().__init__({"attention_mask": attention_mask})
+            self.attention_mask = attention_mask
+
+        def to(self, device):
+            assert device == "cpu"
+            return self
+
+    class FakeTokenizer:
+        def __call__(self, text, **kwargs):
+            assert text == "전기차 배터리"
+            assert kwargs["return_tensors"] == "pt"
+            assert kwargs["truncation"] is True
+            assert kwargs["padding"] is True
+            return FakeInputs()
+
+    class FakeModel:
+        def __call__(self, **kwargs):
+            assert "attention_mask" in kwargs
+            logits = torch.tensor(
+                [
+                    [
+                        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        [0.0, 0.1, 0.9, 0.2, 0.8, 0.7],
+                    ]
+                ]
+            )
+            return types.SimpleNamespace(logits=logits)
+
+    encoder = object.__new__(SpladeSparseEncoder)
+    encoder.model_name = "fake-splade"
+    encoder.local_files_only = False
+    encoder.top_k = 3
+    encoder._tokenizer = FakeTokenizer()
+    encoder._model = FakeModel()
+    encoder._device = "cpu"
+
+    sparse = encoder.embed("전기차 배터리")
+
+    assert list(sparse) == [2, 4, 5]
+    assert len(sparse) == 3
 
 
 def test_openai_embedding_encoder_initializes_client_in_slots(monkeypatch):

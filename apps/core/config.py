@@ -123,6 +123,14 @@ class Settings(BaseSettings):
     )
     sparse_local_files_only: bool = False
     hf_hub_offline: bool = False
+    # query-side IDF 보정(opt-in, 기본 비활성). 경로 지정 시 _build_sparse_query가 query 토큰
+    # 가중치에 downweight-only 계수를 곱해 코퍼스 편재 토큰(상세/detail 등 SPLADE 확장 artifact)을
+    # 억제한다. 계수 = 0 if idf<=hard_floor else min(1, idf/ref) — 1.0을 넘지 않아(boost 금지)
+    # 희귀 토큰은 그대로 두고 빈출 토큰만 누른다. A/B 검증 후 경로를 설정해 활성화할 것.
+    # 산출물: sparse_stopwords.py --dump-idf. 미설정/미존재/파싱실패면 무동작(현행 sparse 유지).
+    sparse_idf_path: str | None = None
+    sparse_idf_ref: float = 3.5         # 이 idf 이상이면 계수 1.0(미변경). 빈출 억제 강도 조절.
+    sparse_idf_hard_floor: float = 0.0  # idf<=이 값이면 계수 0(하드 마스크). 0=비활성(soft only).
 
     # =========================================================================
     # 6. 오케스트레이션 파라미터 (Retrieval Pipeline Limits)

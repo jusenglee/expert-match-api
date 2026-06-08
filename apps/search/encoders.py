@@ -19,6 +19,8 @@ from apps.search.text_utils import stable_unit_vector
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SPLADE_TOP_K = 64
+
 
 class DenseEncoder(Protocol):
     """텍스트 임베딩을 위한 인코더 인터페이스 정의입니다."""
@@ -50,6 +52,7 @@ class SpladeSparseEncoder:
 
     model_name: str
     local_files_only: bool = False
+    top_k: int | None = DEFAULT_SPLADE_TOP_K
     _tokenizer: Any = field(init=False, repr=False)
     _model: Any = field(init=False, repr=False)
     _device: str = field(init=False, repr=False)
@@ -100,6 +103,13 @@ class SpladeSparseEncoder:
         # 0이 아닌 가중치만 추출
         indices = torch.nonzero(sparse_vector).flatten()
         values = sparse_vector[indices]
+
+        if self.top_k is not None and self.top_k > 0 and values.numel() > self.top_k:
+            values, positions = torch.topk(values, k=self.top_k)
+            indices = indices[positions]
+            sorted_positions = torch.argsort(indices)
+            indices = indices[sorted_positions]
+            values = values[sorted_positions]
 
         return {int(idx): float(val) for idx, val in zip(indices, values)}
 
