@@ -625,6 +625,7 @@ def test_recommend_populates_match_score_and_evidence_summaries():
         "doc_type": "paper",
         "title": "Paper 1",
         "concepts": ["ai", "semiconductor"],
+        "display_only_concepts": [],
         "sources": ["dense_full", "concept:ai"],
         "score": 0.42,
     }
@@ -632,6 +633,7 @@ def test_recommend_populates_match_score_and_evidence_summaries():
         "total_profile_counts": cards[0].counts,
         "matched_evidence_count": 1,
         "shown_evidence_count": 1,
+        "profile_evidence_count": 0,
     }
 
 

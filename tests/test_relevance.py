@@ -364,3 +364,30 @@ def test_has_operation_marker_negative_for_design_project():
         _payload("M", "project", "p_c000", "지능형 반도체 설계 핵심기술 개발"), markers
     )
     assert not has_operation_marker(_payload("M", "project", "p_c001", "x"), frozenset())
+
+
+# ---------------------------------------------------------------------------
+# chunk_display_only_concepts (제목/doc_attrs엔 있으나 본문 확정엔 없는 concept)
+# ---------------------------------------------------------------------------
+def test_display_only_concept_when_term_in_title_not_body():
+    from apps.search.relevance import chunk_display_only_concepts
+
+    plan = _ai_semi_plan()
+    # 본문엔 semiconductor evidence 없음, doc_attrs 제목엔 '시스템반도체' → semiconductor=display-only
+    payload = _payload(
+        "M", "paper", "paper_1_c000", text="저전력 신호처리 회로 연구",
+        doc_attrs={"main_language_title": "시스템반도체 집적회로 설계"},
+    )
+    assert tag_chunk_concepts(payload, concept_plan=plan) == []  # 본문 확정 0
+    assert chunk_display_only_concepts(payload, plan) == ["semiconductor"]
+
+
+def test_display_only_empty_when_term_in_body():
+    from apps.search.relevance import chunk_display_only_concepts
+
+    plan = _ai_semi_plan()
+    payload = _payload(
+        "M", "paper", "paper_2_c000", text="반도체 설계 연구",
+        doc_attrs={"main_language_title": "반도체"},
+    )
+    assert chunk_display_only_concepts(payload, plan) == []  # 본문 확정 → display-only 아님

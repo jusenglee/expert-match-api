@@ -232,6 +232,36 @@ def tag_chunk_concepts(
     return [c for c in concept_plan.all_concepts if c in confirmed]
 
 
+def _doc_attrs_text(payload: ChunkPayload) -> str:
+    values: list[Any] = []
+    for value in (payload.doc_attrs or {}).values():
+        if isinstance(value, (str, int, float)):
+            values.append(value)
+        elif isinstance(value, (list, tuple, set)):
+            values.extend(value)
+    return _normalize_text(*values)
+
+
+def chunk_display_only_concepts(payload: ChunkPayload, concept_plan: ConceptPlan) -> list[str]:
+    """evidence_term이 doc_attrs(title/keywords 등)엔 있으나 확정 텍스트(chunk_text/doc_id)엔 없는 concept.
+
+    화면 제목은 doc_attrs에서 오므로 '제목엔 보이지만 확정 근거는 아닌'(거짓 confirmed 방지 설계의 부작용)
+    concept를 진단/표시용으로 분리 노출한다. 점수/확정 태깅에는 영향 없다(scoring 무변경).
+    """
+    attrs = _doc_attrs_text(payload)
+    if not attrs:
+        return []
+    body = _payload_text(payload)
+    display_only: set[str] = set()
+    for spec in concept_plan.specs:
+        evidence = spec.evidence_terms or spec.query_terms
+        in_attrs = any(_contains_term(attrs, term) for term in evidence)
+        in_body = any(_contains_term(body, term) for term in evidence)
+        if in_attrs and not in_body:
+            display_only.add(spec.id)
+    return [c for c in concept_plan.all_concepts if c in display_only]
+
+
 # ---------------------------------------------------------------------------
 # 멀티뷰 융합 점수 (raw score 합산 금지 — normalized rank score)
 # ---------------------------------------------------------------------------

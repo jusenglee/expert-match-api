@@ -201,7 +201,9 @@ async def build_app_runtime(
         ),
         filter_compiler=QdrantFilterCompiler(),
         card_builder=CandidateCardBuilder(),
-        evidence_selector=PassthroughEvidenceSelector(),
+        evidence_selector=PassthroughEvidenceSelector(
+            candidate_evidence_budget=settings.candidate_evidence_budget
+        ),
         reason_generator=reason_generator,
         feedback_store=feedback_store,
     )

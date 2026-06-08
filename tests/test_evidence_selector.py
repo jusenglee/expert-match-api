@@ -159,3 +159,46 @@ def test_trace_records_passthrough_mode_and_empty_candidates():
     assert trace["empty_candidate_ids"] == ["2"]
     counts = {c["expert_id"]: c["total"] for c in trace["candidate_evidence_counts"]}
     assert counts == {"1": 1, "2": 0}
+
+
+def _many(doc_type: str, n: int) -> list[ChunkEvidence]:
+    return [
+        _evidence(chunk_id=f"{doc_type}_{i}_c000", doc_type=doc_type, title=f"{doc_type}{i}",
+                  score=1.0 - i * 0.01)
+        for i in range(n)
+    ]
+
+
+def test_evidence_budget_caps_total_and_keeps_doc_type_diversity():
+    selector = PassthroughEvidenceSelector(candidate_evidence_budget=6)
+    card = _card("1", paper=_many("paper", 8), patent=_many("patent", 8), project=_many("project", 8))
+    bundle = selector.select(candidates=[card], plan=_plan("x"))["1"]
+    assert len(bundle.all_items()) == 6  # 24 → budget 6
+    # 라운드로빈 다양성: 세 doc_type 모두 포함
+    assert {item.type for item in bundle.all_items()} == {"paper", "patent", "project"}
+
+
+def test_evidence_budget_zero_disables_cap():
+    selector = PassthroughEvidenceSelector(candidate_evidence_budget=0)
+    card = _card("1", paper=_many("paper", 8))  # family cap(achievement=10)만 → 8 전부
+    bundle = selector.select(candidates=[card], plan=_plan("x"))["1"]
+    assert len(bundle.all_items()) == 8
+
+
+def test_evidence_budget_prioritizes_joint_and_concept_best():
+    # required=ai,semiconductor. joint chunk(둘 다)와 개념별 best가 budget 안에서 우선 선택돼야 한다.
+    selector = PassthroughEvidenceSelector(candidate_evidence_budget=3)
+    card = _card("1", paper=_many("paper", 5))
+    card.matched_concepts = ["ai", "semiconductor"]
+    card.top_chunks = [
+        {"chunk_id": "paper_0_c000", "concepts": ["ai"]},          # ai best(최고점)
+        {"chunk_id": "paper_1_c000", "concepts": ["semiconductor"]},
+        {"chunk_id": "paper_2_c000", "concepts": ["ai", "semiconductor"]},  # joint
+        {"chunk_id": "paper_3_c000", "concepts": []},
+        {"chunk_id": "paper_4_c000", "concepts": []},
+    ]
+    bundle = selector.select(candidates=[card], plan=_plan("x"))["1"]
+    kept = {item.item_id for item in bundle.all_items()}
+    assert len(kept) == 3
+    assert "paper_2_c000" in kept  # joint 우선
+    assert "paper_0_c000" in kept and "paper_1_c000" in kept  # 개념별 best

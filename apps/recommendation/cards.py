@@ -12,6 +12,7 @@ from apps.domain.chunk_view import derive_date, derive_title, parse_year, snippe
 from apps.domain.models import (
     CandidateCard,
     ChunkEvidence,
+    ChunkPayload,
     PlannerOutput,
     ResearcherCandidate,
 )
@@ -59,26 +60,61 @@ class CandidateCardBuilder:
     def shortlist(self, cards: list[CandidateCard], limit: int) -> list[CandidateCard]:
         return cards[:limit]
 
+    @staticmethod
+    def _payload_to_evidence(
+        payload: ChunkPayload, *, score: float, evidence_kind: str
+    ) -> ChunkEvidence:
+        return ChunkEvidence(
+            chunk_id=payload.chunk_id,
+            doc_type=payload.doc_type,
+            title=derive_title(payload.doc_type, payload.doc_attrs, fallback=payload.chunk_text),
+            date=derive_date(payload.doc_type, payload.doc_date, payload.doc_attrs),
+            snippet=snippet(payload.chunk_text),
+            doc_attrs=payload.doc_attrs,
+            score=score,
+            evidence_kind=evidence_kind,
+        )
+
     def _build_evidence_by_type(
         self, candidate: ResearcherCandidate
     ) -> dict[str, list[ChunkEvidence]]:
         buckets: dict[str, list[ChunkEvidence]] = {}
         for hit in candidate.chunks:
-            payload = hit.payload
-            doc_type = payload.doc_type
-            evidence = ChunkEvidence(
-                chunk_id=payload.chunk_id,
-                doc_type=doc_type,
-                title=derive_title(doc_type, payload.doc_attrs, fallback=payload.chunk_text),
-                date=derive_date(doc_type, payload.doc_date, payload.doc_attrs),
-                snippet=snippet(payload.chunk_text),
-                doc_attrs=payload.doc_attrs,
-                score=hit.score,
-            )
-            buckets.setdefault(doc_type, []).append(evidence)
+            evidence = self._payload_to_evidence(hit.payload, score=hit.score, evidence_kind="matched")
+            buckets.setdefault(evidence.doc_type, []).append(evidence)
         for items in buckets.values():
             items.sort(key=_evidence_sort_key, reverse=True)
         return buckets
+
+    def attach_profile_evidence(
+        self,
+        cards: list[CandidateCard],
+        profile_by_researcher: dict[str, list[ChunkPayload]],
+    ) -> None:
+        """hydration된 대표 실적을 card.profile_evidence로 붙인다(질의 매칭 chunk_id는 제외, 중복 제거).
+
+        점수/랭킹에는 영향 없다 — 표시/맥락용 '참고 프로필'. in-place로 card를 갱신한다.
+        """
+        if not profile_by_researcher:
+            return
+        for card in cards:
+            payloads = profile_by_researcher.get(card.expert_id)
+            if not payloads:
+                continue
+            matched_ids = {
+                ev.chunk_id for items in card.evidence_by_type.values() for ev in items
+            }
+            profile: list[ChunkEvidence] = []
+            seen: set[str] = set()
+            for payload in payloads:
+                if payload.chunk_id in matched_ids or payload.chunk_id in seen:
+                    continue
+                seen.add(payload.chunk_id)
+                profile.append(
+                    self._payload_to_evidence(payload, score=0.0, evidence_kind="profile")
+                )
+            profile.sort(key=_evidence_sort_key, reverse=True)
+            card.profile_evidence = profile
 
     def _build_top_chunks(self, candidate: ResearcherCandidate) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
@@ -94,6 +130,7 @@ class CandidateCardBuilder:
                         fallback=payload.chunk_text,
                     ),
                     "concepts": list(hit.concepts),
+                    "display_only_concepts": list(hit.display_only_concepts),
                     "sources": list(hit.sources),
                     "score": round(float(hit.score), 6),
                 }

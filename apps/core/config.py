@@ -263,6 +263,16 @@ class Settings(BaseSettings):
     )
     operation_evidence_factor: float = 0.5
 
+    # shortlist 확정 후 researcher_id로 대표 실적을 추가 조회해 '참고 프로필'로 보강(질의 매칭 evidence와 별도).
+    # 점수/랭킹에는 영향 없고 표시/맥락용. researcher×doc_type당 cap개, 단일 scroll로 fetch_limit까지.
+    profile_hydration_enabled: bool = True
+    profile_evidence_per_doc_type_cap: int = 3
+    profile_hydration_fetch_limit: int = 4000
+
+    # 후보 1명당 LLM/표시에 들어가는 질의-매칭 evidence 총량 상한(doc_type별 family cap 이후 전역 적용).
+    # joint→required 개념별 best→doc_type 다양성 우선으로 선택. 0=무제한(기존 family cap만).
+    candidate_evidence_budget: int = 12
+
     # required concept gate: main top-K는 required_concepts 전부 충족. 부분 충족은 fallback tier로 분리.
     relevance_gate_enabled: bool = True
     relevance_fallback_tier: bool = True

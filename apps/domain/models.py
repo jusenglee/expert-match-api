@@ -116,6 +116,8 @@ class ChunkHit(BaseModel):
     # v2.1 관련도 검색: 이 chunk가 충족하는 concept id 목록 + 어느 검색 view에서 잡혔나.
     concepts: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
+    # doc_attrs(제목/키워드)엔 있으나 본문 확정엔 없는 concept(표시 전용 — 점수/확정 무관, 진단용).
+    display_only_concepts: list[str] = Field(default_factory=list)
 
     @property
     def chunk_id(self) -> str:
@@ -173,6 +175,7 @@ class ChunkEvidence(BaseModel):
     snippet: str = ""
     doc_attrs: dict[str, Any] = Field(default_factory=dict)
     score: float = 0.0
+    evidence_kind: str = "matched"  # "matched"=질의 매칭 / "profile"=researcher hydration(참고 실적)
 
 
 class ConceptSpec(BaseModel):
@@ -254,6 +257,7 @@ class EvidenceItem(BaseModel):
     detail: str | None = None
     snippet: str | None = None
     chunk_id: str | None = None
+    evidence_kind: str = "matched"  # "matched"=질의 매칭 / "profile"=researcher hydration(참고 실적)
 
 
 class CandidateCard(BaseModel):
@@ -276,6 +280,8 @@ class CandidateCard(BaseModel):
     coverage_type: str = ""
     score_breakdown: dict[str, Any] = Field(default_factory=dict)
     top_chunks: list[dict[str, Any]] = Field(default_factory=list)
+    # researcher_id hydration으로 보강한 '참고 실적'(질의 매칭 아님 — 표시/맥락용, 점수/랭킹 무영향).
+    profile_evidence: list[ChunkEvidence] = Field(default_factory=list)
 
     @property
     def doc_types_present(self) -> list[str]:
@@ -304,6 +310,7 @@ class RecommendationDecision(BaseModel):
     score_explanation: dict[str, Any] = Field(default_factory=dict)
     evidence_summary: dict[str, Any] = Field(default_factory=dict)
     evidence: list[EvidenceItem] = Field(default_factory=list)
+    profile_evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0
 

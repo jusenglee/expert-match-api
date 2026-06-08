@@ -38,6 +38,7 @@ from qdrant_client import QdrantClient, models
 from apps.core.cache import RetrievalResultCache
 from apps.core.config import Settings
 from apps.core.timer import Timer
+from apps.domain.chunk_view import parse_year
 from apps.domain.models import ChunkHit, ChunkPayload, PlannerOutput, ResearcherCandidate
 from apps.search.doc_types import DOC_TYPE_TO_FAMILY
 from apps.search.encoders import DenseEncoder, SparseEncoder
@@ -45,6 +46,7 @@ from apps.search.query_builder import CompiledQueries, QueryTextBuilder, SearchQ
 from apps.search.relevance import (
     CONCEPT_VIEW_PREFIX,
     ConceptPlan,
+    chunk_display_only_concepts,
     fuse_chunk_score,
     has_operation_marker,
     resolve_concept_plan,
@@ -601,6 +603,7 @@ class QdrantHybridRetriever:
                         "rank": hit.rank,
                         "fused_score": round(hit.score, 6),
                         "concepts": hit.concepts,
+                        "display_only_concepts": hit.display_only_concepts,
                         "sources": hit.sources,
                     }
                 )
@@ -720,6 +723,7 @@ class QdrantHybridRetriever:
                 payload=entry.payload,
                 concepts=concepts,
                 sources=sorted(entry.view_best_rank0),
+                display_only_concepts=chunk_display_only_concepts(entry.payload, concept_plan),
             )
             by_researcher.setdefault(entry.payload.researcher_id, []).append(hit)
 
@@ -846,6 +850,55 @@ class QdrantHybridRetriever:
     ) -> RetrievalResult:
         """[/search/candidates 전용] 멀티뷰 flat 경로로 통일(커스텀 가중 fan-out 폐기)."""
         return await self.search(query=query, plan=plan, query_filter=query_filter)
+
+    async def hydrate_profile_evidence(
+        self,
+        researcher_ids: list[str],
+        *,
+        per_doc_type_cap: int = 3,
+        fetch_limit: int = 4000,
+    ) -> dict[str, list[ChunkPayload]]:
+        """shortlist 후보의 researcher_id로 대표 실적 chunk를 보강 조회한다(질의 매칭 아님, 표시/맥락용).
+
+        단일 scroll(filter=researcher_id IN[...])로 가져와 researcher×doc_type당 최근순 cap개로 제한한다.
+        점수/랭킹에는 쓰지 않는다(검색 결과 evidence와 분리). 실패/빈 입력이면 {} 반환.
+        """
+        ids = [rid for rid in dict.fromkeys(researcher_ids) if rid]
+        if not ids:
+            return {}
+        scroll_filter = self._merge_filters(
+            models.Filter(
+                must=[models.FieldCondition(key="researcher_id", match=models.MatchAny(any=ids))]
+            ),
+            self._retrieval_doc_type_filter(),
+        )
+        try:
+            response = await asyncio.to_thread(
+                self.client.scroll,
+                collection_name=self.settings.qdrant_collection_name,
+                scroll_filter=scroll_filter,
+                limit=max(1, fetch_limit),
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — 보강 실패는 격리(주 추천 흐름은 계속).
+            logger.error("hydrate_profile_evidence scroll failed: %s", exc, exc_info=exc)
+            return {}
+        points = response[0] if isinstance(response, tuple) else getattr(response, "points", response)
+        grouped: dict[str, dict[str, list[ChunkPayload]]] = {}
+        for point in points or []:
+            payload = self._validate_chunk(self._point_payload_data(point))
+            if payload is None:
+                continue
+            grouped.setdefault(payload.researcher_id, {}).setdefault(payload.doc_type, []).append(payload)
+        out: dict[str, list[ChunkPayload]] = {}
+        for researcher_id, by_doc in grouped.items():
+            chunks: list[ChunkPayload] = []
+            for items in by_doc.values():
+                items.sort(key=lambda p: (parse_year(p.doc_date) or 0), reverse=True)
+                chunks.extend(items[: max(0, per_doc_type_cap)])
+            out[researcher_id] = chunks
+        return out
 
     async def search_grouped_diagnostic(
         self,

@@ -403,6 +403,32 @@ class RecommendationService:
                 retrieval_cache_hit=search_result.get("cache_hit", False),
             )
 
+        # researcher_id hydration: '참고 프로필' 보강(질의 매칭 evidence와 분리, 점수/랭킹 무영향).
+        # retriever/card_builder가 보강 인터페이스를 갖춘 경우에만(테스트 더블은 skip).
+        hydration_settings = getattr(self.retriever, "settings", None)
+        hydrate = getattr(self.retriever, "hydrate_profile_evidence", None)
+        attach_profiles = getattr(self.card_builder, "attach_profile_evidence", None)
+        if (
+            hydration_settings is not None
+            and getattr(hydration_settings, "profile_hydration_enabled", False)
+            and callable(hydrate)
+            and callable(attach_profiles)
+        ):
+            try:
+                profile_by_researcher = await hydrate(
+                    [card.expert_id for card in shortlist],
+                    per_doc_type_cap=getattr(hydration_settings, "profile_evidence_per_doc_type_cap", 3),
+                    fetch_limit=getattr(hydration_settings, "profile_hydration_fetch_limit", 4000),
+                )
+                attach_profiles(shortlist, profile_by_researcher)
+                logger.info(
+                    "프로필 보강 완료: candidates=%d hydrated=%d",
+                    len(shortlist),
+                    sum(1 for card in shortlist if card.profile_evidence),
+                )
+            except Exception as exc:  # noqa: BLE001 — 보강 실패는 격리(추천 흐름 계속).
+                logger.warning("프로필 보강 실패(무시): %s", exc)
+
         logger.info(
             "증거 선별 시작: candidates=%d candidate_ids=%s",
             len(shortlist),
@@ -837,6 +863,7 @@ class RecommendationService:
                     "doc_type": item.get("doc_type", ""),
                     "title": item.get("title") or title_by_chunk_id.get(chunk_id),
                     "concepts": list(item.get("concepts") or []),
+                    "display_only_concepts": list(item.get("display_only_concepts") or []),
                     "sources": list(item.get("sources") or []),
                     "score": round(cls._safe_float(score), 6),
                 }
@@ -847,6 +874,7 @@ class RecommendationService:
                     "doc_type": item.get("doc_type", ""),
                     "title": item.get("title"),
                     "concepts": list(item.get("concepts") or []),
+                    "display_only_concepts": list(item.get("display_only_concepts") or []),
                     "sources": list(item.get("sources") or []),
                     "score": round(cls._safe_float(item.get("score")), 6),
                 }
@@ -875,7 +903,39 @@ class RecommendationService:
             "total_profile_counts": dict(card.counts),
             "matched_evidence_count": len(relevant_bundle.all_items()),
             "shown_evidence_count": len(evidence),
+            "profile_evidence_count": len(card.profile_evidence),
         }
+
+    @staticmethod
+    def _build_profile_evidence_items(
+        *, card: CandidateCard, exclude_chunk_ids: set[str]
+    ) -> list[EvidenceItem]:
+        """card.profile_evidence(researcher hydration)를 응답 EvidenceItem(kind=profile)으로 변환.
+
+        이미 표시되는 질의-매칭 evidence(chunk_id)는 제외해 중복을 막는다. 점수/랭킹 무관.
+        """
+        valid_types = {"paper", "patent", "project", "assessor_activity", "specialty"}
+        items: list[EvidenceItem] = []
+        seen: set[str] = set()
+        for ev in card.profile_evidence:
+            if ev.chunk_id in exclude_chunk_ids or ev.chunk_id in seen:
+                continue
+            title = " ".join((ev.title or "").split())
+            if not title:
+                continue
+            seen.add(ev.chunk_id)
+            items.append(
+                EvidenceItem(
+                    type=ev.doc_type if ev.doc_type in valid_types else "profile",
+                    title=title,
+                    date=ev.date,
+                    detail=None,
+                    snippet=(" ".join((ev.snippet or "").split()) or None),
+                    chunk_id=ev.chunk_id,
+                    evidence_kind="profile",
+                )
+            )
+        return items
 
     @staticmethod
     def _build_strict_filter_trace(
@@ -1071,6 +1131,10 @@ class RecommendationService:
                 evidence=evidence,
                 relevant_bundle=relevant_bundle,
             )
+            profile_evidence = self._build_profile_evidence_items(
+                card=card,
+                exclude_chunk_ids={item.chunk_id for item in evidence if item.chunk_id},
+            )
             selected_evidence_trace.append(evidence_trace)
             if not recommendation_reason:
                 logger.warning(
@@ -1120,6 +1184,7 @@ class RecommendationService:
                     score_explanation=score_explanation,
                     evidence_summary=evidence_summary,
                     evidence=evidence,
+                    profile_evidence=profile_evidence,
                     risks=risks,
                     rank_score=card.rank_score,
                 )

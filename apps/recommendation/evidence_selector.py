@@ -19,6 +19,7 @@ from apps.domain.models import CandidateCard, ChunkEvidence, PlannerOutput
 from apps.search.doc_types import DOC_TYPE_TO_FAMILY, FAMILY_EVIDENCE_CAP
 
 DEFAULT_TYPE_CAP = 10
+DEFAULT_EVIDENCE_BUDGET = 12
 
 
 class RelevantEvidenceItem(BaseModel):
@@ -119,14 +120,84 @@ def _evidence_item(ev: ChunkEvidence, *, source: str) -> RelevantEvidenceItem:
     )
 
 
+def _select_within_budget(
+    by_doc_type: dict[str, list[RelevantEvidenceItem]],
+    *,
+    chunk_concepts: dict[str, list[str]],
+    required_concepts: set[str],
+    budget: int,
+) -> dict[str, list[RelevantEvidenceItem]]:
+    """후보당 evidence 총량을 budget으로 제한(doc_type별 family cap '이후' 전역 적용).
+
+    우선순위: joint(모든 required 동시충족) → required 개념별 best → doc_type 다양성 라운드로빈(점수순).
+    by_doc_type 구조(타입별 점수순)는 보존하고 선택된 item만 남긴다. 합계가 budget 이하면 그대로 반환.
+    """
+    total = sum(len(items) for items in by_doc_type.values())
+    if budget <= 0 or total <= budget:
+        return by_doc_type
+
+    def covered(item: RelevantEvidenceItem) -> set[str]:
+        return set(chunk_concepts.get(item.item_id, [])) & required_concepts
+
+    flat = [item for items in by_doc_type.values() for item in items]
+    selected_ids: set[str] = set()
+
+    # 1) joint: required 전부 동시충족 — 점수 desc
+    if len(required_concepts) >= 2:
+        for item in sorted(
+            (it for it in flat if len(covered(it)) >= len(required_concepts)),
+            key=lambda it: -it.match_score,
+        ):
+            if len(selected_ids) >= budget:
+                break
+            selected_ids.add(item.item_id)
+
+    # 2) required 개념별 best 1개(미선택 중 최고점)
+    for concept in sorted(required_concepts):
+        if len(selected_ids) >= budget:
+            break
+        for item in sorted(flat, key=lambda it: -it.match_score):
+            if item.item_id in selected_ids:
+                continue
+            if concept in covered(item):
+                selected_ids.add(item.item_id)
+                break
+
+    # 3) doc_type 다양성 라운드로빈(점수순)으로 남은 예산 채움
+    queues: dict[str, list[RelevantEvidenceItem]] = {}
+    for doc_type, items in by_doc_type.items():
+        remaining = [it for it in items if it.item_id not in selected_ids]
+        if remaining:
+            queues[doc_type] = remaining
+    doc_cycle = list(queues.keys())
+    cursor = 0
+    while len(selected_ids) < budget and any(queues.values()):
+        queue = queues.get(doc_cycle[cursor % len(doc_cycle)])
+        cursor += 1
+        if queue:
+            selected_ids.add(queue.pop(0).item_id)
+
+    return {
+        doc_type: kept
+        for doc_type, items in by_doc_type.items()
+        if (kept := [item for item in items if item.item_id in selected_ids])
+    }
+
+
 class PassthroughEvidenceSelector:
     """그룹 chunk(하이브리드 RRF 관련도순)를 doc_type별 묶음 + family cap만 적용해 그대로 노출.
 
     lexical 재랭크 없음. 각 doc_type 내부는 검색 관련도 점수(match_score=chunk score) 내림차순.
     """
 
-    def __init__(self, *, family_cap: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        family_cap: dict[str, int] | None = None,
+        candidate_evidence_budget: int = DEFAULT_EVIDENCE_BUDGET,
+    ) -> None:
         self.family_cap = family_cap or dict(FAMILY_EVIDENCE_CAP)
+        self.candidate_evidence_budget = candidate_evidence_budget
         self.last_trace: dict[str, object] = {}
 
     def select(
@@ -147,6 +218,19 @@ class PassthroughEvidenceSelector:
                 ]
                 if items:
                     by_doc_type[doc_type] = items
+            # 후보당 evidence 총량 budget: joint→개념별 best→doc_type 다양성 우선으로 제한.
+            if self.candidate_evidence_budget > 0:
+                chunk_concepts = {
+                    str(chunk.get("chunk_id")): list(chunk.get("concepts", []))
+                    for chunk in candidate.top_chunks
+                    if chunk.get("chunk_id")
+                }
+                by_doc_type = _select_within_budget(
+                    by_doc_type,
+                    chunk_concepts=chunk_concepts,
+                    required_concepts=set(candidate.matched_concepts),
+                    budget=self.candidate_evidence_budget,
+                )
             bundle = RelevantEvidenceBundle(expert_id=candidate.expert_id, by_doc_type=by_doc_type)
             bundles[candidate.expert_id] = bundle
             total = len(bundle.all_items())
