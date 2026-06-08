@@ -1,12 +1,11 @@
 """flat 계약(v2.1) QdrantFilterCompiler 검증.
 
 원본 test_filter_script.py는 라이브 Qdrant에 붙어 org 배제를 수동 확인하던 스크립트였다
-(SearchSchemaRegistry / payload.basic_info 등 폐기 API 사용). 의도(=org include/exclude
-필터가 root affiliated_organization으로 컴파일되는지)를 보존하되, 네트워크 없이 flat
-QdrantFilterCompiler.compile 출력 구조를 단언하는 pytest로 재작성한다.
+(SearchSchemaRegistry / payload.basic_info 등 폐기 API 사용). 현재 계약에서는 org include/exclude가
+정규화된 root 필드 부재로 Qdrant exact pre-filter가 아니라 retriever 앱단 post-filter 소관이다.
 
-test_filter_compiler.py와 중복을 피하기 위해 여기서는 org include/exclude 정규화,
-*_count_min 하위호환 별칭, journal_class→doc_attrs.indexing_database, doc_date(datetime)
+test_filter_compiler.py와 중복을 피하기 위해 여기서는 org include/exclude Qdrant 필터 제외,
+*_count_min 하위호환 별칭, doc_attrs 필터 무시, doc_date(datetime)
 recency 컷오프 값 등 보완 커버리지에 집중한다.
 """
 from __future__ import annotations
@@ -17,7 +16,6 @@ from qdrant_client import models
 
 from apps.search.doc_types import DOC_TYPE_TO_FAMILY, DOC_TYPES, Family
 from apps.search.filters import QdrantFilterCompiler
-from apps.search.text_utils import normalize_org_name
 
 
 def _field_conditions(conditions):
@@ -36,57 +34,39 @@ def _condition_for(conditions, key):
 
 
 # ---------------------------------------------------------------------------
-# org include / exclude — 원본 스크립트가 검증하던 핵심 동작(루트 affiliated_organization)
+# org include / exclude - retriever 앱단 post-filter 소관
 # ---------------------------------------------------------------------------
 
 
-def test_exclude_org_compiles_to_must_not_root_affiliation():
-    exclude = "주식회사 미소테크"
+def test_exclude_org_is_not_compiled_to_qdrant_filter():
     compiled = QdrantFilterCompiler().compile(
-        hard_filters={}, exclude_orgs=[exclude], include_orgs=[]
+        hard_filters={}, exclude_orgs=["주식회사 미소테크"], include_orgs=[]
     )
 
-    assert compiled is not None
-    assert compiled.must is None  # 배제만 있으면 must 없음
-    assert compiled.must_not is not None
-    cond = _condition_for(compiled.must_not, "affiliated_organization")
-    assert cond is not None, "배제 기관은 root affiliated_organization must_not에 들어가야 한다"
-    # 정규화(법인격/공백 제거 후 대문자)된 값으로 매칭
-    assert cond.match.value == normalize_org_name(exclude)
-    # v1.x 잔재(중첩/researcher_meta) 경로 없음
-    assert "researcher_meta.affiliated_organization" not in _field_keys(compiled.must_not)
-    assert not any(isinstance(c, models.NestedCondition) for c in compiled.must_not)
+    assert compiled is None
 
 
-def test_include_org_compiles_to_must_root_affiliation():
-    include = "한국전자통신연구원"
+def test_include_org_is_not_compiled_to_qdrant_filter():
     compiled = QdrantFilterCompiler().compile(
-        hard_filters={}, exclude_orgs=[], include_orgs=[include]
+        hard_filters={}, exclude_orgs=[], include_orgs=["한국전자통신연구원"]
     )
 
-    assert compiled is not None
-    cond = _condition_for(compiled.must, "affiliated_organization")
-    assert cond is not None
-    assert cond.match.value == normalize_org_name(include)
-    assert compiled.must_not is None
+    assert compiled is None
 
 
-def test_include_and_exclude_same_field_split_across_must_and_must_not():
+def test_include_and_exclude_with_root_filter_keeps_orgs_out_of_qdrant_filter():
     compiled = QdrantFilterCompiler().compile(
-        hard_filters={},
+        hard_filters={"highest_degree": "박사"},
         exclude_orgs=["배제기관"],
         include_orgs=["포함기관"],
     )
     assert compiled is not None
-    must_cond = _condition_for(compiled.must, "affiliated_organization")
-    not_cond = _condition_for(compiled.must_not, "affiliated_organization")
-    assert must_cond is not None and not_cond is not None
-    assert must_cond.match.value == normalize_org_name("포함기관")
-    assert not_cond.match.value == normalize_org_name("배제기관")
+    assert _condition_for(compiled.must, "highest_degree") is not None
+    assert _condition_for(compiled.must, "affiliated_organization") is None
+    assert compiled.must_not is None
 
 
 def test_blank_or_unnormalizable_org_is_dropped():
-    # 괄호/법인격만 있는 값은 normalize_org_name이 None → 조건 생성 안 됨
     compiled = QdrantFilterCompiler().compile(
         hard_filters={}, exclude_orgs=["주식회사", "()"], include_orgs=["   "]
     )
@@ -155,27 +135,22 @@ def test_count_min_zero_is_emitted_but_none_is_dropped():
 
 
 # ---------------------------------------------------------------------------
-# journal_class → doc_attrs.indexing_database (paper 등재구분)
+# journal_class/doc_attrs - 유동 필드이므로 hard filter에서 무시
 # ---------------------------------------------------------------------------
 
 
-def test_journal_class_maps_to_doc_attrs_indexing_database():
+def test_journal_class_is_ignored_because_doc_attrs_are_dynamic():
     compiled = QdrantFilterCompiler().compile(
         hard_filters={"journal_class": "SCIE"}, exclude_orgs=[]
     )
-    assert compiled is not None
-    cond = _condition_for(compiled.must, "doc_attrs.indexing_database")
-    assert cond is not None
-    assert isinstance(cond.match, models.MatchAny)
-    assert cond.match.any == ["SCIE"]
+    assert compiled is None
 
 
-def test_journal_class_list_uses_match_any():
+def test_journal_class_list_is_ignored_because_doc_attrs_are_dynamic():
     compiled = QdrantFilterCompiler().compile(
         hard_filters={"journal_class": ["SCIE", "SCOPUS"]}, exclude_orgs=[]
     )
-    cond = _condition_for(compiled.must, "doc_attrs.indexing_database")
-    assert cond.match.any == ["SCIE", "SCOPUS"]
+    assert compiled is None
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +303,10 @@ def test_combined_filters_all_use_flat_keys_no_nested_residue():
         "highest_degree",
         "scie_publication_count",
         "research_project_count",
-        "doc_attrs.indexing_database",
-        "affiliated_organization",
     } <= must_keys
-    assert "affiliated_organization" in _field_keys(compiled.must_not)
+    assert "doc_attrs.indexing_database" not in must_keys
+    assert "affiliated_organization" not in must_keys
+    assert compiled.must_not is None
     # 어떤 must/must_not 조건도 v1.x 중첩 경로를 쓰지 않는다
     all_field_keys = _field_keys(compiled.must) | _field_keys(compiled.must_not)
     assert all(not k.startswith("researcher_meta.") for k in all_field_keys)

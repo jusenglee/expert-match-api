@@ -46,7 +46,7 @@
 
 ### 1.1 `hard_filters` 허용 키 (flat chunk 모델)
 
-모든 백엔드 필드는 **flat root** 또는 `doc_attrs.*`(실제 payload 키)를 가리킨다. `researcher_meta.*` 같은 중첩 경로는 더 이상 존재하지 않는다.
+모든 백엔드 필드는 **flat root**만 가리킨다. `researcher_meta.*` 같은 중첩 경로는 더 이상 존재하지 않으며, `doc_attrs.*`는 doc_type별 유동 필드이므로 hard filter 대상으로 쓰지 않는다.
 
 | 키 | 의미 | flat 백엔드 경로 |
 |---|---|---|
@@ -58,12 +58,13 @@
 | `intellectual_property_count_min` | 최소 지식재산 수 | root `intellectual_property_count` (Range gte) |
 | `research_project_count_min` | 최소 연구과제 수 | root `research_project_count` (Range gte) |
 | `researcher_assessor_activity_count_min` | 최소 평가위원 활동 수 | root `researcher_assessor_activity_count` (Range gte) |
-| `journal_class` | 등재구분 | `doc_attrs.indexing_database` (paper 등재구분, MatchAny) |
 
 > **단일 assessor count.** 실데이터는 평가위원 활동을 단일 `researcher_assessor_activity_count`로 보유한다.
 > 구 분리 키 `researcher_assessor_count_min`/`expert_assessor_count_min`과 `assessor_activity_count_min`은 모두 이 단일 필드로 흡수된다(하위호환 별칭).
 >
 > **flat 정합(v2.1).** v1.x의 `art_recent_years`/`pat_recent_years`/`pjt_recent_years`(doc_type별 분리·`event_year` 기준)는 통합 `recent_years` + `recent_doc_types`로 대체되며, recency 기준은 **단일 `doc_date`(datetime)** 다(`event_date`/`event_year` 폐기). `*_cnt_min` → `*_count_min`으로 명칭 통일.
+
+> **doc_attrs hard filter 금지.** `journal_class`처럼 `doc_attrs.*`에 의존하던 키는 더 이상 Qdrant hard filter로 컴파일하지 않는다. "SCIE 논문 보유" 조건은 root 누적값인 `scie_publication_count_min`으로 표현한다.
 
 > **HARD 제약 — 다중 doc_type recency는 OR.** `recent_doc_types`가 2개 이상이면 `(doc_type=X AND doc_date>=cutoff)` 조건들을 `min_should(min_count=1)`로 묶는다. AND로 묶으면 0건 회귀가 난다(DATA_MODEL §3.2 교훈). `recent_doc_types`에 family명(`achievement`/`assessment`/`expertise`)을 주면 그 family의 doc_type 전체로 확장된다. doc_type 미지정이면 "어떤 chunk든 최근 `doc_date`면 통과".
 
@@ -95,6 +96,7 @@
 - **집계:** 남은 chunk hit을 `researcher_id`로 묶어 RRF 누적(연구자 점수). 한 연구자의 동일 doc_type은 상위 N chunk(`doc_type_chunk_cap`, 기본 3)만 점수에 기여하고, 추가 chunk는 harmonic decay로 체감 반영한다. doc_type prior는 기본 equal이며 앱단 랭크 가중일 뿐 Qdrant score 가중합이 아니다.
 - `trace.query_payload`는 `search_query_plan`, `group_count`, `aggregated_candidate_count`, `relevance_gate_active_concepts`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`를 포함한다.
 - `trace.query_payload`는 검색 키워드/텍스트만 노출하며 dense/sparse 벡터 값과 전체 payload는 노출하지 않는다.
+- 기관 include/exclude는 정규화된 root 필드가 없으므로 Qdrant exact pre-filter가 아니라 앱단 post-filter에서 root `affiliated_organization`만 기준으로 처리한다. `doc_attrs.performing_organization`/`managing_agency`는 과제 속성이며 소속 필터에 쓰지 않는다.
 
 ---
 

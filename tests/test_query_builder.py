@@ -1,6 +1,6 @@
 import pytest
 
-from apps.domain.models import PlannerOutput
+from apps.domain.models import ConceptSpec, PlannerOutput
 from apps.search.query_builder import QueryTextBuilder
 
 # WO-0: 514403e "검색 로직 변경 - 설계 변경"으로 superseded된 구설계(branch query) 검증 stale 테스트.
@@ -84,8 +84,16 @@ def test_query_builder_derives_concept_fields_from_concept_plan():
         retrieval_core=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
         core_keywords=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
         semantic_query="인공지능과 반도체 경험을 함께 보유한 연구자",
+        concept_specs=[
+            ConceptSpec(id="ai", label="인공지능", role="required",
+                        query_terms=["인공지능", "AI", "머신러닝"], evidence_terms=["인공지능", "AI"],
+                        weak_terms=["지능형"]),
+            ConceptSpec(id="semiconductor", label="반도체", role="required",
+                        query_terms=["반도체", "시스템반도체"], evidence_terms=["반도체"],
+                        weak_terms=["시스템"]),
+        ],
     )
-    concept_plan = resolve_concept_plan(plan, raw_query)  # registry 감지 → ai, semiconductor
+    concept_plan = resolve_concept_plan(plan, raw_query)  # planner concept_specs → ai, semiconductor
 
     query_plan = builder.build_search_query_plan(raw_query, plan, concept_plan)
 

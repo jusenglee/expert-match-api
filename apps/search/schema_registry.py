@@ -28,8 +28,8 @@ FAMILIES: tuple[str, ...] = tuple(f.value for f in Family)
 # =========================================================================
 # flat payload 필터/인덱스 (DATA_MODEL §5)
 # =========================================================================
-# 필터(FieldCondition) 가능한 키. 모두 flat root 또는 doc_attrs.* (실제 키).
-# assessor_activity/specialty doc_attrs 키는 미상이므로 인덱스 대상에서 제외(passthrough).
+# 필터(FieldCondition) 가능한 키. 실데이터 계약상 안정적인 flat root 필드만 포함한다.
+# doc_attrs.*는 doc_type별 유동 필드이므로 필터/인덱스 대상으로 삼지 않는다.
 FILTERABLE_FIELDS: frozenset[str] = frozenset(
     {
         # 공통 식별/메타 (flat root)
@@ -43,14 +43,6 @@ FILTERABLE_FIELDS: frozenset[str] = frozenset(
         "intellectual_property_count",
         "research_project_count",
         "researcher_assessor_activity_count",
-        # doc_attrs (known doc_types)
-        "doc_attrs.is_scie",
-        "doc_attrs.indexing_database",
-        "doc_attrs.intellectual_property_type",
-        "doc_attrs.application_registration_type",
-        "doc_attrs.application_country",
-        "doc_attrs.performing_organization",
-        "doc_attrs.managing_agency",
     }
 )
 
@@ -61,13 +53,6 @@ PAYLOAD_INDEX_FIELDS: tuple[tuple[str, str], ...] = (
     ("doc_type", "keyword"),
     ("affiliated_organization", "keyword"),
     ("highest_degree", "keyword"),
-    ("doc_attrs.is_scie", "keyword"),
-    ("doc_attrs.indexing_database", "keyword"),
-    ("doc_attrs.intellectual_property_type", "keyword"),
-    ("doc_attrs.application_registration_type", "keyword"),
-    ("doc_attrs.application_country", "keyword"),
-    ("doc_attrs.performing_organization", "keyword"),
-    ("doc_attrs.managing_agency", "keyword"),
     # integer (연구자 공통 count — 모든 chunk에 비정규화)
     ("publication_count", "integer"),
     ("scie_publication_count", "integer"),

@@ -4,8 +4,8 @@
 - 질의를 정규식으로 깎지 않는다. concept 검증은 검색 후 deterministic multi-signal로 한다.
 - 멀티뷰 융합은 raw score 합산 금지 — source별 normalized rank score × view_weight.
 - researcher 점수 = 단순 합산 ✗, required-concept best + balance + joint + capped support + 품질/감점.
-- concept는 planner(LLM) concept_specs > concept_registry 보강/감지 > 없음 순으로 동적 확정한다
-  (resolve_concept_plan). registry는 정답 사전이 아니라 planner 미산출 시 안전망/보강 전용이다.
+- concept는 planner(LLM) concept_specs > query_exact 합성(retrieval_core) > 없음 순으로 동적 확정한다
+  (resolve_concept_plan). 하드코딩 도메인 사전(registry)은 제거됨 — planner 산출이 단일 출처.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from apps.domain.models import ChunkHit, ChunkPayload, ConceptSpec
-from apps.search import concept_registry as registry
 from apps.search.doc_types import DOC_TYPE_TO_FAMILY
 from apps.search.query_builder import GENERIC_SEARCH_TERMS
 
@@ -106,54 +105,6 @@ def _contains_term(text: str, term: str) -> bool:
     return normalized in text
 
 
-def _merge_terms(primary: list[str], extra: list[str], cap: int) -> list[str]:
-    """primary 우선, extra로 누락 보강. 중복 제거(대소문자 무시) + cap."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for term in [*primary, *extra]:
-        key = term.casefold().strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(term)
-        if len(out) >= cap:
-            break
-    return out
-
-
-def _enrich_with_registry(specs: list[ConceptSpec]) -> list[ConceptSpec]:
-    """planner concept_specs를 같은 id의 registry term으로 보강(planner 우선)."""
-    enriched: list[ConceptSpec] = []
-    for spec in specs:
-        reg = registry.registry_spec(spec.id)
-        if reg is None:
-            enriched.append(spec)
-            continue
-        enriched.append(
-            spec.model_copy(
-                update={
-                    "query_terms": _merge_terms(spec.query_terms, reg.query_terms, MAX_QUERY_TERMS),
-                    "evidence_terms": _merge_terms(spec.evidence_terms, reg.evidence_terms, MAX_EVIDENCE_TERMS),
-                    "weak_terms": _merge_terms(spec.weak_terms, reg.weak_terms, MAX_WEAK_TERMS),
-                }
-            )
-        )
-    return enriched
-
-
-def _detect_from_registry(raw_query: str) -> list[ConceptSpec]:
-    """planner 미산출 시 fallback: 질의에서 registry concept를 evidence_term lexical로 감지."""
-    scope = _normalize_text(raw_query)
-    detected: list[ConceptSpec] = []
-    for concept_id in registry.all_registry_ids():
-        spec = registry.registry_spec(concept_id)
-        if spec is None:
-            continue
-        if any(_contains_term(scope, term) for term in spec.evidence_terms):
-            detected.append(spec)
-    return detected
-
-
 def _synthesize_query_exact(plan: Any) -> list[ConceptSpec]:
     """planner·registry 둘 다 실패 시 최후 안전망(source='query_exact').
 
@@ -201,23 +152,19 @@ def _apply_caps(specs: list[ConceptSpec]) -> list[ConceptSpec]:
 
 
 def resolve_concept_plan(plan: Any, raw_query: str) -> ConceptPlan:
-    """동적 Concept Evidence Plan 확정.
+    """동적 Concept Evidence Plan 확정 (planner 산출 단일 출처).
 
-    우선순위: planner concept_specs(있으면 registry로 보강) > registry 감지 fallback > 없음.
-    하드코딩 사전이 아니라 planner 산출을 1순위로 쓰고, registry는 보강/안전망 역할만 한다.
+    우선순위: planner concept_specs > query_exact 합성(retrieval_core) > 없음.
+    하드코딩 도메인 사전(registry)은 제거됨 — concept/evidence는 planner(LLM)가 질의마다 산출한다.
+    planner가 빈 출력을 내면 retrieval_core 키워드를 query_exact concept(optional)으로 합성한다.
+    raw_query는 호출부 시그니처 호환을 위해 유지(현재 미사용).
     """
     planner_specs = list(getattr(plan, "concept_specs", []) or [])
     if planner_specs:
-        specs = _enrich_with_registry(planner_specs)
-        source = "planner"
+        specs, source = planner_specs, "planner"
     else:
-        specs = _detect_from_registry(raw_query)
-        if specs:
-            source = "registry"
-        else:
-            # 최후 안전망: planner가 준 핵심 키워드를 query_exact concept(optional)으로 합성.
-            specs = _synthesize_query_exact(plan)
-            source = "query_exact" if specs else "none"
+        specs = _synthesize_query_exact(plan)
+        source = "query_exact" if specs else "none"
     return ConceptPlan(specs=_apply_caps(specs), source=source)
 
 

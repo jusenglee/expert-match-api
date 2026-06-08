@@ -60,7 +60,6 @@ RETRIEVAL_MODE = "multiview_flat_relevance"
 GROUPED_DIAGNOSTIC_MODE = "grouped_hybrid_rrf"
 
 # 도메인 org가 들어있는 doc_attrs 키(교차-chunk 배제 후보).
-_ORG_ATTR_KEYS = ("performing_organization", "managing_agency")
 _RELEVANCE_GATE_VERSION = "v1"
 
 # grouped 진단 경로의 concept gate도 production search()와 동일하게 relevance.ConceptPlan +
@@ -264,7 +263,7 @@ class QdrantHybridRetriever:
 
     # ------------------------------------------------------ multiview helpers
     def _resolve_concept_plan(self, query: str, plan: PlannerOutput) -> ConceptPlan:
-        """동적 Concept Evidence Plan 확정(planner concept_specs 우선 → registry 보강/감지).
+        """동적 Concept Evidence Plan 확정(planner concept_specs 우선 → query_exact 합성 폴백).
 
         concept·alias·검색문은 planner가 질의마다 산출하고, app-layer는 검증 규칙으로만 쓴다.
         하드코딩 도메인 사전은 더 이상 사용하지 않는다(relevance.resolve_concept_plan 단일 출처).
@@ -506,23 +505,37 @@ class QdrantHybridRetriever:
             researcher_name=identity.researcher_name,
         )
 
-    def _excluded_by_org(self, candidate: ResearcherCandidate, exclude_orgs: list[str]) -> bool:
+    @staticmethod
+    def _candidate_affiliation_matches(
+        candidate: ResearcherCandidate, orgs: list[str]
+    ) -> bool:
+        """root affiliated_organization만 기관 필터 대상으로 사용한다."""
+        normalized_targets = [n for org in orgs if (n := normalize_org_name(org))]
+        if not normalized_targets:
+            return False
+        normalized_affiliation = (
+            normalize_org_name(candidate.affiliated_organization or "") or ""
+        )
+        if not normalized_affiliation:
+            return False
+        return any(
+            target in normalized_affiliation or normalized_affiliation in target
+            for target in normalized_targets
+        )
+
+    def _included_by_org(
+        self, candidate: ResearcherCandidate, include_orgs: list[str]
+    ) -> bool:
+        if not include_orgs:
+            return True
+        return self._candidate_affiliation_matches(candidate, include_orgs)
+
+    def _excluded_by_org(
+        self, candidate: ResearcherCandidate, exclude_orgs: list[str]
+    ) -> bool:
         if not exclude_orgs:
             return False
-        normalized_excludes = [n for ex in exclude_orgs if (n := normalize_org_name(ex))]
-        if not normalized_excludes:
-            return False
-        candidate_orgs = [candidate.affiliated_organization or ""]
-        for hit in candidate.chunks:
-            for key in _ORG_ATTR_KEYS:
-                val = hit.payload.doc_attrs.get(key)
-                if isinstance(val, str):
-                    candidate_orgs.append(val)
-        for org in candidate_orgs:
-            normalized_org = normalize_org_name(org) or ""
-            if normalized_org and any(ex in normalized_org for ex in normalized_excludes):
-                return True
-        return False
+        return self._candidate_affiliation_matches(candidate, exclude_orgs)
 
     def _score_traces(self, hits: list[ResearcherCandidate]) -> list[dict[str, Any]]:
         traces: list[dict[str, Any]] = []
@@ -668,6 +681,13 @@ class QdrantHybridRetriever:
             nonlocal org_filtered_count
             survivors: list[ResearcherCandidate] = []
             for candidate in candidates:
+                if not self._included_by_org(candidate, plan.include_orgs):
+                    org_filtered_count += 1
+                    filtered_out.append(
+                        {"expert_id": candidate.researcher_id, "name": candidate.researcher_name,
+                         "reason": "include_org_mismatch"}
+                    )
+                    continue
                 if self._excluded_by_org(candidate, plan.exclude_orgs):
                     org_filtered_count += 1
                     filtered_out.append(
@@ -857,7 +877,30 @@ class QdrantHybridRetriever:
                     }
                 )
 
-        survivors = [c for c in candidates if not self._excluded_by_org(c, plan.exclude_orgs)]
+        org_filtered = 0
+        survivors: list[ResearcherCandidate] = []
+        for candidate in candidates:
+            if not self._included_by_org(candidate, plan.include_orgs):
+                org_filtered += 1
+                filtered_out.append(
+                    {
+                        "expert_id": candidate.researcher_id,
+                        "name": candidate.researcher_name,
+                        "reason": "include_org_mismatch",
+                    }
+                )
+                continue
+            if self._excluded_by_org(candidate, plan.exclude_orgs):
+                org_filtered += 1
+                filtered_out.append(
+                    {
+                        "expert_id": candidate.researcher_id,
+                        "name": candidate.researcher_name,
+                        "reason": "excluded_org",
+                    }
+                )
+                continue
+            survivors.append(candidate)
         final_hits = self._sort_hits(survivors)
 
         return RetrievalResult(
@@ -872,6 +915,7 @@ class QdrantHybridRetriever:
                 "relevance_filtered_candidate_count": filtered,
                 "group_count": len(groups),
                 "aggregated_candidate_count": len(candidates),
+                "org_filtered_count": org_filtered,
                 "final_hit_count": len(final_hits),
                 "timers": {"search_ms": search_timer.elapsed_ms},
             },

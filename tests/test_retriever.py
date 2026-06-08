@@ -14,16 +14,31 @@ import asyncio
 from types import SimpleNamespace
 
 from apps.core.config import Settings
-from apps.domain.models import PlannerOutput, ResearcherCandidate
+from apps.domain.models import ConceptSpec, PlannerOutput, ResearcherCandidate
 from apps.search.query_builder import CompiledQueries, QueryTextBuilder
 from apps.search.retriever import QdrantHybridRetriever
 from apps.search.schema_registry import DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
 from apps.search.sparse_runtime import SparseRuntimeConfig
 
-# concept view 텍스트 = concept_registry의 query_terms join (planner 미산출 시 registry 감지).
+# concept view 텍스트 = planner concept_specs의 query_terms join (registry 제거 후 명시 주입).
 AI_VIEW_TEXT = "인공지능 AI 머신러닝 딥러닝 신경망"
 SEMI_VIEW_TEXT = "반도체 시스템반도체 반도체소자"
 JOINT_FOCUS_TEXT = "인공지능 반도체"  # sparse_focus = ConceptPlan.focus_query(concept label 중심)
+
+# query_terms join이 AI_VIEW_TEXT / SEMI_VIEW_TEXT와 일치해야 concept view 텍스트가 동일하다.
+AI_SPEC = ConceptSpec(
+    id="ai", label="인공지능", role="required",
+    query_terms=["인공지능", "AI", "머신러닝", "딥러닝", "신경망"],
+    evidence_terms=["인공지능", "AI", "머신러닝", "딥러닝", "신경망"],
+    weak_terms=["지능형", "스마트", "자동화"],
+)
+SEMI_SPEC = ConceptSpec(
+    id="semiconductor", label="반도체", role="required",
+    query_terms=["반도체", "시스템반도체", "반도체소자"],
+    evidence_terms=["반도체", "시스템반도체", "반도체소자", "집적회로", "웨이퍼"],
+    weak_terms=["지능형", "시스템", "센서", "회로", "소자", "공정"],
+)
+AI_SEMI_SPECS = [AI_SPEC, SEMI_SPEC]
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +190,7 @@ def test_search_runs_one_flat_query_per_view_dense_first():
                 retrieval_core=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
                 core_keywords=["인공지능", "반도체", "반도체 연구개발", "반도체 산업 경험"],
                 semantic_query="인공지능 반도체 경험 연구자",
+                concept_specs=AI_SEMI_SPECS,
             ),
             query_filter=None,
         )
@@ -208,7 +224,7 @@ def test_search_merges_chunks_by_chunk_id_across_views():
         (_chunk_payload("M1", "Alpha", chunk_index=1, text="반도체 공정 인공지능 가속기"), 0.8),
     ]
     client = FakeFlatClient(default_points=points)
-    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"], concept_specs=AI_SEMI_SPECS)
 
     assert len(result.hits) == 1
     candidate = result.hits[0]
@@ -230,7 +246,7 @@ def test_search_partial_coverage_routed_to_fallback_tier():
     # concept:ai view에서만 잡힌 중립 텍스트 chunk → 'ai'만 태깅 → 부분충족(partial).
     neutral = _chunk_payload("M1", "Alpha", text="인공지능 데이터 분석 연구")
     client = FakeFlatClient(points_by_view={("sparse", AI_VIEW_TEXT): [(neutral, 0.5)]})
-    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"], concept_specs=AI_SEMI_SPECS)
 
     assert len(result.hits) == 1
     candidate = result.hits[0]
@@ -250,7 +266,7 @@ def test_search_main_tier_ranks_above_fallback_tier():
             ("sparse", SEMI_VIEW_TEXT): [(joint_chunk, 0.9)],
         }
     )
-    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"], concept_specs=AI_SEMI_SPECS)
 
     ids = [hit.researcher_id for hit in result.hits]
     assert ids == ["1", "2"]  # required 충족 후보가 부분충족보다 항상 위.
@@ -265,6 +281,7 @@ def test_search_gate_drops_partial_when_fallback_disabled():
         _retriever(client, relevance_fallback_tier=False),
         query="인공지능 반도체",
         core=["인공지능", "반도체"],
+        concept_specs=AI_SEMI_SPECS,
     )
 
     assert result.hits == []
@@ -325,13 +342,71 @@ def test_search_excludes_candidates_by_org():
     assert any(f["expert_id"] == "2" and f["reason"] == "excluded_org" for f in result.filtered_out_candidates)
 
 
+def test_search_filters_include_orgs_by_root_affiliation_only():
+    points = [
+        (_chunk_payload("1", "Keep", text="인공지능 반도체", organization="주식회사 대원테크"), 0.9),
+        (_chunk_payload("2", "Drop", text="인공지능 반도체", organization="한국전자통신연구원"), 0.9),
+    ]
+    client = FakeFlatClient(default_points=points)
+    result = asyncio.run(
+        _retriever(client).search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(
+                intent_summary="x",
+                retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"],
+                include_orgs=["대원테크"],
+            ),
+            query_filter=None,
+        )
+    )
+
+    assert [hit.researcher_id for hit in result.hits] == ["1"]
+    assert any(
+        f["expert_id"] == "2" and f["reason"] == "include_org_mismatch"
+        for f in result.filtered_out_candidates
+    )
+
+
+def test_search_org_filter_ignores_project_doc_attrs_organizations():
+    points = [
+        (
+            _chunk_payload(
+                "1",
+                "Keep",
+                doc_type="project",
+                text="인공지능 반도체 과제",
+                organization="서울대학교",
+                doc_attrs={"performing_organization": "한국전자통신연구원"},
+            ),
+            0.9,
+        )
+    ]
+    client = FakeFlatClient(default_points=points)
+    result = asyncio.run(
+        _retriever(client).search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(
+                intent_summary="x",
+                retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"],
+                exclude_orgs=["한국전자통신연구원"],
+            ),
+            query_filter=None,
+        )
+    )
+
+    assert [hit.researcher_id for hit in result.hits] == ["1"]
+    assert result.filtered_out_candidates == []
+
+
 def test_search_skips_invalid_points():
     points = [
         ({"researcher_id": "bad", "researcher_name": "Broken"}, 0.9),  # chunk_id/doc_type 없음
         (_chunk_payload("good", "Valid", text="인공지능 반도체"), 0.8),
     ]
     client = FakeFlatClient(default_points=points)
-    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"])
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"], concept_specs=AI_SEMI_SPECS)
 
     assert [hit.researcher_id for hit in result.hits] == ["good"]
     assert len(result.hits[0].chunks) == 1

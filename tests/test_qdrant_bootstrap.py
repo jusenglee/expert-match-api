@@ -96,6 +96,7 @@ def test_creates_single_dense_and_sparse_vectors_with_flat_indexes():
     assert {"researcher_id", "doc_type", "doc_date"} <= fields
     assert "vector" not in fields  # 벡터 named 키가 인덱스로 섞이지 않음
     assert not any("[]" in field for field in fields)
+    assert not any(field.startswith("doc_attrs.") for field in fields)
 
 
 def test_flat_indexes_use_expected_schema_types():
@@ -108,7 +109,6 @@ def test_flat_indexes_use_expected_schema_types():
     assert recorded["publication_count"] == models.PayloadSchemaType.INTEGER
     assert recorded["researcher_assessor_activity_count"] == models.PayloadSchemaType.INTEGER
     assert recorded["doc_date"] == models.PayloadSchemaType.DATETIME
-    assert recorded["doc_attrs.indexing_database"] == models.PayloadSchemaType.KEYWORD
     # 모든 인덱스 생성은 wait=True
     assert all(wait is True for _, _, wait in client.payload_indexes)
 

@@ -5,7 +5,7 @@ from langchain_core.messages import AIMessage
 
 from apps.core.config import Settings
 from apps.domain.models import ConceptSpec, PlannerOutput
-from apps.recommendation.planner import OpenAICompatPlanner
+from apps.recommendation.planner import HeuristicPlanner, OpenAICompatPlanner
 
 
 class FakePlannerModel:
@@ -138,6 +138,20 @@ def test_openai_compat_planner_falls_back_after_retry_exhaustion():
     assert planner.model.call_count == 2
 
 
+def test_heuristic_planner_keeps_non_empty_retrieval_core():
+    planner = HeuristicPlanner()
+
+    result = asyncio.run(
+        planner.plan(query="난접근성 화재 진압 드론 전문가 추천", top_k=5)
+    )
+
+    assert result.retrieval_core
+    assert result.core_keywords == result.retrieval_core
+    assert "전문가" not in result.retrieval_core
+    assert "추천" not in result.retrieval_core
+    assert planner.last_trace["retrieval_keywords"] == result.retrieval_core
+
+
 def test_openai_compat_planner_strips_role_and_action_terms_from_retrieval_core():
     """LLM 이 역할/행위어를 retrieval_core 에 중복으로 넣으면 후처리 단계에서 제거되어야 한다."""
     planner = OpenAICompatPlanner(
@@ -201,8 +215,12 @@ def test_system_prompt_includes_concept_evidence_plan():
     prompt = OpenAICompatPlanner._build_system_prompt()
     for token in ("concept_specs", "[Concept Evidence Plan]", "query_terms", "evidence_terms", "weak_terms"):
         assert token in prompt, token
-    assert "solid_state_battery" in prompt  # 비-AI 도메인 예시(도메인 일반화)
-    assert "weak_terms에 넣으세요" in prompt  # evidence/weak 분리(거짓 확정 방지) 규칙
+    assert "Solar 102B" in prompt
+    assert "vLLM" in prompt
+    assert "secondary_battery" in prompt  # 표준 registry id 재사용(예시 3) — enrich 정합
+    assert "semiconductor" in prompt  # head-noun 원리 일반화 예시(비-배터리 도메인)
+    assert "head-noun" in prompt  # 핵심 도메인 명사 → evidence 승격(recall)
+    assert "evidence_terms와 weak_terms를 반드시 구분" in prompt  # evidence/weak 분리(거짓 확정 방지)
 
 
 def test_planner_emits_concept_specs_from_llm():

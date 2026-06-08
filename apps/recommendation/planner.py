@@ -9,13 +9,16 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import textwrap
 from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from openai import BadRequestError
 
+from apps.core.cache import PlanCache
 from apps.core.config import Settings
 from apps.core.json_utils import extract_json_object_text as _extract_json_object_text
 from apps.core.llm_policies import build_consistency_invoke_kwargs
@@ -28,7 +31,18 @@ logger = logging.getLogger(__name__)
 MAX_PLANNER_ATTEMPTS = 2
 
 
-PLANNER_VERSION = "v0.5.0"  # concept_specs(동적 Concept Evidence Plan) 추가 — 캐시 무효화
+PLANNER_VERSION = "v0.5.2"  # Solar 102B vLLM 전제 명시 + heuristic retrieval_core 보강 — 캐시 무효화
+
+
+# planner 출력을 vLLM guided decoding(JSON 스키마)으로 강제 — prose JSON-only 요청을 구조적으로 보증.
+# 미지원 배포에서 BadRequestError가 나면 인스턴스 단위로 자동 비활성 후 prose 폴백(_invoke_json_output 참고).
+PLANNER_GUIDED_DECODING = True
+
+
+@functools.lru_cache(maxsize=1)
+def _planner_json_schema() -> dict[str, Any]:
+    """PlannerOutput → JSON 스키마(1회 생성 캐시). vLLM extra_body={'guided_json': ...}에 사용."""
+    return PlannerOutput.model_json_schema()
 
 
 class Planner(Protocol):
@@ -60,8 +74,43 @@ def _filter_summary(filters: dict[str, Any] | None) -> dict[str, Any]:
     return {key: (filters or {}).get(key) for key in _sorted_filter_keys(filters)}
 
 
+_HEURISTIC_ROLE_TERMS = (
+    "평가위원",
+    "심사위원",
+    "전문가",
+    "연구자",
+    "교수",
+)
+_HEURISTIC_ACTION_TERMS = (
+    "추천해줘",
+    "찾아줘",
+    "선정해줘",
+    "추천",
+    "심사",
+    "평가",
+    "선정",
+    "발굴",
+)
+
+
+def _heuristic_keywords(
+    normalized_query: str,
+    role_terms: list[str],
+    action_terms: list[str],
+) -> list[str]:
+    clean_query = normalized_query
+    for term in role_terms + action_terms:
+        clean_query = clean_query.replace(term, " ")
+    keywords: list[str] = []
+    for token in clean_query.split():
+        normalized = token.strip()
+        if len(normalized) > 1 and normalized not in keywords:
+            keywords.append(normalized)
+    return keywords or ([normalized_query] if normalized_query else [])
+
+
 class HeuristicPlanner:
-    """Deterministic fallback planner used when LLM planning is unavailable."""
+    """LLM 없이 동작하는 결정적 플래너. 테스트/오프라인 런타임에서 사용한다."""
 
     def __init__(self) -> None:
         self.last_trace: dict[str, Any] = {}
@@ -84,24 +133,38 @@ class HeuristicPlanner:
             len(exclude_orgs or []),
             _sorted_filter_keys(filters_override),
         )
+
+        role_terms = [
+            term for term in _HEURISTIC_ROLE_TERMS if term in normalized_query
+        ]
+        action_terms = [
+            term for term in _HEURISTIC_ACTION_TERMS if term in normalized_query
+        ]
+        retrieval_core = _heuristic_keywords(
+            normalized_query,
+            role_terms,
+            action_terms,
+        )
         output = PlannerOutput(
             intent_summary=normalized_query,
             hard_filters=dict(filters_override or {}),
             include_orgs=list(include_orgs or []),
             exclude_orgs=list(exclude_orgs or []),
-            task_terms=[],
-            core_keywords=[],
-            retrieval_core=[],
-            role_terms=[],
-            action_terms=[],
+            task_terms=_normalize_string_list(role_terms + action_terms),
+            core_keywords=list(retrieval_core),
+            retrieval_core=list(retrieval_core),
+            role_terms=role_terms,
+            action_terms=action_terms,
+            semantic_query=normalized_query,
             top_k=top_k or 15,
         )
         self.last_trace = {
             "mode": "deterministic_fallback",
             "normalized_query": normalized_query,
             "planner_retry_count": 0,
-            "planner_keywords": [],
-            "retrieval_keywords": [],
+            "planner_keywords": list(retrieval_core),
+            "retrieval_keywords": list(retrieval_core),
+            "removed_role_terms": list(role_terms + action_terms),
             "attempts": [],
         }
         logger.info(
@@ -116,6 +179,7 @@ class HeuristicPlanner:
         )
         return output
 
+
 class OpenAICompatPlanner:
     """
     LLM(OpenAI 호환 API)을 사용하여 사용자의 질의를 깊이 있게 분석하는 플래너입니다.
@@ -124,8 +188,8 @@ class OpenAICompatPlanner:
 
     def __init__(self, settings: Settings, cache: PlanCache | None = None) -> None:
         self.settings = settings
-        # LLM 실패 fallback은 plan() 내장 fallback_broad_search 경로를 쓴다(HeuristicPlanner는
-        # llm_backend=='heuristic'일 때 main.py가 직접 주입). 여기서 인스턴스를 들고 있지 않는다.
+        # LLM 실패 fallback은 plan() 내장 fallback_broad_search 경로를 쓴다.
+        # HeuristicPlanner는 llm_backend=='heuristic'일 때 main.py가 직접 주입한다.
         self.model = OpenAICompatChatModel(
             model_name=settings.llm_model_name,
             base_url=settings.llm_base_url,
@@ -133,6 +197,8 @@ class OpenAICompatPlanner:
         )
         self.cache = cache
         self.last_trace: dict[str, Any] = {}
+        # guided_json 지원 여부(미지원 배포에서 BadRequestError 1회 후 prose 폴백으로 고정).
+        self._guided_supported: bool = True
 
     @staticmethod
     def _build_system_prompt() -> str:
@@ -140,6 +206,7 @@ class OpenAICompatPlanner:
                 # 역할
                 당신은 ***동질적인 전문가 코퍼스***를 검색하는 전문가 추천 시스템의 R&D 질의 플래너입니다.
                 당신은 전문가/평가위원을 모아놓은 qdrant 벡터DB 에 검색 할 쿼리를 만들기 위해, 사용자의 질의를 분석하고 정규화해야 합니다.
+                실행 모델은 Solar 102B를 vLLM(OpenAI 호환 API)로 서빙한 모델입니다. 모든 지시와 출력 값은 사용자의 언어를 따르며, 한국어 질의는 한국어로 작성하세요.
             
                 # 출력 목표
                 - `retrieval_core`: 실제 기술/도메인 매칭에 필요한 핵심 키워드 리스트(Sparse/Keyword 검색용). "평가위원", "전문가" 등 역할어는 제외하세요.
@@ -159,7 +226,7 @@ class OpenAICompatPlanner:
                 4-1. **대상 기관 vs 소속 기관 구분**: "X에서 수행한 과제를 심사", "X 사업 평가", "X 과제 ~" 처럼 기관 X 가 *심사/평가 대상*으로 등장하는 경우, X 는 `include_orgs`에 넣지 말고 `semantic_query`의 맥락으로만 유지하세요. "X 소속 ~", "X 출신 ~" 처럼 명시적으로 소속을 지정한 경우만 `include_orgs`에 넣습니다.
                 5. 명시적으로 지원되는 구조화 필터만 `hard_filters`에 복사하세요.
                 6. 안전한 도메인 키워드가 없으면 `retrieval_core`는 빈 리스트로 반환하세요.
-                7. (Solar 추론) 내부적으로 단계적으로 추론하되, 최종 출력은 JSON 객체 **하나만** 반환하세요. 마크다운 펜스, 설명문, 추론 과정을 출력에 포함하지 마세요.
+                7. 출력은 JSON 객체 **하나만** 반환하세요. 마크다운 펜스, 설명문, 추론 과정을 출력에 포함하지 마세요. (응답은 구조화 디코딩으로 JSON만 허용됩니다.)
 
                 # [Concept Evidence Plan] (concept_specs 생성 규칙)
                 질의에서 핵심 기술/도메인 개념(concept)을 뽑고, concept마다 아래 용어를 **분리**해 생성하세요.
@@ -172,11 +239,20 @@ class OpenAICompatPlanner:
                 - weak_terms: 단독으로는 근거가 약한 연관어(확정 근거 아님) — 최대 12개.
 
                 [필수 규칙]
-                - evidence_terms와 weak_terms를 반드시 구분하세요. "지능형/스마트/시스템/산업/개발/소재/센서/경험/연구" 같은
-                  일반·약한 단어는 evidence_terms에 절대 넣지 말고 weak_terms에 넣으세요(거짓 확정 방지).
-                - concept은 최대 5개. 질의에 명시된 기술/도메인만 만드세요. 역할어/행위어는 concept이 아닙니다.
+                - evidence_terms와 weak_terms를 반드시 구분하세요.
+                  · evidence_terms: 그 개념을 '고유하게' 지시하는 분별력 있는 명사·전문용어·약어. 개념의 핵심 도메인
+                    head-noun도 여기 넣어 recall을 확보하세요(예: 배터리, 이차전지, 반도체). 판정 기준 — 문서에 substring으로
+                    등장할 때 '같은 개념의 문서에만' 나타나면 evidence입니다. (분별력이 큰 고유어를 evidence 리스트 앞쪽에 두세요.)
+                  · weak_terms(확정 근거 아님): 다음 두 부류를 모두 weak로 두세요.
+                    (a) 분별력이 없는 일반·기능어: 소재/개발/시스템/지능형/스마트/센서/경험/연구/산업 등.
+                    (b) 무관한 2개 이상 도메인의 합성어 부분문자열로 흔히 등장해 거짓 확정을 유발하는 모호어·광역 상위어:
+                        "전지"→연료전지·태양전지·축전지, "소자"→반도체소자·광소자·표시소자, "화재"→화재예방·산불.
+                - concept id는 가능하면 아래 표준 id를 재사용하세요(런타임 안전망 보강이 자동 적용됩니다):
+                  ai, semiconductor, secondary_battery, bio, robot, autonomous_driving, display, hydrogen, quantum, security.
+                  표준에 없는 새 도메인만 새 snake_case id를 만드세요.
+                - head-noun을 evidence로 올리는 것은 기술/도메인 명사에만 적용합니다. 기관명·역할어·행위어는 concept이 아니므로 evidence 대상이 아닙니다.
+                - concept은 최대 5개. 질의에 명시된 기술/도메인만 만드세요. 도메인 개념이 없으면 concept_specs는 빈 배열 [] 로 두세요.
                 - 영문 약어(AI/NPU/ADAS 등)는 그 자체로 분별력이 있을 때만 evidence_terms에 넣으세요.
-                - 도메인 개념이 없으면 concept_specs는 빈 배열 [] 로 두세요.
 
                 # 출력 스키마
                 {
@@ -229,6 +305,7 @@ class OpenAICompatPlanner:
                      "weak_terms": ["비행", "로봇", "무인"]}
                   ]
                 }
+                주의: "화재 진압"/"소방"은 화재진압 개념을 고유하게 지시하는 head-noun이라 evidence. 단독 "화재"는 화재예방·산불 등에 공통 매칭되는 광역 상위어라 weak입니다.
 
                 # 예시 2 (대상 기관 + 역할어 처리)
                 Input:
@@ -279,12 +356,44 @@ class OpenAICompatPlanner:
                   "exclude_orgs": [],
                   "top_k": 10,
                   "concept_specs": [
-                    {"id": "solid_state_battery", "label": "전고체 배터리", "role": "required",
+                    {"id": "secondary_battery", "label": "전고체 배터리", "role": "required",
                      "query_terms": ["전고체전지", "전고체 배터리", "고체전해질"],
-                     "evidence_terms": ["전고체전지", "전고체 배터리", "solid-state battery", "고체전해질", "황화물계 전해질", "산화물계 전해질"],
-                     "weak_terms": ["배터리", "전지", "소재", "개발"]}
+                     "evidence_terms": ["전고체전지", "전고체 배터리", "solid-state battery", "고체전해질", "황화물계 전해질", "배터리", "이차전지"],
+                     "weak_terms": ["전지", "소재", "개발"]}
                   ]
                 }
+                주의: concept id는 표준 id "secondary_battery"를 재사용했습니다(전고체전지는 이차전지의 하위 유형이라 registry 안전망 보강이 자동 적용됨). "배터리"는 연료전지/태양전지에 substring으로 나타나지 않아 evidence로 안전하고, "전지"는 그 도메인들에 공통 매칭돼 거짓 확정 위험이므로 weak로 둡니다.
+
+                # 예시 4 (head-noun=evidence 원리는 도메인 불문 — 반도체)
+                Input:
+                {
+                  "query": "시스템반도체 설계 경험이 있는 연구자를 찾아줘",
+                  "filters_override": {},
+                  "include_orgs": [],
+                  "exclude_orgs": [],
+                  "top_k": 10
+                }
+
+                Output:
+                {
+                  "intent_summary": "시스템반도체 설계 경험 연구자 탐색",
+                  "retrieval_core": ["시스템반도체", "반도체 설계"],
+                  "semantic_query": "시스템반도체/집적회로 설계 경험을 가진 연구자",
+                  "role_terms": ["연구자"],
+                  "action_terms": ["찾아줘"],
+                  "intent_flags": { "need_experience": true },
+                  "hard_filters": {},
+                  "include_orgs": [],
+                  "exclude_orgs": [],
+                  "top_k": 10,
+                  "concept_specs": [
+                    {"id": "semiconductor", "label": "반도체", "role": "required",
+                     "query_terms": ["시스템반도체", "반도체", "집적회로"],
+                     "evidence_terms": ["반도체", "시스템반도체", "집적회로", "웨이퍼", "SoC", "파운드리"],
+                     "weak_terms": ["소자", "회로", "공정", "시스템"]}
+                  ]
+                }
+                주의: "반도체"는 그 개념을 고유하게 지시하는 head-noun이라 evidence. "소자"는 반도체소자·광소자·표시소자 등 무관 도메인에 공통 매칭되는 모호어라 weak. concept id는 표준 id "semiconductor"를 재사용했습니다.
             """
         return textwrap.dedent(prompt).strip()
 
@@ -351,14 +460,22 @@ class OpenAICompatPlanner:
         payload: dict[str, Any],
         seed: int,
     ) -> tuple[PlannerOutput, dict[str, Any], str]:
+        messages = [
+            SystemMessage(content=self._build_system_prompt()),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+        ]
         invoke_kwargs = build_consistency_invoke_kwargs(seed=seed)
-        result = await self.model.ainvoke_non_stream(
-            [
-                SystemMessage(content=self._build_system_prompt()),
-                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-            ],
-            **invoke_kwargs,
-        )
+        if PLANNER_GUIDED_DECODING and self._guided_supported:
+            guided_kwargs = {**invoke_kwargs, "extra_body": {"guided_json": _planner_json_schema()}}
+            try:
+                result = await self.model.ainvoke_non_stream(messages, **guided_kwargs)
+            except BadRequestError as exc:
+                # 배포가 guided_json을 거부 → 이 인스턴스에서는 비활성 후 prose JSON-only로 폴백.
+                self._guided_supported = False
+                logger.warning("플래너 guided_json 미지원/거부 — prose 폴백 전환: error=%r", exc)
+                result = await self.model.ainvoke_non_stream(messages, **invoke_kwargs)
+        else:
+            result = await self.model.ainvoke_non_stream(messages, **invoke_kwargs)
         json_text = _extract_json_object_text(result.content)
         parsed_payload = json.loads(json_text)
         output = PlannerOutput.model_validate(parsed_payload)

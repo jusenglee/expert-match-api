@@ -54,9 +54,9 @@
 - Input: `publication_count_min` / `highest_degree` 필터
 - Expected: flat root의 `publication_count`/`highest_degree`로 chunk 단계에서 deterministic 필터, 위반 후보 0건.
 
-### 12. 제외 기관 (cross-chunk)
+### 12. 소속 기관 include/exclude
 - Input: `exclude_orgs` 지정
-- Expected: flat root `affiliated_organization` + 매칭 chunk의 `doc_attrs.performing_organization`/`doc_attrs.managing_agency`(project) 어디에도 해당 기관이 없는 후보만 반환. (assessor_activity/specialty의 `doc_attrs` 키는 미상 → passthrough, 인덱스 대상 아님.)
+- Expected: root `affiliated_organization`만 정규화 비교해 include/exclude를 적용한다. `doc_attrs.performing_organization`/`doc_attrs.managing_agency`는 과제 속성이므로 소속기관 필터에 쓰지 않는다.
 
 ### 13. 평가이력 신호 (NEW)
 - Input: "평가위원 경험이 풍부한" 의도
@@ -96,7 +96,7 @@
 - 검색은 항상 `grouped_hybrid_rrf`: dense_full + sparse_joint + sparse_concept_queries prefetch → equal RRF → post-group concept coverage gate.
 - v1.x 확장 사전은 active 검색 경로에 없으며 `expanded` 쿼리는 별도 확장어를 추가하지 않는다.
 - 검색 후 `researcher_id`로 집계해 연구자당 1건, 점수는 RRF 누적, doc_type별 `chunk_cap` 적용.
-- hard filter는 시스템이 deterministic 보장(flat root 메타 기준), 다중 doc_type `doc_date` recency는 OR 결합.
+- hard filter는 시스템이 deterministic 보장(flat root 메타 기준), 다중 doc_type `doc_date` recency는 OR 결합. `doc_attrs.*`는 필터/인덱스 대상이 아니다.
 - `/search/candidates`와 `/recommend`는 검색·집계 순서를 유지하고 `/recommend`는 Top-k만 LLM에 전달.
 - evidence 선별은 family별 캡을 적용하되 후보 순위를 바꾸지 않는다.
 - `recommendation.evidence`는 LLM이 고른 `chunk_id`로 resolve, 무효 시 결정론적 fallback.

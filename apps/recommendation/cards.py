@@ -88,8 +88,6 @@ class CandidateCardBuilder:
             matched_filter_summary.append(
                 f"Degree filter matched: {candidate.highest_degree or 'unknown'}"
             )
-        if hard_filters.get("journal_class"):
-            matched_filter_summary.append(f"SCIE count: {counts['scie_cnt']}")
         if hard_filters.get("research_project_count_min") is not None:
             matched_filter_summary.append(f"Project count: {counts['project_cnt']}")
 

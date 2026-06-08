@@ -58,9 +58,8 @@ def test_filterable_fields_are_flat_keys():
         "researcher_assessor_activity_count",
     ):
         assert field in sr.FILTERABLE_FIELDS
-    # doc_attrs.* keys present
-    assert "doc_attrs.indexing_database" in sr.FILTERABLE_FIELDS
-    assert "doc_attrs.is_scie" in sr.FILTERABLE_FIELDS
+    # doc_attrs.* keys are dynamic and not filterable.
+    assert not any(field.startswith("doc_attrs.") for field in sr.FILTERABLE_FIELDS)
     # no v1.x nested[] residue, no v2.0-doc'd event_year/researcher_meta keys
     for field in sr.FILTERABLE_FIELDS:
         assert "[]" not in field
@@ -92,6 +91,7 @@ def test_payload_index_fields_shape():
     # no nested(v1.x) residue, no researcher_meta nesting
     assert not any("[]" in path for path in paths)
     assert not any(path.startswith("researcher_meta.") for path in paths)
+    assert not any(path.startswith("doc_attrs.") for path in paths)
 
 
 def test_payload_index_subset_of_filterable():

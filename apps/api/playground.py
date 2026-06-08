@@ -463,7 +463,7 @@ PLAYGROUND_HTML = dedent(
                 <div style="margin-top: 1rem">
                   <div class="input-group">
                     <label for="filtersInput">필터 재정의 (JSON 형식)</label>
-                    <textarea id="filtersInput" placeholder='{&#10;  "highest_degree": "박사",&#10;  "journal_class": "SCIE",&#10;  "research_project_count_min": 3&#10;}'></textarea>
+                    <textarea id="filtersInput" placeholder='{&#10;  "highest_degree": "박사",&#10;  "scie_publication_count_min": 1,&#10;  "research_project_count_min": 3&#10;}'></textarea>
                   </div>
                   <div class="input-group">
                     <label for="includeInput">검색 대상 기관 (소속 제한)</label>

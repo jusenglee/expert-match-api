@@ -183,7 +183,7 @@ chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
 - `doc_date >= 올해-N` (+ `doc_type` 한정) — 최근성. `doc_date`는 단일 datetime 필드이며 `"NONE"`/결측은 datetime range에 매칭되지 않는다(= recency 제외). **여러 doc_type recency는 OR(min_should, min_count=1)** 로 결합한다(AND로 묶으면 0건 회귀, [`DATA_MODEL.md §3`](DATA_MODEL.md)).
 - flat root `*_count >= 임계값` — 최소 실적 (`publication_count` / `scie_publication_count` / `intellectual_property_count` / `research_project_count` / `researcher_assessor_activity_count`).
 - `highest_degree` — 학위 (root).
-- **제외 기관:** root `affiliated_organization`(Qdrant 필터) + 매칭 chunk의 `doc_attrs.performing_organization` / `doc_attrs.managing_agency`(project 상세)에 대해 교차 배제. Qdrant 필터로 가능한 부분 + 교차 chunk 배제는 Python post-filter.
+- **소속 기관 include/exclude:** 정규화된 root 소속 필드가 없으므로 Qdrant exact pre-filter에 의존하지 않고 Python post-filter에서 root `affiliated_organization`만 비교한다. `doc_attrs.performing_organization` / `doc_attrs.managing_agency`는 과제 속성이며 소속기관 필터 대상이 아니다.
 - 필터는 LLM이 아니라 시스템이 보장한다.
 
 ### 5.5 결정론적 최종 정렬

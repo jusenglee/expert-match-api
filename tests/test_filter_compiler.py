@@ -1,13 +1,13 @@
 """flat 계약(v2.1) hard_filters → Qdrant 필터 컴파일 검증.
 
 DATA_CONTRACT §1.1 허용 키(highest_degree / recent_years+recent_doc_types /
-*_count_min / journal_class)를 flat root 또는 doc_attrs.* 경로로 매핑한다:
+*_count_min)를 flat root 경로로 매핑한다:
 - highest_degree → root highest_degree
 - *_count_min → root count (assessor 별칭 전부 → researcher_assessor_activity_count)
-- journal_class → doc_attrs.indexing_database
-- affiliated_organization (include/exclude) → root affiliated_organization
 - recency → root doc_date(DatetimeRange) 기준, doc_type별 OR(min_should, min_count=1)
 
+doc_attrs.*는 유동 필드이므로 hard filter로 컴파일하지 않는다.
+기관 include/exclude는 정규화된 root 필드가 없으므로 retriever 앱단 post-filter 소관이다.
 다중 doc_type recency는 AND가 아니라 OR(min_should, min_count=1) — 0건 회귀 방지(필수).
 """
 from datetime import UTC, datetime
@@ -28,7 +28,7 @@ def _expected_cutoff(recent_years):
     return datetime(year, 1, 1, tzinfo=UTC)
 
 
-def test_compiles_meta_count_degree_journal_and_org_inclusion_exclusion():
+def test_compiles_root_meta_count_degree_and_ignores_doc_attrs_and_orgs():
     compiled = QdrantFilterCompiler().compile(
         hard_filters={
             "highest_degree": "박사",
@@ -46,12 +46,10 @@ def test_compiles_meta_count_degree_journal_and_org_inclusion_exclusion():
     assert "highest_degree" in must_keys
     assert "scie_publication_count" in must_keys
     assert "research_project_count" in must_keys
-    # journal_class → doc_attrs.indexing_database
-    assert "doc_attrs.indexing_database" in must_keys
-    # include org → root affiliated_organization (must)
-    assert "affiliated_organization" in must_keys
-    # exclude org → root affiliated_organization (must_not)
-    assert "affiliated_organization" in _field_keys(compiled.must_not)
+    # doc_attrs.*와 기관 조건은 Qdrant hard filter로 컴파일하지 않는다.
+    assert "doc_attrs.indexing_database" not in must_keys
+    assert "affiliated_organization" not in must_keys
+    assert compiled.must_not is None
     # v1.x nested 경로 잔재 없음
     assert not any(isinstance(c, models.NestedCondition) for c in compiled.must)
     assert not any("researcher_meta" in (k or "") for k in must_keys)
@@ -209,15 +207,13 @@ def test_unknown_recent_doc_type_is_ignored_falls_back_to_bare_doc_date():
     assert cond.key == "doc_date"
 
 
-def test_exclude_org_only_produces_must_not_filter():
+def test_org_only_filters_are_left_to_retriever_post_filter():
     compiled = QdrantFilterCompiler().compile(
         hard_filters={},
         exclude_orgs=["제외기관"],
+        include_orgs=["포함기관"],
     )
-    assert compiled is not None
-    assert compiled.must is None
-    assert compiled.must_not is not None
-    assert _field_keys(compiled.must_not) == {"affiliated_organization"}
+    assert compiled is None
 
 
 def test_empty_filters_returns_none():

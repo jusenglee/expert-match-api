@@ -19,7 +19,7 @@ python -m pip install -e .[dev]
   - payload root `chunk_id` 문자열 (`<doc_type>_<숫자doc_id>_c<NNN>`, 예: `paper_100000045256_c000`)이 authoritative evidence id.
   - Point ID는 신규/멱등 컬렉션에서는 `chunk_id`를 권장하나, 운영 컬렉션이 UUID Point ID를 쓰더라도 런타임은 `payload.chunk_id`를 기준으로 evidence를 resolve한다.
   - named vector: `vector_e5i`(1024, Cosine) + `vector_splade`. doc_type은 named vector가 아니라 payload 필터.
-  - payload 인덱스: `researcher_id`(keyword), `doc_type`(keyword), 연구자 공통 count 5종(`publication_count`/`scie_publication_count`/`intellectual_property_count`/`research_project_count`/`researcher_assessor_activity_count`, integer), `doc_date`(datetime, recency), `affiliated_organization`/`highest_degree` 및 주요 `doc_attrs.*` keyword 필드 ([`DATA_MODEL.md §5`](../architecture/DATA_MODEL.md))
+  - payload 인덱스: `researcher_id`(keyword), `doc_type`(keyword), `affiliated_organization`/`highest_degree`(keyword), 연구자 공통 count 5종(`publication_count`/`scie_publication_count`/`intellectual_property_count`/`research_project_count`/`researcher_assessor_activity_count`, integer), `doc_date`(datetime, recency). `doc_attrs.*`는 유동 필드라 필터/인덱스 대상이 아니다. ([`DATA_MODEL.md §5`](../architecture/DATA_MODEL.md))
 - 시작 시, 실제 선택된 sparse backend에 맞춰 sparse vector modifier(`IDF` 또는 없음)를 자동 확인·복구한다.
 
 ### 2.1 적재(ingestion) 불변식 점검
@@ -66,7 +66,7 @@ NTIS_QDRANT_COLLECTION_NAME=ntis_researcher_chunks python -m apps.tools.bootstra
 - 컬렉션 존재 여부
 - named vector `vector_e5i`/`vector_splade` 존재 여부
 - sparse vector modifier 값(IDF/none)
-- 필수 payload 인덱스(`researcher_id`, `doc_type`, `doc_date`, 연구자 count 5종 등) 생성 여부
+- 필수 payload 인덱스(`researcher_id`, `doc_type`, `doc_date`, `affiliated_organization`, `highest_degree`, 연구자 count 5종 등) 생성 여부
 - 유효 샘플 Point 존재 및 구조(flat root: `chunk_id`, `doc_type`, `researcher_id`, 공통 메타 + count 5종, doc_type별 `doc_attrs`)
 
 ## 4. 서버 실행

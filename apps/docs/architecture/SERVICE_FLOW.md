@@ -35,7 +35,7 @@
 2. **chunk concept gate:** `required_concepts`가 있으면 concept hit가 없는 sibling chunk를 제거한다.
 3. **연구자 coverage gate:** 남은 chunk들이 `required_concepts` 전체를 덮는 연구자만 후보로 남긴다.
 4. **연구자 집계:** chunk hit을 `researcher_id`로 묶고 RRF 누적으로 연구자 점수 산출. 한 연구자의 동일 doc_type에서는 상위 N개 chunk만 점수에 기여(`doc_type_chunk_cap`, 기본 3), 같은 doc_type 추가 chunk는 harmonic decay로 체감 반영한다. 집계 prior는 기본 equal, 연구자당 1건으로 dedupe.
-5. **hard filter:** `doc_date` 최근성(여러 doc_type은 OR/min_should), flat root `*_count` 최소 실적, 학위, 제외 기관을 deterministic 적용. 제외 기관은 root `affiliated_organization`(Qdrant 필터) + 매칭 chunk의 `doc_attrs.performing_organization`/`doc_attrs.managing_agency`(앱단 post-filter)로 교차 배제한다.
+5. **hard filter:** `doc_date` 최근성(여러 doc_type은 OR/min_should), flat root `*_count` 최소 실적, 학위를 deterministic 적용한다. 기관 include/exclude는 정규화된 root 필드가 없으므로 앱단 post-filter에서 root `affiliated_organization`만 비교한다. `doc_attrs.*`는 유동 상세 필드라 필터 대상으로 쓰지 않는다.
 6. **결정론적 정렬:** score 내림차순 → `researcher_name` 오름차순 → `researcher_id` 오름차순.
 
 각 후보에는 어떤 doc_type/chunk이 어떤 순위로 매칭됐는지 `retrieval_score_traces`로 기록한다.

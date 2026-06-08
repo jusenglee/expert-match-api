@@ -1,16 +1,16 @@
 """사용자 질의 분석 결과(hard_filters)를 Qdrant 필터(models.Filter)로 변환하는 모듈.
 
-flat chunk 모델(v2.1) 기준. 모든 필터 키는 flat root 또는 doc_attrs.* (실제 payload 키)를 가리킨다.
+flat chunk 모델(v2.1) 기준. hard filter는 실데이터 샘플 계약상 안정적인 payload root
+필드만 대상으로 삼는다. doc_type별 `doc_attrs.*`는 유동 필드이므로 필터 대상으로 쓰지 않는다.
 DATA_CONTRACT §1.1 허용 키(`highest_degree` / `recent_years`+`recent_doc_types` /
-`*_count_min` / `journal_class`)를 다음 flat 경로로 매핑한다:
+`*_count_min`)를 다음 flat root 경로로 매핑한다:
 - 연구자 공통 count/메타 → flat root (researcher_meta 중첩 폐기)
 - recency → root `doc_date`(datetime), event_year 폐기
-- journal_class → `doc_attrs.indexing_database`(paper 등재구분)
 
 HARD 제약(보존 필수): 다중 doc_type recency는 AND가 아니라 **OR(min_should, min_count=1)**.
 AND로 묶으면 0건 회귀(DATA_MODEL §3.2 교훈).
-교차-chunk org 배제(performing/managing 등 doc_attrs)는 retriever 앱단 post-filter 소관이며,
-여기서는 root `affiliated_organization`만 다룬다.
+소속 기관 include/exclude는 정규화된 root 필드가 없으므로 Qdrant exact pre-filter가 아니라
+retriever 앱단 post-filter에서 root `affiliated_organization`만 기준으로 처리한다.
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from typing import Any
 from qdrant_client import models
 
 from apps.search.doc_types import DOC_TYPE_TO_FAMILY, DOC_TYPES, Family
-from apps.search.text_utils import normalize_org_name
 
 # 최소 건수 hard_filters 키 → flat root 백엔드 필드 (DATA_CONTRACT §1.1).
 # 실데이터는 assessor를 단일 researcher_assessor_activity_count로 보유하므로, 구 split 키
@@ -37,9 +36,6 @@ _COUNT_MIN_TO_FIELD: dict[str, str] = {
     "expert_assessor_count_min": "researcher_assessor_activity_count",
 }
 
-_AFFILIATION_KEY = "affiliated_organization"
-#: 등재구분(journal_class) hard_filter → paper doc_attrs 실제 키.
-_JOURNAL_CLASS_KEY = "doc_attrs.indexing_database"
 _FAMILY_VALUES = frozenset(f.value for f in Family)
 
 
@@ -81,20 +77,10 @@ class QdrantFilterCompiler:
         exclude_orgs: list[str],
         include_orgs: list[str] | None = None,
     ) -> models.Filter | None:
+        _ = (exclude_orgs, include_orgs)
         must: list[models.Condition] = []
-        must_not: list[models.Condition] = []
 
-        # 0. 소속 기관 포함(include) — root affiliated_organization
-        for org in include_orgs or []:
-            normalized = normalize_org_name(org)
-            if normalized:
-                must.append(
-                    models.FieldCondition(
-                        key=_AFFILIATION_KEY, match=models.MatchValue(value=normalized)
-                    )
-                )
-
-        # 1. 학위 — root highest_degree
+        # 1. 학위 - root highest_degree
         if degree := hard_filters.get("highest_degree"):
             values = degree if isinstance(degree, list) else [degree]
             must.append(
@@ -111,16 +97,9 @@ class QdrantFilterCompiler:
                     models.FieldCondition(key=backend_key, range=models.Range(gte=min_value))
                 )
 
-        # 3. 등재구분 (paper의 doc_attrs.indexing_database, 예: SCIE/SCOPUS)
-        if journal_class := hard_filters.get("journal_class"):
-            values = journal_class if isinstance(journal_class, list) else [journal_class]
-            must.append(
-                models.FieldCondition(
-                    key=_JOURNAL_CLASS_KEY, match=models.MatchAny(any=values)
-                )
-            )
+        # 3. journal_class 등 doc_attrs 기반 키는 의도적으로 무시한다.
 
-        # 4. 최근성 — root doc_date(datetime) 기준. 여러 doc_type이면 OR(min_should)로 결합(★0건 회귀 방지).
+        # 4. 최근성 - root doc_date(datetime) 기준. 여러 doc_type이면 OR(min_should)로 결합(0건 회귀 방지).
         recent_activity_conditions: list[models.Condition] = []
         recent_years = hard_filters.get("recent_years")
         if recent_years is not None:
@@ -161,17 +140,6 @@ class QdrantFilterCompiler:
         elif len(recent_activity_conditions) == 1:
             must.append(recent_activity_conditions[0])
 
-        # 5. 제외 기관 — root affiliated_organization
-        #    (chunk doc_attrs의 performing/managing 등 교차 배제는 retriever 앱단 post-filter)
-        for org in exclude_orgs:
-            normalized = normalize_org_name(org)
-            if normalized:
-                must_not.append(
-                    models.FieldCondition(
-                        key=_AFFILIATION_KEY, match=models.MatchValue(value=normalized)
-                    )
-                )
-
-        if not must and not must_not:
+        if not must:
             return None
-        return models.Filter(must=must or None, must_not=must_not or None)
+        return models.Filter(must=must)

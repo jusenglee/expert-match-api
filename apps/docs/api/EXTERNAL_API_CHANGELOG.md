@@ -12,6 +12,7 @@
 
 | 날짜 | 커밋 | 영향도 | 변경 내용 |
 |---|---|---|---|
+| 2026-06-04 | `v2.1.1` | **정책 정정** | hard_filter와 payload index 대상을 flat root 필드로 제한했습니다. `doc_attrs.*`는 유동 상세 필드이므로 `journal_class`→`doc_attrs.indexing_database` 매핑과 project `performing_organization`/`managing_agency` 기반 기관 필터를 제거했습니다. 기관 include/exclude는 root `affiliated_organization` 앱단 post-filter만 사용합니다. |
 | 2026-03-31 | `c4a3cfa` | 기준선 | 공개 응답 스키마 초안이 추가되었습니다. `/recommend`는 `intent_summary`, `applied_filters`, `searched_branches`, `retrieved_count`, `recommendations`, `data_gaps`, `not_selected_reasons`, `trace` 구조를 갖고, `/search/candidates`는 `candidates[*].branch_coverage`를 사용했습니다. |
 | 2026-04-06 | `368cb28` | 동작 변경 | `/recommend`가 더 이상 "후보 없음" 또는 "evidence 없음" 때문에 `500`을 내지 않고, `200 OK`와 함께 `recommendations=[]`를 반환하도록 바뀌었습니다. 빈 결과 사유는 `not_selected_reasons`에 남기도록 정리되었습니다. |
 | 2026-04-14 | `9b71535` | 경미 | 응답 최상위 스키마 변경은 없지만, 검색/추천 결과의 `trace.include_orgs`가 노출되기 시작했습니다. 같은 커밋에서 `top_k` 상한이 `5 -> 15`로 바뀌었지만 이는 요청 계약 변경입니다. |
@@ -22,7 +23,7 @@
 | 2026-04-23 | `pending` | 확장 | 검색 동작이 고정 2단계(`keyword_pool_then_hybrid`)로 바뀌었습니다. 외부 최상위 스키마는 유지되지만 `trace.query_payload`에서 `retrieval_mode`, `keyword_stage_candidate_count`, `keyword_stage_branch_counts`, `hybrid_stage_candidate_filter_count`, `hybrid_stage_raw_branch_counts`, `aggregated_candidate_count`, `support_pass_count`, `support_filtered_count`를 확인할 수 있습니다. 같은 변경에서 `trace.server_logs`에는 `trace=<id>`와 `[METHOD /path]`를 포함한 사용자 질의, 플래너, 1차 검색, 2차 검색, 응답 준비 단계별 요약 로그가 포함됩니다. |
 | 2026-04-23 | `pending` | 확장 | 운영 로그와 `trace.query_payload`에 실제 키워드 추출 결과와 검색 쿼리 텍스트가 추가되었습니다. `trace.server_logs`는 `retrieval_core`, `core_keywords`, `role_terms`, `action_terms`, `semantic_query`, 실제 `retrieval_keywords`, 1차/2차 검색 텍스트를 값 그대로 보여줍니다. v1.x 확장 사전 기반 `bundle_ids`는 active 검색 경로에서 제거됐습니다. |
 | 2026-05-28 | `v2.0` | **주요 변경(BREAKING)** | chunk 데이터 모델 재설계(저장 단위 "연구자 1 Point" → "chunk 1 Point"). 외부 응답에서 다음이 변경됩니다 — `recommendations[*].evidence[*].type`이 4종(`paper/patent/project/profile`)에서 doc_type 문자열로 확장; `evidence[*]`에 **`chunk_id` 추가**; `counts`가 연구자 누적 실적 기반 명칭(`publication_count` 등)으로 변경. 컬렉션 기본값 `researcher_recommend_proto` → `ntis_researcher_chunks`. *(이 시점 설계 문서는 11 doc_type / `searched_doc_types` 리네임 / `doc_type_coverage`(family) 등을 예고했으나, 실제 적재 데이터와 코드는 아래 v2.1에서 flat·5 doc_type으로 확정되었습니다.)* |
-| 2026-06-02 | `v2.1` | **주요 변경(BREAKING)** | **flat payload 확정.** 실제 적재 데이터는 평탄 chunk payload(연구자 공통 메타 root 비정규화 + doc_type별 `doc_attrs{}`)이며 doc_type은 **정확히 5종**(`paper`/`patent`/`project`/`assessor_activity`/`specialty`)입니다. `recommendations[*].evidence[*].type`은 이 5종 또는 합성 `profile`이고, 식별자는 `chunk_id`(형식 `<doc_type>_<숫자doc_id>_c<NNN>`)입니다. `/search/candidates.candidates[*]`는 family boolean이 아니라 **`doc_types_present`(hit한 doc_type 문자열 목록)** 를 노출하며, `counts`는 flat root 단일 평가위원 카운트를 포함한 5개 키입니다. hard_filter는 flat 키(`highest_degree`, root count `*_count_min`, `journal_class`→`doc_attrs.indexing_database`, `recent_years`+`recent_doc_types` on `doc_date`)입니다. |
+| 2026-06-02 | `v2.1` | **주요 변경(BREAKING)** | **flat payload 확정.** 실제 적재 데이터는 평탄 chunk payload(연구자 공통 메타 root 비정규화 + doc_type별 `doc_attrs{}`)이며 doc_type은 **정확히 5종**(`paper`/`patent`/`project`/`assessor_activity`/`specialty`)입니다. `recommendations[*].evidence[*].type`은 이 5종 또는 합성 `profile`이고, 식별자는 `chunk_id`(형식 `<doc_type>_<숫자doc_id>_c<NNN>`)입니다. `/search/candidates.candidates[*]`는 family boolean이 아니라 **`doc_types_present`(hit한 doc_type 문자열 목록)** 를 노출하며, `counts`는 flat root 단일 평가위원 카운트를 포함한 5개 키입니다. hard_filter는 flat root 키(`highest_degree`, root count `*_count_min`, `recent_years`+`recent_doc_types` on `doc_date`)입니다. `doc_attrs.*`는 필터/인덱스 대상이 아닙니다. |
 | 2026-06-04 | `pending` | 동작/trace 변경 | 검색 쿼리가 `SearchQueryPlan`으로 분리되었습니다. dense는 사용자 원문 중심 `dense_query`, SPLADE는 짧은 `sparse_joint_query`와 `sparse_<concept>` 보조 쿼리를 사용합니다. `trace.query_payload.search_query_plan`에 `raw_query`, `dense_query`, `sparse_joint_query`, `sparse_concept_queries`, `required_concepts`, `optional_concepts`가 노출됩니다. 검색 모드는 `grouped_hybrid_rrf`이며, 최종 연구자 후보는 `required_concepts` coverage gate를 통과해야 합니다. evidence 식별 기준은 Qdrant Point ID가 아니라 payload root `chunk_id`입니다. |
 
 ## v2.1 flat payload 확정 (실데이터 정합, 2026-06-02)
@@ -51,7 +52,7 @@
 
 ### D. hard_filter 키 (flat)
 
-- 모든 hard_filter 백엔드 경로는 flat root 또는 `doc_attrs.*`: `highest_degree`(root), `*_count_min`(root count, 단일 평가위원 `researcher_assessor_activity_count_min` 포함), `journal_class` → `doc_attrs.indexing_database`, `recent_years`+`recent_doc_types`는 root **`doc_date`(datetime)** 기준. (구 `researcher_meta.*` 중첩 경로, `event_year` 폐기)
+- 모든 hard_filter 백엔드 경로는 flat root: `highest_degree`, `*_count_min`(root count, 단일 평가위원 `researcher_assessor_activity_count_min` 포함), `recent_years`+`recent_doc_types`는 root **`doc_date`(datetime)** 기준. `doc_attrs.*`는 유동 상세 필드이므로 필터/인덱스 대상에서 제외한다. (구 `researcher_meta.*` 중첩 경로, `event_year` 폐기)
 - 다중 doc_type recency는 `min_should(min_count=1)` **OR**로 묶입니다(AND 0건 회귀 방지).
 
 ### 소비자 가이드

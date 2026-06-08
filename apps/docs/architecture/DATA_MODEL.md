@@ -80,7 +80,7 @@ payload는 **2개 영역**만 갖는다: (A) ROOT 평탄 필드(공통 식별 + 
 
 | 필드 | 타입 | 인덱스 | 용도 |
 |---|---|---|---|
-| `affiliated_organization` | keyword | ✅ | 소속 — include/제외 기관 필터 |
+| `affiliated_organization` | keyword | ✅ | 소속 — 앱단 include/exclude 기관 post-filter 기준 |
 | `highest_degree` | keyword | ✅ | 학위 hard filter |
 | `publication_count` | integer | ✅ | 최소 논문 수 필터 |
 | `scie_publication_count` | integer | ✅ | 최소 SCIE 수 필터 |
@@ -100,7 +100,7 @@ payload는 **2개 영역**만 갖는다: (A) ROOT 평탄 필드(공통 식별 + 
 
 | 키 | 비고 |
 |---|---|
-| `indexing_database` | 등재 DB(예: `SCIE`, `SCOPUS`, `NONE`). hard_filter `journal_class`가 이 키로 매핑됨 |
+| `indexing_database` | 등재 DB(예: `SCIE`, `SCOPUS`, `NONE`). 표시/근거용 passthrough이며 hard filter 대상이 아님 |
 | `journal_name` | 학술지명 |
 | `keywords` | 키워드(문자열, `;` 구분일 수 있음) |
 | `main_language_title` / `sub_language_title` | 논문명(주/부 언어) |
@@ -113,8 +113,8 @@ payload는 **2개 영역**만 갖는다: (A) ROOT 평탄 필드(공통 식별 + 
 |---|---|
 | `project_title_korean` / `project_title_english` | 과제명(국/영) |
 | `project_period` | `YYYY-MM-DD ~ YYYY-MM-DD` 문자열 |
-| `performing_organization` | 수행기관 — 교차-chunk 제외 기관 필터 후보 |
-| `managing_agency` | 관리(전문)기관 — 교차-chunk 제외 기관 필터 후보 |
+| `performing_organization` | 수행기관 — 과제 속성 passthrough, 소속기관 필터 대상 아님 |
+| `managing_agency` | 관리(전문)기관 — 과제 속성 passthrough, 소속기관 필터 대상 아님 |
 
 **patent** (known)
 
@@ -130,12 +130,12 @@ payload는 **2개 영역**만 갖는다: (A) ROOT 평탄 필드(공통 식별 + 
 
 **assessor_activity / specialty** (UNKNOWN — passthrough)
 
-> 이 두 doc_type의 `doc_attrs` 키 구성은 **현재 미상**이다. 본 API는 이를 **타입 없는 passthrough**로 취급한다:
+> `doc_attrs`는 doc_type별 유동 상세 영역이다. 본 API는 이를 **타입 없는 passthrough**로 취급한다:
 > - 스키마로 키를 강제하지 않는다(추측 키를 만들지 않는다).
 > - 필터/인덱스 대상으로 삼지 않는다(§5).
 > - title/date 파생은 best-effort이고, 1차 표시는 `chunk_text`를 사용한다(`apps/domain/chunk_view.py`).
 >
-> 실제 키가 확정되면 본 문서와 `chunk_view._TITLE_KEYS`/`_DATE_KEYS`를 함께 갱신한다.
+> 실제 키가 확정되더라도 hard filter로 승격하려면 flat root 정규화 필드를 별도로 추가하고 본 문서와 코드를 함께 갱신한다.
 
 ### 3.4 단일 `doc_date`와 recency
 
@@ -178,7 +178,7 @@ doc_type은 **정확히 5종**이며, 검색·집계·evidence에서 일관되�
 
 | 인덱스 종류 | 대상 필드 |
 |---|---|
-| keyword | `researcher_id`, `doc_type`, `affiliated_organization`, `highest_degree`, `doc_attrs.is_scie`, `doc_attrs.indexing_database`, `doc_attrs.intellectual_property_type`, `doc_attrs.application_registration_type`, `doc_attrs.application_country`, `doc_attrs.performing_organization`, `doc_attrs.managing_agency` |
+| keyword | `researcher_id`, `doc_type`, `affiliated_organization`, `highest_degree` |
 | integer | `publication_count`, `scie_publication_count`, `intellectual_property_count`, `research_project_count`, `researcher_assessor_activity_count` |
 | datetime | `doc_date` (`"NONE"`/결측은 range 비매칭 = recency 자동 제외) |
 | text (선택) | `chunk_text` — 운영 full-text 매칭이 필요할 때만 |
@@ -187,7 +187,7 @@ doc_type은 **정확히 5종**이며, 검색·집계·evidence에서 일관되�
 - 필터에 자주 쓰는 필드는 반드시 인덱스 대상.
 - exact match가 필요한 기관명/학위/구분값은 `keyword`.
 - 날짜·집계값은 임베딩에 녹이지 말고 payload 필터로 처리.
-- **assessor_activity/specialty의 `doc_attrs` 키는 미상이므로 인덱스 대상에서 제외**(passthrough).
+- **`doc_attrs.*`는 유동 필드이므로 인덱스/필터 대상에서 제외**(passthrough). `journal_class` 같은 조건은 root 누적값(`scie_publication_count_min`)으로 표현한다.
 
 ---
 
@@ -240,3 +240,4 @@ doc_type은 **정확히 5종**이며, 검색·집계·evidence에서 일관되�
 - **LLM은 후보를 재정렬·탈락·생성하지 않는다.** 주어진 후보 집합 위에서 근거를 인용해 판단만 한다.
 - **embedding 텍스트는 role/action 불용어를 배제한다.**
 - **evidence 참조 id == payload `chunk_id`.**
+- **hard filter는 flat root 필드만 사용한다.** `doc_attrs.*`는 표시/근거 passthrough이며 Qdrant 필터와 기관 post-filter 대상이 아니다.
