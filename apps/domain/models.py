@@ -313,6 +313,9 @@ class RecommendationDecision(BaseModel):
     profile_evidence: list[EvidenceItem] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     rank_score: float = 0.0
+    # 누적 실적 기준 데이터 공백(root count) + 사유가 서버 fallback으로 생성됐는지.
+    data_gaps: list[str] = Field(default_factory=list)
+    fallback_reason_used: bool = False
 
     @computed_field(return_type=list[str])
     @property

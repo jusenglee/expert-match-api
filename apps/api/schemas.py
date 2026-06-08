@@ -63,6 +63,10 @@ class RecommendationResponse(BaseModel):
     searched_branches: list[str] = Field(
         ..., description="Branches used during retrieval"
     )
+    doc_type_coverage: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Global doc_type coverage: searched vs matched vs missing across recommendations",
+    )
     retrieved_count: int = Field(..., description="Total retrieved candidate count")
     recommendations: list[RecommendationDecision] = Field(
         ..., description="Final recommendation decisions"

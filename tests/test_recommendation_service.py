@@ -635,6 +635,14 @@ def test_recommend_populates_match_score_and_evidence_summaries():
         "shown_evidence_count": 1,
         "profile_evidence_count": 0,
     }
+    # #8 per-candidate data_gaps + fallback 플래그
+    assert recommendation.data_gaps == list(cards[0].data_gaps)
+    assert recommendation.fallback_reason_used is False
+    # #9 전역 doc_type 커버리지(searched vs matched vs missing)
+    coverage = result["doc_type_coverage"]
+    assert coverage["matched"] == ["paper"]
+    assert "paper" in coverage["searched"] and "paper" not in coverage["missing"]
+    assert set(coverage["searched"]) == set(coverage["matched"]) | set(coverage["missing"])
 
 
 def test_recommend_trace_includes_strict_filter_exclusions():
@@ -1007,3 +1015,18 @@ def test_recommend_generates_fallback_reason_for_omitted_candidate():
             "resolved_evidence_ids": [_chunk_id("2")],
         }
     ]
+
+
+def test_calibrate_fit_clamps_to_coverage_band():
+    calibrate = RecommendationService._calibrate_fit
+    # joint(두 조건 동시충족) → 최소 중간(보통 불가)
+    assert calibrate("보통", coverage_type="joint") == "중간"
+    assert calibrate("높음", coverage_type="joint") == "높음"
+    # partial(일부 미충족) → 최대 중간(높음 불가)
+    assert calibrate("높음", coverage_type="partial") == "중간"
+    assert calibrate("보통", coverage_type="partial") == "보통"
+    # separate → 최대 중간(높음은 joint 전용)
+    assert calibrate("보통", coverage_type="separate") == "보통"
+    assert calibrate("높음", coverage_type="separate") == "중간"
+    # 미상/빈 coverage → 전 범위(클램프 없음)
+    assert calibrate("높음", coverage_type=None) == "높음"

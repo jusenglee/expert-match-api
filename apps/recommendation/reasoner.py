@@ -50,6 +50,7 @@ PRIMARY_PAYLOAD_PROFILE: dict[str, Any] = {
     "matched_keywords_limit": 5,
     "snippet_char_limit": 1000,
     "detail_char_limit": 200,
+    "profile_context_limit": 8,
 }
 
 RETRY_PAYLOAD_PROFILE: dict[str, Any] = {
@@ -61,6 +62,7 @@ RETRY_PAYLOAD_PROFILE: dict[str, Any] = {
     "matched_keywords_limit": 3,
     "snippet_char_limit": 280,
     "detail_char_limit": 120,
+    "profile_context_limit": 4,
 }
 
 
@@ -210,6 +212,7 @@ class OpenAICompatReasonGenerator:
         - **[중요]** 절대 없는 사실을 지어내지 마세요(환각 금지). 반드시 제공된 증거(`relevant_evidence`, `context_evidence`)의 내용에 기반하여 작성해야 합니다.
         - 각 증거는 `type`(paper/patent/project/assessor_activity/specialty)과 `evidence_id`를 갖습니다. 인용 시 반드시 제공된 `evidence_id` 문자열을 그대로 사용하세요.
         - 각 후보는 `matched_concepts`(시스템이 이미 충족으로 판정한 질의 조건)와 `missing_concepts`를 가지며, 각 증거는 `satisfied_concepts`(그 증거가 충족하는 조건)를 가집니다. 조건 id는 영문(예: ai=인공지능, semiconductor=반도체)일 수 있습니다.
+        - `profile_context`는 이 후보의 '질의에 직접 매칭되지는 않은' 다른 실적(참고 프로필)입니다. 후보를 과소평가하지 않도록 배경으로만 참고하세요. **`profile_context` 항목은 `selected_evidence_ids`에 넣지 말고, 질의를 직접 충족한 근거인 것처럼 단정하지 마세요.**
         - `counts`(누적 실적 수)는 보조적으로만 활용하세요.
 
         [출력 규칙]
@@ -217,6 +220,7 @@ class OpenAICompatReasonGenerator:
         - `recommendation_reason`은 1~2문장의 간결하고 구체적인 한국어 문장으로 작성하며, 320자를 넘지 마세요.
         - **추천 사유는 반드시 제공된 증거의 실적명이나 연구 내용을 언급하여 작성해야 합니다.**
         - **어떤 증거가 어떤 조건(concept)을 충족하는지 연결해 서술하세요** (예: 'OOO 과제로 반도체 설계를, △△△ 논문으로 인공지능을 충족'). 단, `matched_concepts`에 없는 조건을 충족했다고 주장하지 마세요(환각 금지).
+        - 질의에 직접 매칭된 근거가 적더라도 '실적이 부족하다'고 단정하지 마세요. 대신 '질의에 직접 매칭된 근거는 제한적'이라고 표현하고, `profile_context`에 관련 실적이 보이면 '프로필상 관련 실적 보유'를 함께 언급하세요.
         - `selected_evidence_ids`는 인용한 증거의 `evidence_id` 문자열을 그대로 포함시키세요 (최대 {MAX_SELECTED_EVIDENCE_IDS}개).
         - `selected_evidence_ids`에는 제공된 증거의 `evidence_id`(예: `paper_100000045256_c000`)만 넣으세요.
         - 적절한 직접 증거 ID가 없으면 `selected_evidence_ids`는 빈 배열(`[]`)로 두세요.
@@ -325,6 +329,26 @@ class OpenAICompatReasonGenerator:
                 )
         return out
 
+    @classmethod
+    def _serialize_profile_context(
+        cls, candidate: CandidateCard, *, limit: int, profile: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """질의에 직접 매칭되지 않은 '참고 프로필'(researcher hydration) — 배경용.
+
+        evidence_id를 부여하지 않는다(인용 금지). 사유가 매칭 근거만 보고 후보를 과소평가하지 않도록
+        배경 신호로만 제공한다.
+        """
+        out: list[dict[str, Any]] = []
+        for ev in candidate.profile_evidence[:limit]:
+            out.append(
+                {
+                    "type": ev.doc_type,
+                    "title": _truncate_text(ev.title, profile["detail_char_limit"]),
+                    "date": ev.date,
+                }
+            )
+        return out
+
     @staticmethod
     def _compact_retrieval_grounding(trace: dict[str, Any]) -> dict[str, Any]:
         if not trace:
@@ -387,6 +411,9 @@ class OpenAICompatReasonGenerator:
                     "context_evidence": cls._serialize_context(
                         candidate, limit=profile["context_limit"], profile=profile,
                         chunk_concepts=chunk_concepts,
+                    ),
+                    "profile_context": cls._serialize_profile_context(
+                        candidate, limit=profile.get("profile_context_limit", 8), profile=profile,
                     ),
                 }
             )

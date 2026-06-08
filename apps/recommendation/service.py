@@ -45,6 +45,16 @@ FINAL_SORT_POLICY = "rrf_score_desc_name_asc"
 REASON_GENERATION_BATCH_SIZE = 5
 MAX_USER_FACING_RESULTS = 15
 
+# fit 캘리브레이션: coverage_type 기반 deterministic 밴드로 LLM fit을 클램프(rubric).
+# joint(두 조건 동시충족 근거)=최소 중간, separate=전 범위, partial(일부 미충족)=높음 불가.
+_FIT_RANK: dict[str, int] = {"보통": 0, "중간": 1, "높음": 2}
+_RANK_FIT: dict[int, str] = {0: "보통", 1: "중간", 2: "높음"}
+_COVERAGE_FIT_BAND: dict[str, tuple[str, str]] = {
+    "joint": ("중간", "높음"),      # 한 근거가 두 조건 동시충족 → 최소 중간, '높음'은 joint 전용
+    "separate": ("보통", "중간"),   # 조건별 분리 충족 → 최대 중간(높음 아님)
+    "partial": ("보통", "중간"),    # 일부 미충족 → 최대 중간
+}
+
 
 def _sorted_filter_keys(filters: dict[str, Any] | None) -> list[str]:
     return sorted((filters or {}).keys())
@@ -796,6 +806,18 @@ class RecommendationService:
             "direct_evidence_count": len(direct_evidence),
         }
 
+    @staticmethod
+    def _calibrate_fit(fit: str, *, coverage_type: str | None) -> str:
+        """coverage_type 기반 deterministic 밴드로 LLM fit을 클램프(캘리브레이션 rubric).
+
+        질의 두 조건을 동시충족(joint)한 후보는 최소 '중간', 일부 미충족(partial)은 최대 '중간'으로
+        제한한다. LLM은 밴드 안에서만 자유 판정 → '충족인데 보통' / '미충족인데 높음' 모순 차단.
+        """
+        current = _FIT_RANK.get(fit, 0)
+        floor_label, ceiling_label = _COVERAGE_FIT_BAND.get(coverage_type or "", ("보통", "높음"))
+        clamped = min(max(current, _FIT_RANK[floor_label]), _FIT_RANK[ceiling_label])
+        return _RANK_FIT[clamped]
+
     @classmethod
     def _build_match_badges(
         cls, *, plan: PlannerOutput, match_details: dict[str, Any]
@@ -1102,6 +1124,7 @@ class RecommendationService:
             fit = "보통"
             recommendation_reason = ""
             risks = list(card.risks)
+            fallback_reason_used = False
             if generated is not None:
                 fit = generated.fit if generated.fit in {"높음", "중간", "보통"} else "보통"
                 recommendation_reason = generated.recommendation_reason
@@ -1112,6 +1135,8 @@ class RecommendationService:
                 relevant_bundle=relevant_bundle,
             )
             match_details = self._build_match_details(card=card, evidence=evidence)
+            # fit 캘리브레이션: coverage_type 밴드로 LLM fit을 클램프(충족인데 보통/미충족인데 높음 차단).
+            fit = self._calibrate_fit(fit, coverage_type=match_details.get("coverage_type"))
             match_badges = self._build_match_badges(
                 plan=plan,
                 match_details=match_details,
@@ -1137,6 +1162,7 @@ class RecommendationService:
             )
             selected_evidence_trace.append(evidence_trace)
             if not recommendation_reason:
+                fallback_reason_used = True
                 logger.warning(
                     "Recommendation reason is empty after reason generation: expert_id=%s fit=%s resolved_evidence_ids=%s fallback=%s",
                     card.expert_id,
@@ -1187,6 +1213,8 @@ class RecommendationService:
                     profile_evidence=profile_evidence,
                     risks=risks,
                     rank_score=card.rank_score,
+                    data_gaps=list(card.data_gaps),
+                    fallback_reason_used=fallback_reason_used,
                 )
             )
 
@@ -1227,10 +1255,26 @@ class RecommendationService:
         expanded_shadow_hits: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         merged_data_gaps = _merge_unique_strings(data_gaps)
+        # 전역 doc_type 커버리지: 검색 대상(전체) vs 실제 매칭 근거가 표시된 doc_type vs 미표시.
+        searched_doc_types = list(DOC_TYPES)
+        matched_doc_types = _merge_unique_strings(
+            [
+                doc_type
+                for rec in recommendations
+                for doc_type in (rec.match_details.get("matched_doc_types") or [])
+            ]
+        )
+        matched_set = set(matched_doc_types)
+        doc_type_coverage = {
+            "searched": searched_doc_types,
+            "matched": matched_doc_types,
+            "missing": [dt for dt in searched_doc_types if dt not in matched_set],
+        }
         return {
             "intent_summary": plan.intent_summary,
             "applied_filters": plan.hard_filters,
             "searched_branches": list(DOC_TYPES),
+            "doc_type_coverage": doc_type_coverage,
             "retrieved_count": retrieved_count,
             "recommendations": recommendations,
             "data_gaps": merged_data_gaps,

@@ -579,6 +579,7 @@ PLAYGROUND_HTML = dedent(
               <div class="stat-box"><span class="label">누적 과제</span><span class="value">${escapeHtml(counts.project_cnt ?? 0)}</span></div>
               <div class="stat-box"><span class="label">이번 매칭 근거</span><span class="value">${escapeHtml(data.matched_evidence_count ?? 0)}</span></div>
               <div class="stat-box"><span class="label">화면 표시 근거</span><span class="value">${escapeHtml(data.shown_evidence_count ?? 0)}</span></div>
+              <div class="stat-box"><span class="label">참고 프로필</span><span class="value">${escapeHtml(data.profile_evidence_count ?? 0)}</span></div>
             </div>
           `;
         }
@@ -605,6 +606,7 @@ PLAYGROUND_HTML = dedent(
                     escapeHtml(item.doc_type || '-'),
                     item.score != null ? `score ${escapeHtml(item.score)}` : '',
                     (item.concepts || []).length ? `concepts ${(item.concepts || []).map(escapeHtml).join(', ')}` : '',
+                    (item.display_only_concepts || []).length ? `제목만(미확정) ${(item.display_only_concepts || []).map(escapeHtml).join(', ')}` : '',
                     (item.sources || []).length ? `sources ${(item.sources || []).map(escapeHtml).join(', ')}` : ''
                   ].filter(Boolean).join(' · ');
                   return `<li style="margin-bottom: 0.6rem">
@@ -737,6 +739,11 @@ PLAYGROUND_HTML = dedent(
                       <summary>수행 증거 및 실적</summary>
                       ${renderEvidenceItems(r.evidence)}
                     </details>
+                    ${(r.profile_evidence && r.profile_evidence.length) ? `
+                    <details>
+                      <summary>참고 프로필 (질의 매칭 아님 · ${r.profile_evidence.length}건)</summary>
+                      ${renderEvidenceItems(r.profile_evidence)}
+                    </details>` : ''}
                   </div>
                 `).join('')}
               `;
