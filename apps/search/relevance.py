@@ -172,13 +172,7 @@ def resolve_concept_plan(plan: Any, raw_query: str) -> ConceptPlan:
 # chunk concept tagging (deterministic multi-signal)
 # ---------------------------------------------------------------------------
 def _payload_text(payload: ChunkPayload) -> str:
-    attr_values: list[Any] = []
-    for value in payload.doc_attrs.values():
-        if isinstance(value, (str, int, float)):
-            attr_values.append(value)
-        elif isinstance(value, (list, tuple, set)):
-            attr_values.extend(value)
-    return _normalize_text(payload.chunk_text, payload.doc_id, attr_values)
+    return _normalize_text(payload.chunk_text, payload.doc_id)
 
 
 def chunk_concept_signals(
@@ -189,7 +183,7 @@ def chunk_concept_signals(
 ) -> dict[str, set[str]]:
     """chunk의 concept별 신호 분류: confirmed / weak_only / view_only.
 
-    - confirmed: evidence_term이 chunk(text/title/doc_attrs)에 직접 등장 → concept 확정.
+    - confirmed: evidence_term이 chunk_text/doc_id에 직접 등장 → concept 확정.
     - weak_only: weak_term만 있고 evidence 없음 → 약신호(확정 X).
     - view_only: concept:<id> 검색 view에만 잡힘(evidence/weak 없음) → 약신호(확정 X).
     """

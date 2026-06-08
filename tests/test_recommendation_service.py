@@ -17,6 +17,7 @@ from apps.recommendation.reasoner import ReasonGenerationOutput, ReasonedCandida
 from apps.search.doc_types import DOC_TYPES
 from apps.recommendation.service import (
     EMPTY_RETRIEVAL_KEYWORDS_REASON,
+    MAX_USER_FACING_RESULTS,
     NO_MATCHING_CANDIDATE_REASON,
     RecommendationService,
 )
@@ -302,11 +303,68 @@ def test_search_candidates_logs_pipeline_stages(caplog):
     assert "후보 카드 생성 완료" in caplog.text
 
 
+def test_search_candidates_clamps_default_result_count_to_user_facing_maximum():
+    class LimitPlanner:
+        last_trace = {"mode": "test", "planner_retry_count": 0}
+
+        async def plan(self, **kwargs):
+            _ = kwargs
+            return PlannerOutput(
+                intent_summary="semiconductor experts",
+                retrieval_core=["semiconductor"],
+                core_keywords=["semiconductor"],
+                top_k=30,
+            )
+
+    class LimitRetriever:
+        async def search(self, **kwargs):
+            _ = kwargs
+            return RetrievalResult(
+                hits=[
+                    ResearcherCandidate(
+                        researcher_id=str(index),
+                        researcher_name=f"Candidate {index}",
+                        group_score=100.0 - index,
+                    )
+                    for index in range(1, 21)
+                ],
+                query_payload={"retrieval_mode": "multiview_flat_relevance"},
+                queries=CompiledQueries(stable="semiconductor", expanded="semiconductor"),
+                retrieval_keywords=["semiconductor"],
+                retrieval_score_traces=[],
+            )
+
+    class LimitCardBuilder:
+        def build_small_cards(self, hits, plan):
+            _ = plan
+            return [
+                _candidate_card(hit.researcher_id, hit.researcher_name or "", hit.group_score)
+                for hit in hits
+            ]
+
+    service = RecommendationService(
+        planner=LimitPlanner(),
+        retriever=LimitRetriever(),
+        filter_compiler=LoggingFilterCompiler(),
+        card_builder=LimitCardBuilder(),
+        evidence_selector=DummyEvidenceSelector(),
+        reason_generator=RecordingReasonGenerator(ReasonGenerationOutput()),
+        feedback_store=DummyFeedbackStore(),
+    )
+
+    result = asyncio.run(service.search_candidates(query="Recommend reviewers"))
+
+    assert result["top_k_used"] == MAX_USER_FACING_RESULTS
+    assert len(result["candidates"]) == MAX_USER_FACING_RESULTS
+    assert len(result["hits_with_support"]) == MAX_USER_FACING_RESULTS
+
+
 def _bind_search_result(
     service: RecommendationService,
     *,
     cards: list[CandidateCard],
     retrieved_count: int,
+    planner_top_k: int = 2,
     planner_trace: dict | None = None,
     retrieval_skipped_reason: str | None = None,
 ) -> None:
@@ -321,7 +379,7 @@ def _bind_search_result(
     ):
         _ = (filters_override, include_orgs, exclude_orgs, top_k)
         return {
-            "planner": _plan(),
+            "planner": _plan(top_k=planner_top_k),
             "planner_trace": planner_trace
             or {
                 "mode": "test",
@@ -447,6 +505,27 @@ def test_recommend_sends_only_top_k_to_reason_generator_and_preserves_order():
     )
     assert result["trace"]["reason_generation_trace"]["batch_count"] == 1
     assert result["searched_branches"] == list(DOC_TYPES)
+
+
+def test_recommend_clamps_planner_top_k_to_user_facing_maximum():
+    service, reason_generator, evidence_selector = _build_service(ReasonGenerationOutput())
+    cards = [
+        _candidate_card(str(index), f"Candidate {index}", 100.0 - index)
+        for index in range(1, 21)
+    ]
+    _bind_search_result(service, cards=cards, retrieved_count=20, planner_top_k=30)
+
+    result = asyncio.run(service.recommend(query="Recommend reviewers"))
+
+    expected_ids = [str(index) for index in range(1, MAX_USER_FACING_RESULTS + 1)]
+    assert result["trace"]["top_k_used"] == MAX_USER_FACING_RESULTS
+    assert [item.expert_id for item in result["recommendations"]] == expected_ids
+    assert evidence_selector.received_candidate_ids == [expected_ids]
+    assert reason_generator.received_candidate_ids == [
+        expected_ids[0:5],
+        expected_ids[5:10],
+        expected_ids[10:15],
+    ]
 
 
 def test_recommend_batches_reason_generation_and_preserves_global_order():

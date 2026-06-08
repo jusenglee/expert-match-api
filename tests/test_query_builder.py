@@ -98,7 +98,7 @@ def test_query_builder_derives_concept_fields_from_concept_plan():
     query_plan = builder.build_search_query_plan(raw_query, plan, concept_plan)
 
     assert query_plan.raw_query == raw_query
-    assert query_plan.dense_query == raw_query
+    assert query_plan.dense_query == "인공지능과 반도체 경험을 함께 보유한 연구자"
     # sparse_focus = concept label 중심 짧은 명사구(과확장 억제).
     assert query_plan.sparse_joint_query == "인공지능 반도체"
     assert set(query_plan.sparse_concept_queries) == {"ai", "semiconductor"}
@@ -122,3 +122,17 @@ def test_query_builder_without_concept_plan_leaves_concepts_empty():
     assert query_plan.sparse_concept_queries == {}
     assert "AI반도체" in query_plan.sparse_joint_query  # 키워드 폴백
     assert "경험" not in query_plan.sparse_joint_query   # 일반어 제거
+
+
+def test_query_builder_falls_back_to_raw_query_when_semantic_query_is_empty():
+    builder = QueryTextBuilder()
+    raw_query = "AI반도체 설계 경험 연구자"
+    plan = PlannerOutput(
+        intent_summary=raw_query,
+        retrieval_core=["AI반도체", "설계 경험"],
+        core_keywords=["AI반도체", "설계 경험"],
+    )
+
+    query_plan = builder.build_search_query_plan(raw_query, plan)
+
+    assert query_plan.dense_query == raw_query

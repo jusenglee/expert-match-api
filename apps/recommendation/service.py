@@ -43,6 +43,7 @@ EMPTY_RETRIEVAL_KEYWORDS_REASON = (
 )
 FINAL_SORT_POLICY = "rrf_score_desc_name_asc"
 REASON_GENERATION_BATCH_SIZE = 5
+MAX_USER_FACING_RESULTS = 15
 
 
 def _sorted_filter_keys(filters: dict[str, Any] | None) -> list[str]:
@@ -57,6 +58,13 @@ def _count_relevant_evidence_items(
     bundles: dict[str, RelevantEvidenceBundle],
 ) -> int:
     return sum(len(bundle.all_items()) for bundle in bundles.values())
+
+
+def _clamp_result_limit(value: int | None, *, default: int | None = None) -> int:
+    selected = value if value is not None else default
+    if selected is None:
+        return MAX_USER_FACING_RESULTS
+    return max(1, min(int(selected), MAX_USER_FACING_RESULTS))
 
 
 class RecommendationService:
@@ -158,6 +166,7 @@ class RecommendationService:
             )
 
         planner_trace = self._extract_component_trace(self.planner)
+        result_limit = _clamp_result_limit(top_k, default=plan.top_k)
         retrieval_keywords = QueryTextBuilder.normalize_keywords(
             plan.retrieval_core or plan.core_keywords
         )
@@ -213,6 +222,7 @@ class RecommendationService:
                 "raw_query": query,
                 "retrieval_skipped_reason": EMPTY_RETRIEVAL_KEYWORDS_REASON,
                 "final_sort_policy": FINAL_SORT_POLICY,
+                "top_k_used": result_limit,
                 "timers": {
                     "plan_ms": plan_timer.elapsed_ms,
                     "search_ms": 0.0,
@@ -247,13 +257,14 @@ class RecommendationService:
             retrieval_payload.get("final_hit_count"),
         )
 
-        display_hits = retrieval.hits[:top_k] if top_k is not None else retrieval.hits
+        display_hits = retrieval.hits[:result_limit]
         cards = self.card_builder.build_small_cards(display_hits, plan)
         logger.info(
-            "후보 카드 생성 완료: display_hits=%d cards=%d requested_top_k=%s total_retrieved=%d",
+            "후보 카드 생성 완료: display_hits=%d cards=%d requested_top_k=%s top_k_used=%d total_retrieved=%d",
             len(display_hits),
             len(cards),
             top_k,
+            result_limit,
             len(retrieval.hits),
         )
         return {
@@ -276,6 +287,7 @@ class RecommendationService:
             "raw_query": query,
             "retrieval_skipped_reason": None,
             "final_sort_policy": FINAL_SORT_POLICY,
+            "top_k_used": result_limit,
             "timers": {
                 "plan_ms": plan_timer.elapsed_ms,
                 "search_ms": search_timer.elapsed_ms,
@@ -316,7 +328,10 @@ class RecommendationService:
 
         plan: PlannerOutput = search_result["planner"]
         candidate_cards: list[CandidateCard] = search_result["candidates"]
-        top_k_used = top_k if top_k is not None else max(plan.top_k, 1)
+        top_k_used = int(
+            search_result.get("top_k_used")
+            or _clamp_result_limit(top_k, default=plan.top_k)
+        )
         shortlist = candidate_cards[:top_k_used]
 
         logger.info(

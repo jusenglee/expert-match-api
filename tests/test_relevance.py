@@ -157,15 +157,16 @@ def test_tag_chunk_concepts_via_alias_term_joint():
     assert tagged == ["ai", "semiconductor"]
 
 
-def test_tag_chunk_concepts_via_doc_attrs_only():
-    # 실데이터는 분별 용어가 chunk_text가 아니라 doc_attrs(제목/키워드)에만 있을 수 있다.
+def test_tag_chunk_concepts_does_not_confirm_from_doc_attrs_only():
+    # concept 확정은 chunk_text/doc_id의 직접 evidence만 사용한다. doc_attrs는 표시/상세 메타일 뿐
+    # required gate 확정 근거로 쓰지 않는다.
     plan = _ai_semi_plan()
     payload = _payload(
         "M1", "patent", "patent_1_c000",
         text="지식재산권명: 저전력 신호처리 회로 설계",  # chunk_text엔 반도체 alias 없음
         doc_attrs={"intellectual_property_title": "시스템반도체 집적회로 설계", "keywords": "반도체;집적회로"},
     )
-    assert tag_chunk_concepts(payload, view_concept_hits=set(), concept_plan=plan) == ["semiconductor"]
+    assert tag_chunk_concepts(payload, view_concept_hits=set(), concept_plan=plan) == []
 
 
 def test_tag_chunk_concepts_avoids_short_ascii_false_positive():

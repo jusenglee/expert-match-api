@@ -64,7 +64,7 @@ class CompiledQueries:
 class SearchQueryPlan:
     """검색 채널별 쿼리 정의.
 
-    raw/dense는 사용자의 원문 의미를 보존하고, sparse는 SPLADE 과확장을 줄이기 위해
+    dense는 planner semantic_query를 우선 사용하고, sparse는 SPLADE 과확장을 줄이기 위해
     짧은 자연문/명사구와 concept별 보조 문장으로 분리한다.
     """
 
@@ -117,7 +117,11 @@ class QueryTextBuilder:
         concept이 없으면 핵심 키워드로 폴백한다. concept 감지/검색문은 이 모듈에 하드코딩하지 않는다.
         """
         raw_query = " ".join(query.strip().split())
-        dense_query = raw_query or " ".join((plan.semantic_query or self.build_query_text(plan)).split())
+        dense_query = (
+            " ".join((plan.semantic_query or "").split())
+            or raw_query
+            or " ".join(self.build_query_text(plan).split())
+        )
 
         if concept_plan is not None:
             required_concepts = list(concept_plan.required)

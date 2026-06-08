@@ -2,7 +2,7 @@
 
 검증 계약:
 - search()는 view별 flat query_points를 1콜씩(dense_full + sparse_raw/focus + concept:<id>).
-  질의를 정규식으로 깎지 않고 원문을 dense/sparse_raw로 보존한다.
+  dense는 planner semantic_query를 우선 쓰고, sparse_raw는 원문을 보존한다.
 - 결과는 payload.chunk_id 기준 병합(point_id 아님). chunk 점수 = Σ view_weight × normalized rank.
 - chunk는 검색 후 concept 태깅(view hit ∪ alias). 후보 점수 = capped evidence score(relevance).
 - required_concepts 전부 충족(joint/separate)은 main tier, 부분충족(partial)은 fallback tier.
@@ -172,7 +172,7 @@ def test_sort_hits_breaks_ties_by_name_then_researcher_id():
 
 
 # ---------------------------------------------------------------------------
-# view shape — one flat query_points per view, raw query preserved
+# view shape — one flat query_points per view, semantic dense + raw sparse preserved
 # ---------------------------------------------------------------------------
 def test_search_runs_one_flat_query_per_view_dense_first():
     raw_query = "인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"
@@ -196,8 +196,8 @@ def test_search_runs_one_flat_query_per_view_dense_first():
         )
     )
 
-    # 질의 원문 보존: dense는 원문 그대로 임베드(regex 정제 없음).
-    assert dense_encoder.inputs == [raw_query]
+    # dense는 planner semantic_query를 우선 임베드한다.
+    assert dense_encoder.inputs == ["인공지능 반도체 경험 연구자"]
     # dense_full + sparse_raw + sparse_focus + concept:ai + concept:semiconductor = 5 view.
     assert len(client.calls) == 5
     assert client.calls[0]["using"] == DENSE_VECTOR_NAME
@@ -210,7 +210,7 @@ def test_search_runs_one_flat_query_per_view_dense_first():
         SEMI_VIEW_TEXT,
     ]
     assert result.query_payload["retrieval_mode"] == "multiview_flat_relevance"
-    assert result.query_payload["search_query_plan"]["dense_query"] == raw_query
+    assert result.query_payload["search_query_plan"]["dense_query"] == "인공지능 반도체 경험 연구자"
     assert result.query_payload["relevance_gate_active_concepts"] == ["ai", "semiconductor"]
     assert isinstance(result.queries, CompiledQueries)
 

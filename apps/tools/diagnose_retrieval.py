@@ -62,9 +62,9 @@ TITLE_KEYS = (
     "specific_specialty_name",
 )
 
-DEFAULT_QUERY = "자동차 관련 컨소시엄에 적합한 전기차 배터리 분야 전문가를 추천"
+DEFAULT_QUERY = "인공지능 분야와 관련된 반도체 설계 경험이 있는 연구자 추천" 
 DEFAULT_TARGET_CHUNK_ID = "paper_100003957045_c000"
-DIAGNOSTIC_LLM_REASONING_EFFORT = "high"
+DIAGNOSTIC_LLM_REASONING_EFFORT = "low"
 DIAGNOSTIC_LLM_INCLUDE_REASONING = False
 DIAGNOSTIC_LLM_DISABLE_THINKING = False
 
