@@ -40,7 +40,7 @@
 - `core_keywords`/`retrieval_core`는 검색에 안전한 도메인 명사·명사구만.
 - `role_terms`/`action_terms`("평가위원", "추천" 등)는 검색 텍스트(임베딩 입력)에 넣지 않는다(벡터 오염 방지).
 - `hard_filters`는 허용 키만 사용한다(아래 §1.1). 미허용 키는 검색 컴파일러가 무시한다.
-- 명시 요청 파라미터(`top_k`, `filters_override`, `exclude_orgs`)는 자연어 추출보다 우선.
+- 명시 요청 파라미터(`top_k`, `filters_override`, `exclude_orgs`, `search_mode`)는 자연어 추출보다 우선. `search_mode`는 검색 전략 선택용이며 §3 참조(기본 `multiview`).
 - 사용자 노출 결과 수는 최대 15명이다. 요청 `top_k`는 1~15만 허용하고, planner가 더 큰 `top_k`를 내도 런타임이 15로 clamp한다.
 - 출력이 무효이거나 `core_keywords`가 비면 1회 재시도, 그래도 비면 검색 생략.
 - planner는 doc_type on/off를 결정하지 않는다. 검색 대상 doc_type 축소는 운영 화이트리스트(`NTIS_RETRIEVAL_DOC_TYPES`)로만 한다.
@@ -91,13 +91,20 @@
 
 `QdrantHybridRetriever`는 컬렉션 1개(`researcher_recommend_v1` 또는 운영 override), 단일 dense named vector `vector_e5i`(1024, Cosine) + 단일 sparse named vector `vector_splade`를 사용한다.
 
-- **검색:** view별 flat `query_points`를 병렬 실행한다. view는 `dense_full`, `sparse_raw`, `sparse_focus`, `concept:<id>`로 구성된다.
+- **검색 모드 선택(`search_mode`, 요청별):** 요청 본문 `search_mode`로 회수/스코어링 전략을 고른다. 기본 `multiview`. 후처리(chunk_id 병합·concept gate·capped evidence 재점수·org post-filter·정렬)는 모든 모드 공통이다.
+  - `multiview`(기본): 아래 멀티뷰 경로. 고정 설계 제약(가중 RRF·리랭커 금지)을 따른다.
+  - `hybrid`: `dense_full` + `sparse_raw` 2뷰만 등수 기반 RRF로 융합(`hybrid_view_weights` 기본 1.0/1.0). focus/concept 뷰 미사용.
+  - `keyword_similarity`: SPLADE 1차 후보 풀(`keyword_first_stage_limit`) → 그 point id 집합 한정(`HasIdCondition`) dense 검색으로 **chunk 점수 = dense 유사도(raw)** 재정렬(2단계 cascade). 사용자 명시 선택 시에만 동작하는 opt-in 경로(리랭커 금지 기본 제약의 의도적 예외).
+  - 알 수 없는 값은 `multiview`로 폴백한다. 모드는 캐시 키에 포함돼 모드별 결과가 섞이지 않는다.
+- **검색:** view별 flat `query_points`를 병렬 실행한다. view는 `dense_full`, `sparse_raw`, `sparse_focus`, `concept:<id>`로 구성된다(`multiview` 기준).
 - **융합:** raw score를 더하지 않고 view별 등수 기반 RRF 점수(`rank → 1/(k+rank)`)와 view weight로 chunk 점수를 계산한다.
 - **chunk 병합:** 동일 근거는 Qdrant point id가 아니라 payload root `chunk_id` 기준으로 병합한다.
 - **concept 확정:** `required_concepts` 확인은 `chunk_text`/`doc_id`에 evidence term이 직접 등장할 때만 confirmed로 본다. `doc_attrs` 값은 표시·상세 메타로만 쓰며 concept 확정/gate 근거로 쓰지 않는다.
 - **연구자 coverage gate:** 남은 chunk들이 `required_concepts`를 모두 덮지 못하면 후보를 `reason="relevance_concepts_missing"`로 fallback/제거한다(운영 설정에 따라 fallback tier 유지 가능).
 - **집계:** 남은 chunk hit을 `researcher_id`로 묶어 capped evidence score를 계산한다. 점수는 required-concept best, balance, joint, capped support의 합이며, doc_type prior는 기본 equal이다.
-- `trace.query_payload`는 `search_query_plan`, `group_count`, `aggregated_candidate_count`, `relevance_gate_active_concepts`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`를 포함한다.
+- `trace.query_payload`는 검색 경로별로 다르게 구성된다:
+  - production `search()`(/recommend·/search/candidates): `retrieval_mode`, `search_mode`, `retrieval_keywords`, `search_query_plan`, `semantic_query`, `concept_plan`, `relevance_gate_enabled`, `relevance_gate_active_concepts`, `view_counts`, `merged_chunk_count`, `main_count`, `fallback_count`, `org_filtered_count`, `final_hit_count`, `weights`, `search_limits`, `timers`.
+  - 진단 전용 `search_grouped_diagnostic()`: `retrieval_mode`, `retrieval_keywords`, `search_query_plan`, `relevance_gate_active_concepts`, `group_count`, `aggregated_candidate_count`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`, `final_hit_count`, `timers`. (production 경로는 이 `group_count`/`aggregated_candidate_count`/`relevance_*_count`를 방출하지 않는다.)
 - `trace.query_payload`는 검색 키워드/텍스트만 노출하며 dense/sparse 벡터 값과 전체 payload는 노출하지 않는다.
 - 기관 include/exclude는 정규화된 root 필드가 없으므로 Qdrant exact pre-filter가 아니라 앱단 post-filter에서 root `affiliated_organization`만 기준으로 처리한다. `doc_attrs.performing_organization`/`managing_agency`는 과제 속성이며 소속 필터에 쓰지 않는다.
 
@@ -146,7 +153,8 @@
 
 **규칙:**
 - LLM은 후보 순위를 바꾸지 않고, 후보를 누락시키지 않으며, 새 ID를 만들지 않는다(re-rank/drop/invent 금지).
-- `selected_evidence_ids`는 제공된 풀의 **`chunk_id`를 정확히 복사**한다(형식 `<doc_type>_<숫자doc_id>_c<NNN>`, 예 `paper_100000045256_c000`). 풀에 없거나 형식이 깨진 id는 무효 처리되고 결정론적 fallback으로 evidence를 조립한다.
+- `selected_evidence_ids`는 LLM이 사유 문장에서 인용한 증거의 **`chunk_id`**다(형식 `<doc_type>_<숫자doc_id>_c<NNN>`, 예 `paper_100000045256_c000`). 이는 사유 작성용 인용 힌트이자 trace 기록 용도이며, **`recommendation.evidence` 조립에는 사용되지 않는다**(서버는 코덱 형식만 검증하고 풀 멤버십은 검증하지 않으며, 검증 결과는 trace에만 반영한다).
+- 최종 `recommendation.evidence`는 EvidenceSelector가 family별 캡으로 선별한 후보별 relevant chunk 풀 **전체**로 결정론적으로 조립한다(`selected_evidence_ids`와 무관). 따라서 사유가 인용한 증거는 항상 `evidence`에 포함되며(상위집합), 선별 풀이 빈 후보만 profile(또는 빈) fallback으로 대체한다.
 - 후보별 evidence는 LLM 전달 전 관련도 재랭크 + family별 캡이 적용된다.
 - 심사는 배치(`llm_judge_batch_size`, 기본 10) 단위 순차/병렬로 진행한다.
 

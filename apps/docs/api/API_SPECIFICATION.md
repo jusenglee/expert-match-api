@@ -26,12 +26,14 @@
 {
   "query": "인공지능 및 반도체 분야 박사급 평가위원 추천",
   "top_k": 5,
+  "search_mode": "multiview",
   "filters_override": { "highest_degree": "박사" },
   "exclude_orgs": ["A대학교", "B연구소"]
 }
 ```
 - `query` (string, 필수): 자연어 질의. 여러 줄은 `, `로 합쳐 단일 질의로 정규화.
 - `top_k` (integer, 선택): 반환 최대 인원 (1~15). 미지정 시 planner `top_k`를 따르되 런타임은 최대 15명으로 clamp한다.
+- `search_mode` (string, 선택): 검색 전략. `multiview`(기본, 멀티뷰 하이브리드) / `hybrid`(dense+SPLADE 단순 RRF) / `keyword_similarity`(SPLADE 키워드 1차 → dense 유사도 재정렬). 잘못된 값은 422. 자세한 동작은 [`DATA_CONTRACT.md §3`](DATA_CONTRACT.md).
 - `filters_override` (dict, 선택): hard filter 강제 지정(허용 키는 [`DATA_CONTRACT.md §1.1`](DATA_CONTRACT.md)).
 - `include_orgs` / `exclude_orgs` (list[string], 선택): 포함/배제 기관(root `affiliated_organization` 기준).
 
@@ -41,6 +43,11 @@
   "intent_summary": "AI·반도체 분야 박사 학위 평가위원",
   "applied_filters": { "highest_degree": "박사" },
   "searched_branches": ["paper", "patent", "project", "assessor_activity", "specialty"],
+  "doc_type_coverage": {
+    "searched": ["paper", "patent", "project", "assessor_activity", "specialty"],
+    "matched": ["project", "patent"],
+    "missing": ["paper", "assessor_activity", "specialty"]
+  },
   "retrieved_count": 27,
   "recommendations": [
     {
@@ -100,7 +107,8 @@
 **응답 필드:**
 - `intent_summary` (string): 추출된 의도 요약.
 - `applied_filters` (dict): 실제 검색에 적용된 hard filter.
-- `searched_branches` (list[string]): 검색 대상 doc_type 목록. 기본은 5종 전체(`paper`/`patent`/`project`/`assessor_activity`/`specialty`), 운영 화이트리스트(`NTIS_RETRIEVAL_DOC_TYPES`)로 축소 가능. *(필드명은 하위호환상 `searched_branches`로 유지되며, 값은 doc_type 문자열이다.)*
+- `searched_branches` (list[string]): 검색 대상 doc_type 목록. 항상 5종 전체(`paper`/`patent`/`project`/`assessor_activity`/`specialty`)를 반환한다(응답값은 고정 `list(DOC_TYPES)`이며, 운영 화이트리스트 `NTIS_RETRIEVAL_DOC_TYPES`는 내부 Qdrant 검색 필터에만 영향을 주고 이 필드는 줄이지 않는다). *(필드명은 하위호환상 `searched_branches`로 유지되며, 값은 doc_type 문자열이다.)*
+- `doc_type_coverage` (dict): 전역 doc_type 커버리지. `searched`(검색 대상 doc_type 전체), `matched`(추천 근거로 실제 매칭된 doc_type), `missing`(매칭되지 않은 doc_type)을 포함한다.
 - `retrieved_count` (integer): 필터·집계 후 랭킹된 연구자 후보 수.
 - `recommendations` (list[object]):
   - `rank` (integer): 1부터.
@@ -206,7 +214,7 @@
     "payload_indexes_present": true
   },
   "issues": [],
-  "collection_name": "ntis_researcher_chunks",
+  "collection_name": "researcher_recommend_v1",
   "sample_point_id": "11008395"
 }
 ```
@@ -218,7 +226,7 @@
 ```json
 {
   "status": "ok",
-  "collection_name": "ntis_researcher_chunks",
+  "collection_name": "researcher_recommend_v1",
   "searched_branches": ["paper", "patent", "project", "assessor_activity", "specialty"]
 }
 ```

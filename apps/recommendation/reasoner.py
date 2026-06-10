@@ -34,12 +34,20 @@ FIT_NORMAL = "보통"
 FIT_VALUES = {FIT_HIGH, FIT_MEDIUM, FIT_NORMAL}
 
 MAX_SELECTED_EVIDENCE_IDS = 4
+# recommendation_reason 서버측 상한(시스템 프롬프트 지시와 동일). LLM이 초과해도 결정론적으로 컷한다.
+REASON_MAX_CHARS = 320
 REASON_TOOL_NAME = "submit_recommendation_batch"
 REASON_GENERATION_MAX_TOKENS = 8192
 # evidence id == chunk_id 코덱: <doc_type>_<doc_id본문>_c<NNN>
 # doc_id 본문은 숫자(paper_100000045256_c000) 또는 연구자ID형(specialty_M1013800_c000) 모두 가능 → 끝의 _c<NNN>로만 앵커링.
 _DOC_TYPE_ALT = "|".join(re.escape(dt) for dt in DOC_TYPES)
 VALID_EVIDENCE_ID_PATTERN = re.compile(rf"^(?:{_DOC_TYPE_ALT})_.+_c\d+$")
+# recommendation_reason 본문에 누출된 chunk_id 토큰 제거용(비앵커). 괄호로 감싼 경우 괄호째,
+# 그렇지 않으면 토큰만 제거(주변 공백은 이후 collapse가 정리 → 단어가 붙지 않도록).
+_EVIDENCE_ID_CORE = rf"(?:{_DOC_TYPE_ALT})_[A-Za-z0-9]+_c\d+"
+_INLINE_EVIDENCE_ID_PATTERN = re.compile(
+    rf"[\(\[（]\s*{_EVIDENCE_ID_CORE}\s*[\)\]）]|{_EVIDENCE_ID_CORE}"
+)
 
 PRIMARY_PAYLOAD_PROFILE: dict[str, Any] = {
     "name": "primary",
@@ -93,6 +101,21 @@ def _truncate_text(value: Any, max_chars: int) -> str | None:
     if max_chars <= 3:
         return normalized[:max_chars]
     return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _strip_inline_evidence_ids(value: str) -> tuple[str, bool]:
+    """recommendation_reason 본문에 노출된 evidence_id(chunk_id) 토큰을 제거(결정론적 백스톱).
+
+    프롬프트가 본문 노출을 금지해도 모델이 어기는 경우를 대비한다. 토큰을 감싼 빈 괄호와
+    잔여 공백/구두점도 정리한다. 반환: (정리된 문자열, 제거 발생 여부).
+    """
+    stripped = _INLINE_EVIDENCE_ID_PATTERN.sub("", value)
+    if stripped == value:
+        return value, False
+    stripped = re.sub(r"[\(\[（]\s*[\)\]）]", "", stripped)  # 잔여 빈 괄호
+    stripped = re.sub(r"\s+([,\.\)\]）])", r"\1", stripped)  # 구두점 앞 공백
+    stripped = " ".join(stripped.split())
+    return stripped, True
 
 
 class ReasonedCandidate(BaseModel):
@@ -210,7 +233,7 @@ class OpenAICompatReasonGenerator:
         [배경 및 데이터 활용]
         - 이 후보자들은 시스템에 의해 질의와 관련된 인물로 이미 판별된 상태입니다.
         - **[중요]** 절대 없는 사실을 지어내지 마세요(환각 금지). 반드시 제공된 증거(`relevant_evidence`, `context_evidence`)의 내용에 기반하여 작성해야 합니다.
-        - 각 증거는 `type`(paper/patent/project/assessor_activity/specialty)과 `evidence_id`를 갖습니다. 인용 시 반드시 제공된 `evidence_id` 문자열을 그대로 사용하세요.
+        - 각 증거는 `type`(paper/patent/project/assessor_activity/specialty)과 `evidence_id`를 갖습니다. `evidence_id`는 내부 참조용이며 **오직 `selected_evidence_ids` 배열에만** 넣고, 추천 사유 본문(`recommendation_reason`)에는 절대 쓰지 마세요.
         - 각 후보는 `matched_concepts`(시스템이 이미 충족으로 판정한 질의 조건)와 `missing_concepts`를 가지며, 각 증거는 `satisfied_concepts`(그 증거가 충족하는 조건)를 가집니다. 조건 id는 영문(예: ai=인공지능, semiconductor=반도체)일 수 있습니다.
         - `profile_context`는 이 후보의 '질의에 직접 매칭되지는 않은' 다른 실적(참고 프로필)입니다. 후보를 과소평가하지 않도록 배경으로만 참고하세요. **`profile_context` 항목은 `selected_evidence_ids`에 넣지 말고, 질의를 직접 충족한 근거인 것처럼 단정하지 마세요.**
         - `counts`(누적 실적 수)는 보조적으로만 활용하세요.
@@ -218,13 +241,20 @@ class OpenAICompatReasonGenerator:
         [출력 규칙]
         - `fit`은 다음 중 하나여야 합니다: {FIT_HIGH}, {FIT_MEDIUM}, {FIT_NORMAL}
         - `recommendation_reason`은 1~2문장의 간결하고 구체적인 한국어 문장으로 작성하며, 320자를 넘지 마세요.
+        - **`recommendation_reason` 본문에는 `evidence_id`/chunk_id 같은 내부 식별자(예: `paper_100000045256_c000`)를 절대 쓰지 마세요. 식별자는 오직 `selected_evidence_ids`에만 넣습니다.**
         - **추천 사유는 반드시 제공된 증거의 실적명이나 연구 내용을 언급하여 작성해야 합니다.**
-        - **어떤 증거가 어떤 조건(concept)을 충족하는지 연결해 서술하세요** (예: 'OOO 과제로 반도체 설계를, △△△ 논문으로 인공지능을 충족'). 단, `matched_concepts`에 없는 조건을 충족했다고 주장하지 마세요(환각 금지).
+        - 어떤 실적이 질의의 어떤 요구를 뒷받침하는지 자연스러운 도메인 문장으로 녹여 서술하세요 (예: 'OOO 과제로 반도체 설계 역량을, △△△ 논문으로 인공지능 적용 경험을 보여줍니다'). 단, `matched_concepts`에 없는 요구를 충족했다고 주장하지 마세요(환각 금지).
+        - 자연스러운 한국어 산문으로 쓰고, 'concept'·'조건'·'핵심 개념을 충족' 같은 시스템 메타 용어나 영문 concept id(예: ai, semiconductor)를 본문에 그대로 노출하지 마세요. 실적명·연구 내용·역할 중심으로 서술하세요.
+        - 가능하면 서로 다른 유형의 실적을 2건 이상 엮고(특히 `assessor_activity` 심사 이력이 있으면 함께 언급), 단일 실적만 있으면 그 실적을 구체적으로 서술하세요(없는 실적은 만들지 말 것).
         - 질의에 직접 매칭된 근거가 적더라도 '실적이 부족하다'고 단정하지 마세요. 대신 '질의에 직접 매칭된 근거는 제한적'이라고 표현하고, `profile_context`에 관련 실적이 보이면 '프로필상 관련 실적 보유'를 함께 언급하세요.
         - `selected_evidence_ids`는 인용한 증거의 `evidence_id` 문자열을 그대로 포함시키세요 (최대 {MAX_SELECTED_EVIDENCE_IDS}개).
         - `selected_evidence_ids`에는 제공된 증거의 `evidence_id`(예: `paper_100000045256_c000`)만 넣으세요.
         - 적절한 직접 증거 ID가 없으면 `selected_evidence_ids`는 빈 배열(`[]`)로 두세요.
         - `risks`는 매우 짧고 사실적인 유의사항만 적거나 비워두세요.
+
+        [좋은 예 / 나쁜 예]
+        - 좋은 예: "서울시 화재취약지구 화재안전성 개선 연구로 건축소방 분야의 실증 연구를 수행했고, 소방청 자체평가위원회 위원으로 관련 정책 심의 경험을 보유하고 있습니다." (자연스러운 산문 + 다중 실적, 식별자/메타 용어 없음)
+        - 나쁜 예: "'…화재안전성능 평가…' 논문(paper_100000435395_c000)으로 건축소방 핵심 개념을 충족했습니다." (← evidence_id 본문 노출 + '핵심 개념을 충족' 같은 기계적 표현, 단일 실적)
 
         {output_instruction}
         """
@@ -432,6 +462,8 @@ class OpenAICompatReasonGenerator:
         empty_selected_evidence_candidate_ids: list[str] = []
         invalid_selected_evidence_candidate_ids: list[str] = []
         invalid_selected_evidence_ids_by_candidate: dict[str, list[str]] = {}
+        truncated_reason_candidate_ids: list[str] = []
+        leaked_reason_candidate_ids: list[str] = []
 
         for candidate in candidates:
             item = by_expert_id.get(candidate.expert_id)
@@ -451,6 +483,12 @@ class OpenAICompatReasonGenerator:
                 continue
 
             normalized_reason = " ".join(item.recommendation_reason.split())
+            normalized_reason, reason_id_stripped = _strip_inline_evidence_ids(normalized_reason)
+            if reason_id_stripped:
+                leaked_reason_candidate_ids.append(candidate.expert_id)
+            if len(normalized_reason) > REASON_MAX_CHARS:
+                normalized_reason = _truncate_text(normalized_reason, REASON_MAX_CHARS) or ""
+                truncated_reason_candidate_ids.append(candidate.expert_id)
             raw_selected_evidence_ids = [
                 " ".join(str(evidence_id).split())
                 for evidence_id in list(item.selected_evidence_ids)[:MAX_SELECTED_EVIDENCE_IDS]
@@ -493,6 +531,17 @@ class OpenAICompatReasonGenerator:
             logger.warning("Reason generator omitted candidates: missing=%s", missing_candidate_ids)
         if empty_reason_candidate_ids:
             logger.warning("Reason generator empty reasons: candidate_ids=%s", empty_reason_candidate_ids)
+        if truncated_reason_candidate_ids:
+            logger.warning(
+                "Reason generator truncated reasons over %d chars: candidate_ids=%s",
+                REASON_MAX_CHARS,
+                truncated_reason_candidate_ids,
+            )
+        if leaked_reason_candidate_ids:
+            logger.warning(
+                "Reason generator leaked evidence ids in prose (scrubbed): candidate_ids=%s",
+                leaked_reason_candidate_ids,
+            )
         if invalid_selected_evidence_candidate_ids:
             logger.warning(
                 "Reason generator invalid evidence ids: candidate_ids=%s invalid=%s",
@@ -509,6 +558,8 @@ class OpenAICompatReasonGenerator:
                 "empty_selected_evidence_candidate_ids": empty_selected_evidence_candidate_ids,
                 "invalid_selected_evidence_candidate_ids": invalid_selected_evidence_candidate_ids,
                 "invalid_selected_evidence_ids_by_candidate": invalid_selected_evidence_ids_by_candidate,
+                "truncated_reason_candidate_ids": truncated_reason_candidate_ids,
+                "leaked_reason_candidate_ids": leaked_reason_candidate_ids,
             },
         )
 
@@ -758,7 +809,8 @@ class OpenAICompatReasonGenerator:
                     retrieval_score_traces_by_expert_id=retrieval_score_traces_by_expert_id,
                     seed=retry_seed,
                     use_tools=True,
-                    profile=RETRY_PAYLOAD_PROFILE,
+                    # 재시도된 후보가 배치 동료보다 빈약해지지 않도록 PRIMARY 밀도로 재생성(소수만 재호출 → 토큰 안전).
+                    profile=PRIMARY_PAYLOAD_PROFILE,
                 )
                 primary_output, filled_ids = self._merge_targeted_retry(
                     primary_output, retry_output, incomplete_set

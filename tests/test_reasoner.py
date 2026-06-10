@@ -23,6 +23,8 @@ from apps.recommendation.reasoner import (
     MAX_SELECTED_EVIDENCE_IDS,
     REASON_TOOL_NAME,
     VALID_EVIDENCE_ID_PATTERN,
+    _INLINE_EVIDENCE_ID_PATTERN,
+    _strip_inline_evidence_ids,
     OpenAICompatReasonGenerator,
     PassThroughReasonGenerator,
     ReasonedCandidate,
@@ -168,6 +170,88 @@ def test_valid_evidence_id_pattern_accepts_flat_chunk_ids(evidence_id):
 )
 def test_valid_evidence_id_pattern_rejects_non_flat_ids(evidence_id):
     assert VALID_EVIDENCE_ID_PATTERN.fullmatch(evidence_id) is None
+
+
+# ---------------------------------------------------------------------------
+# _strip_inline_evidence_ids — 본문에 누출된 chunk_id 결정론적 제거(백스톱)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (
+            "'호텔건물 화재안전성 평가' 논문(paper_100000435395_c000)으로 건축소방을 다룹니다.",
+            "'호텔건물 화재안전성 평가' 논문으로 건축소방을 다룹니다.",
+        ),
+        (
+            "specialty_M1013800_c000 전문분야와 project_7_c123 과제를 보유.",
+            "전문분야와 과제를 보유.",
+        ),
+        (
+            "근거 [assessor_activity_900_c000] 가 있습니다.",
+            "근거 가 있습니다.",
+        ),
+        (
+            "관련 실적 paper_42_c000, 그리고 추가 검토.",
+            "관련 실적, 그리고 추가 검토.",
+        ),
+        (
+            "평가（paper_42_c001）결과를 제시.",  # 전각 괄호
+            "평가결과를 제시.",
+        ),
+        (
+            "핵심 근거: project_7_c123",  # 문자열 끝
+            "핵심 근거:",
+        ),
+    ],
+)
+def test_strip_inline_evidence_ids_removes_leaked_ids(raw, expected):
+    cleaned, changed = _strip_inline_evidence_ids(raw)
+    assert changed is True
+    assert cleaned == expected
+    assert _INLINE_EVIDENCE_ID_PATTERN.search(cleaned) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "paper_100000045256 형태는 chunk index가 없습니다.",  # _c<NNN> 없음
+        "project_abc 처럼 코덱 미충족은 그대로 둡니다.",  # _c<NNN> 없음
+        "스마트 제조 분야 연구를 수행했습니다.",  # 식별자 없음
+    ],
+)
+def test_strip_inline_evidence_ids_keeps_near_miss_text(text):
+    cleaned, changed = _strip_inline_evidence_ids(text)
+    assert changed is False
+    assert cleaned == text
+
+
+def test_strip_inline_evidence_ids_noop_when_clean():
+    text = "건축소방 분야 실증 연구를 수행했습니다."
+    cleaned, changed = _strip_inline_evidence_ids(text)
+    assert changed is False
+    assert cleaned == text
+
+
+def test_normalize_output_scrubs_leaked_id_from_reason():
+    candidate = _candidate("1", "후보", 1.0)
+    raw = ReasonGenerationOutput(
+        items=[
+            ReasonedCandidate(
+                expert_id="1",
+                fit=FIT_NORMAL,
+                recommendation_reason="해당 논문(paper_100000435395_c000)으로 건축소방을 다룹니다.",
+                selected_evidence_ids=["paper_100000435395_c000"],
+                risks=[],
+            )
+        ]
+    )
+    normalized, trace = OpenAICompatReasonGenerator._normalize_output(raw, [candidate])
+    reason = normalized.items[0].recommendation_reason
+    assert "paper_100000435395_c000" not in reason
+    assert reason == "해당 논문으로 건축소방을 다룹니다."
+    assert trace["leaked_reason_candidate_ids"] == ["1"]
 
 
 # ---------------------------------------------------------------------------

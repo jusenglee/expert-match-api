@@ -234,6 +234,18 @@ class Settings(BaseSettings):
     )
     view_rrf_k: int = 60  # view_rank_score = 1.0 / (view_rrf_k + rank0)
 
+    # 사용자 선택형 검색 모드별 파라미터(요청 search_mode로 선택, 기본=multiview).
+    # · multiview(기본): search_view_weights로 dense_full + sparse_raw/focus + concept 뷰 융합(현행).
+    # · hybrid: dense_full + sparse_raw 2뷰만 동일 RRF로 융합(단순 하이브리드). concept/focus 뷰 미사용.
+    #   기본 가중을 균등(1.0/1.0)으로 둬 multiview(sparse_raw=0.25 보조채널)와 의미 있게 구분한다.
+    # · keyword_similarity: SPLADE 희소로 1차 후보 풀을 회수한 뒤 그 집합 안에서만 dense 유사도로
+    #   재정렬(2단계 cascade). chunk 점수 = dense 유사도(raw), 뷰 융합 미사용.
+    hybrid_view_weights: dict[str, float] = Field(
+        default_factory=lambda: {"dense_full": 1.0, "sparse_raw": 1.0}
+    )
+    # keyword_similarity 1차(SPLADE) 후보 풀 상한. 이 풀로 dense 재정렬 대상을 한정(HasIdCondition).
+    keyword_first_stage_limit: int = 512
+
     # researcher capped evidence score 가중(단순 합산 금지).
     # joint=한 chunk가 required 다개념 동시충족 / balance=min(개념별 best) / concept=개념별 best 합 / support=보조 근거.
     researcher_score_weights: dict[str, float] = Field(

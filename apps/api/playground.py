@@ -183,11 +183,14 @@ PLAYGROUND_HTML = dedent(
           transition: border-color 0.2s, box-shadow 0.2s;
         }
 
-        textarea:focus, input:focus {
+        textarea:focus, input:focus, select:focus {
           outline: none;
           border-color: var(--accent);
           box-shadow: 0 0 0 3px var(--accent-glow);
         }
+
+        /* 드롭다운 옵션은 브라우저별로 부모 색을 무시하므로 테마 변수로 명시(다크/라이트 모두 가독). */
+        select option { background: var(--bg); color: var(--text-main); }
 
         textarea { min-height: 120px; resize: vertical; }
 
@@ -458,6 +461,15 @@ PLAYGROUND_HTML = dedent(
                 <input id="topKInput" type="number" min="1" max="15" placeholder="기본값 사용">
               </div>
 
+              <div class="input-group">
+                <label for="searchModeInput">검색 방식 (search_mode)</label>
+                <select id="searchModeInput">
+                  <option value="multiview" selected>멀티뷰 하이브리드 (기본)</option>
+                  <option value="hybrid">하이브리드 (dense + SPLADE)</option>
+                  <option value="keyword_similarity">키워드 검색 후 유사도 재정렬</option>
+                </select>
+              </div>
+
               <details>
                 <summary>고급 필터 설정</summary>
                 <div style="margin-top: 1rem">
@@ -698,6 +710,7 @@ PLAYGROUND_HTML = dedent(
           const payload = {
             query,
             top_k: parseInt($('topKInput').value) || undefined,
+            search_mode: $('searchModeInput').value,
             filters_override: $('filtersInput').value ? JSON.parse($('filtersInput').value) : {},
             include_orgs: $('includeInput').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean),
             exclude_orgs: $('excludeInput').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean)

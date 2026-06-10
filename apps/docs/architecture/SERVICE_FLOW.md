@@ -29,7 +29,13 @@
 
 `QueryTextBuilder`는 채널별 `SearchQueryPlan`을 만든다. dense는 planner `semantic_query`를 우선 사용하고(없으면 `raw_query` fallback), SPLADE는 원문 전체가 아니라 `sparse_raw`, 짧은 `sparse_joint_query`, concept별 `sparse_concept_queries`를 분리 사용한다. 예: `raw_query="인공지능 분야 전문성과 반도체 연구개발 또는 반도체 산업 경험을 가진 연구자"`, `semantic_query="인공지능과 반도체 경험을 함께 보유한 연구자"` → `dense_query=semantic_query`, `sparse_joint_query="인공지능 반도체 연구개발 산업 경험"`, concept query는 `ai`, `semiconductor`, `semiconductor_experience`로 분리한다.
 
-`QdrantHybridRetriever` 동작:
+**검색 모드 선택 (`search_mode`, 요청별):** 요청 본문의 `search_mode`로 검색 전략을 고른다(기본 `multiview`). 모든 모드는 동일한 후처리(chunk_id 병합 → concept 태깅/coverage gate → capped evidence 재점수 → org post-filter → 결정론적 정렬)를 공유하며, **회수/스코어링 단계만 다르다.**
+
+- `multiview`(기본): 아래 1~7 멀티뷰 경로(현행). 고정 설계 제약(가중 RRF·리랭커 금지)을 그대로 따른다.
+- `hybrid`: `dense_full` + `sparse_raw` 2뷰만 동일 등수 기반 RRF로 융합한다(`hybrid_view_weights` 기본 균등 1.0/1.0). `sparse_focus`/`concept:<id>` 뷰는 만들지 않는다.
+- `keyword_similarity`: SPLADE(`sparse_raw`)로 1차 후보 풀을 회수(`keyword_first_stage_limit`)한 뒤, 그 point id 집합으로만 한정(`HasIdCondition`)해 dense 검색을 돌려 **chunk 점수 = dense 유사도(raw)**로 재정렬한다(2단계 cascade, 순위 RRF 융합 미사용). 사용자가 명시 선택할 때만 동작하는 opt-in 경로다.
+
+`QdrantHybridRetriever` 동작(`multiview` 기준):
 
 1. **검색 — multiview flat:** view별 `query_points`를 실행한다. view는 `dense_full`, `sparse_raw`, `sparse_focus`, `concept:<id>`다.
 2. **chunk 병합/융합:** 동일 근거는 payload `chunk_id`로 병합하고, raw score가 아니라 view별 등수 기반 RRF 점수와 view weight로 chunk 점수를 계산한다.
@@ -59,7 +65,7 @@
 2. **evidence 선별:** 후보별 매칭 chunk을 doc_type별로 모아 `core_keywords`/query 관련도로 재랭크(cross-encoder → 모델 부재 시 lexical 강등). family별 top-N chunk만 LLM 입력 풀로 구성. 각 chunk은 `chunk_id`를 그대로 보존한다(evidence 참조 id == `chunk_id`).
 3. 최대 5명 단위 배치로 LLM에 전달. 입력 = 후보 머리(profile/flat 메타/평가이력 요약) + 선별 chunk 풀.
 4. LLM은 후보별 `fit`, `recommendation_reason`, `selected_evidence_ids`(=고른 `chunk_id`), `risks`를 반환.
-5. **검색 시 원본 순서 유지.** `selected_evidence_ids`로 최종 `recommendation.evidence`를 조립.
+5. **검색 시 원본 순서 유지.** 최종 `recommendation.evidence`는 2단계에서 선별한 후보별 relevant chunk 풀 **전체**로 결정론적으로 조립한다(`selected_evidence_ids`와 무관). `selected_evidence_ids`는 사유 문장 인용 힌트이자 trace 기록 전용이며 evidence 조립에는 쓰이지 않는다.
 6. LLM이 사유를 누락/공란으로 두면 서버가 chunk 근거 기반 보수적 fallback 사유를 결정론적으로 생성.
 7. 서버는 기존 추천 필드를 유지한 채 UI 보조 메타데이터(`match_badges`, `match_summary`, `match_details`, `score_explanation`, `evidence_summary`)를 additive로 채운다. `evidence_summary`는 연구자 누적 실적 count와 이번 질의 매칭 evidence 수를 분리한다.
 
@@ -82,14 +88,18 @@
 - `raw_query`, `planner_keywords`, `retrieval_keywords` — 원본 질의/추출/실제 검색 키워드
 - `reason_generation_trace` — 사유 생성 상세
 - `retrieval_score_traces` — 후보별 매칭 doc_type/chunk과 순위 근거
-- `query_payload.retrieval_mode` — `multiview_flat_relevance`
+- `query_payload.retrieval_mode` — 선택 모드에 따라 `multiview_flat_relevance`(multiview) / `hybrid_dense_sparse_rrf`(hybrid) / `keyword_then_dense_similarity`(keyword_similarity)
+- `query_payload.search_mode` — 요청이 선택한 모드 토큰(`multiview`/`hybrid`/`keyword_similarity`). 알 수 없는 값은 `multiview`로 폴백
+- `query_payload.view_counts` — view별 회수 chunk 수(keyword_similarity는 `sparse_keyword`/`dense_rerank` 단계 수)
 - `query_payload.search_query_plan` — raw/dense/sparse joint/concept query와 required/optional concept
 - `query_payload.retrieval_keywords` / `semantic_query` — planner 키워드/의미 문장
 - `branch_queries.stable` / `branch_queries.expanded` — trace 호환용 검색 텍스트. 현재는 dense query와 동일하다.
 - `query_payload.merged_chunk_count` / `main_count` / `fallback_count` — multiview 병합 및 tier 집계 수
-- `query_payload.relevance_gate_active_concepts` / `relevance_*_count` — concept coverage gate 동작
+- `query_payload.relevance_gate_enabled` / `relevance_gate_active_concepts` — concept coverage gate 활성 여부 및 active required concepts (production)
 - `strict_filter` — required concept gate 활성 여부와 `relevance_concepts_missing`으로 제외된 후보별 matched/missing concept
-- `query_payload.aggregated_candidate_count` — 연구자 집계 후 후보 수
+- `query_payload.concept_plan` — required/optional 개념과 그 출처(planner 우선 → query_exact 폴백), view_sources 목록
+- `query_payload.search_limits` — 모드별 탐색 제한값(`prefetch_limit`/`views` 또는 keyword_similarity의 `keyword_first_stage_limit`)
+- **진단 전용(production search()는 미방출):** `query_payload.group_count` / `aggregated_candidate_count` / `relevance_kept_chunk_count` / `relevance_dropped_chunk_count` / `relevance_filtered_candidate_count`는 `search_grouped_diagnostic` 경로에만 존재
 - `server_logs` — Trace ID + `METHOD /path` 컨텍스트의 단계별 한글 로그
 - `timers` — 구간별 실행 시간
 

@@ -111,8 +111,8 @@
    1) view별 query_points
       - dense_full: dense_query
       - sparse_raw: raw_query
-      - sparse_joint: sparse_joint_query
-      - sparse_<concept>: sparse_concept_queries
+      - sparse_focus: sparse_joint_query
+      - concept:<id>: sparse_concept_queries
       - 앱단 등수 기반 RRF 융합
    2) chunk gate: chunk_text/doc_id evidence term으로 필수 개념 확정(doc_attrs 값은 확정 근거 제외)
    3) researcher coverage gate: required_concepts를 모두 만족하는 연구자만 후보화
@@ -163,13 +163,13 @@ SearchQueryPlan = {
 ```
 
 1. **dense_full:** `dense_query`는 planner `semantic_query`를 우선 사용하고, 없을 때 사용자 원문으로 fallback한다.
-2. **sparse_joint:** `sparse_joint_query`는 SPLADE용 짧은 핵심 자연문/명사구다. `전문`, `분야`, `연구자`, `또는`, `상세` 같은 일반어를 제거하고, 예: `인공지능 반도체 연구개발 산업 경험`.
-3. **sparse_<concept>:** 필수 개념별 SPLADE 보조 검색으로 근거 chunk를 넓게 확보한다. 예: `ai`, `semiconductor`, `semiconductor_experience`.
+2. **sparse_focus:** view source 이름은 `sparse_focus`이며 텍스트는 `sparse_joint_query`(SPLADE용 짧은 핵심 자연문/명사구)다. `전문`, `분야`, `연구자`, `또는`, `상세` 같은 일반어를 제거하고, 예: `인공지능 반도체 연구개발 산업 경험`.
+3. **concept:<id>:** 필수 개념별 SPLADE 보조 검색으로 근거 chunk를 넓게 확보한다(view source 이름은 `concept:<id>`, 융합 weight 키는 `sparse_concept`). 예: `concept:ai`, `concept:semiconductor`, `concept:semiconductor_experience`.
 4. **multiview RRF:** dense 1개 + sparse 여러 개를 view별 `query_points`로 회수한 뒤, 앱단에서 view별 등수 기반 RRF로 chunk hit을 융합한다.
 
 > SPLADE에 사용자 원문을 그대로 넣으면 일반어가 과확장되고, 순수 키워드 나열은 OR 검색처럼 넓어진다. 따라서 SPLADE는 짧은 자연문/명사구, dense는 planner semantic_query 중심으로 분리한다.
 
-> v1.x의 "브랜치"는 v2.x에서 "doc_type(또는 family) 경로"로 대체된다. 현재 active 검색 모드는 `multiview_flat_relevance`이며, `keyword_pool_then_hybrid`의 1차 후보 풀 단계는 사용하지 않는다.
+> v1.x의 "브랜치"는 v2.x에서 "doc_type(또는 family) 경로"로 대체된다. 기본 검색 모드는 `multiview`(retrieval_mode=`multiview_flat_relevance`)다. 구 `keyword_pool_then_hybrid`의 1차 후보 풀 아이디어는 사용자 선택형 `keyword_similarity` 모드(retrieval_mode=`keyword_then_dense_similarity`)로 재설계되어 opt-in으로만 동작한다(§6.5).
 
 ### 5.3 연구자 집계 (v2.x 핵심)
 chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
@@ -210,6 +210,18 @@ chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
 ### 6.4 evidence cross-encoder 리랭커: 1급 채택
 chunk이 1급 단위가 되면서 evidence 선별에 cross-encoder가 자연스럽게 맞는다. 후보 **내부** chunk을 query 관련도로 재랭크해 family별 top-N만 LLM에 넘긴다(모델 부재 시 lexical 자동 강등). 목적은 **토큰 절감 + grounding 품질 + 정규화**이며 **후보 순위에는 영향을 주지 않는다**. ([`../api/REASONER_RUNTIME_POLICY.md`](../api/REASONER_RUNTIME_POLICY.md))
 
+### 6.5 사용자 선택형 검색 모드 (`search_mode`, 요청별 opt-in)
+요청 본문 `search_mode`로 회수/스코어링 전략을 고른다(기본 `multiview`). 후처리(chunk_id 병합·concept gate·capped evidence 재점수·org post-filter·결정론적 정렬·LLM no-rerank)는 모든 모드 공통이며, **회수와 chunk 점수 산출 방식만** 달라진다.
+
+| 모드 | 회수 | chunk 점수 | 고정 제약과의 관계 |
+|---|---|---|---|
+| `multiview`(기본) | dense_full + sparse_raw/focus + concept 멀티뷰 | view별 등수 RRF × view weight | §6.1~6.3 제약 그대로 유지 |
+| `hybrid` | dense_full + sparse_raw 2뷰 | 등수 RRF × 균등 가중(`hybrid_view_weights` 1.0/1.0) | equal RRF 유지(가중 RRF 아님) |
+| `keyword_similarity` | SPLADE 1차 풀 → 그 id 집합 한정 dense | **dense 유사도(raw)** | cascade 재정렬 = 기본 "리랭커 금지"의 **명시적 예외**(사용자가 선택할 때만) |
+
+- **결정:** 기본값 `multiview`는 §2/§6의 고정 제약(가중 RRF·리랭커 금지)을 **변함없이** 유지한다. `hybrid`/`keyword_similarity`는 사용자가 요청에서 명시 선택해야만 동작하는 opt-in 대체 전략이다. 특히 `keyword_similarity`의 dense 재정렬은 cascade 리랭크 성격이라 기본 제약을 비켜가므로 **기본 경로로 승격하지 않는다.**
+- **이유:** 기본 추천 품질의 토대는 단순·결정론적으로 유지하되(§6.3), 운영/실험이 다른 회수 전략을 비교할 수 있게 레버를 설계에 명시한다. 모드는 L3 캐시 키에 포함돼 모드별 결과가 섞이지 않는다.
+
 ---
 
 ## 7. LLM 추천 전략
@@ -229,7 +241,7 @@ chunk이 1급 단위가 되면서 evidence 선별에 cross-encoder가 자연스�
 - 질문에 없는 조건 추가 금지 / hard filter 미충족 후보 추천 금지.
 - 동일 근거 반복 금지 / 1·2순위 비교 문장 포함.
 - `rank_score`는 상대 RRF 점수이며 절대 적합도 백분율이 아님을 명시.
-- `selected_evidence_ids`는 제공된 `chunk_id`만 그대로 인용(코덱 `<doc_type>_<숫자doc_id>_c<NNN>`). 새 id 생성 금지.
+- `selected_evidence_ids`는 제공된 `chunk_id`만 그대로 인용(코덱 `<doc_type>_<숫자doc_id>_c<NNN>`). 새 id 생성 금지. 단, 이는 사유 문장의 인용 힌트·trace 용도이며, 최종 `recommendation.evidence`는 selector가 선별한 relevant 풀 전체로 결정론적으로 조립된다(선택 id가 evidence를 좌우하지 않음).
 
 ---
 

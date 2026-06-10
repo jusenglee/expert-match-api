@@ -6,6 +6,7 @@ from apps.domain.models import (
     CandidateCard,
     ChunkEvidence,
     ConceptSpec,
+    EvidenceItem,
     PlannerOutput,
     RecommendationDecision,
     ResearcherCandidate,
@@ -405,8 +406,9 @@ def _bind_search_result(
         include_orgs=None,
         exclude_orgs=None,
         top_k=None,
+        search_mode="multiview",
     ):
-        _ = (filters_override, include_orgs, exclude_orgs, top_k)
+        _ = (filters_override, include_orgs, exclude_orgs, top_k, search_mode)
         default_query_payload = {"prefetch": [], "query_filter": None, "query": "rrf"}
         return {
             "planner": planner_output or _plan(top_k=planner_top_k),
@@ -1028,5 +1030,53 @@ def test_calibrate_fit_clamps_to_coverage_band():
     # separate → 최대 중간(높음은 joint 전용)
     assert calibrate("보통", coverage_type="separate") == "보통"
     assert calibrate("높음", coverage_type="separate") == "중간"
-    # 미상/빈 coverage → 전 범위(클램프 없음)
-    assert calibrate("높음", coverage_type=None) == "높음"
+    # 미상/빈 coverage(개념 미감지 generic 질의) → 최대 중간(높음은 joint 전용)
+    assert calibrate("높음", coverage_type=None) == "중간"
+    assert calibrate("높음", coverage_type="") == "중간"
+    assert calibrate("보통", coverage_type=None) == "보통"
+
+
+def test_server_fallback_reason_multi_evidence_is_confident():
+    # 후보가 직접 근거 ≥2건(LLM이 누락했을 뿐)이면 '제한적'으로 깎지 않고 자신감 있게 서술.
+    reason = RecommendationService._build_server_fallback_reason(
+        evidence=[
+            EvidenceItem(type="project", title="화재안전 개선 연구", chunk_id="project_1_c000"),
+            EvidenceItem(type="assessor_activity", title="소방청 평가위원", chunk_id="assessor_activity_2_c000"),
+        ],
+        fallback="selected_evidence",
+        match_summary="화재안전 근거가 확인되었습니다.",
+    )
+    assert "제한적" not in reason
+    assert "추가 검토" not in reason
+    assert "화재안전 개선 연구" in reason and "소방청 평가위원" in reason
+    assert reason.endswith("관련 실적이 확인됩니다.")
+
+
+def test_server_fallback_reason_references_up_to_three_diverse_types():
+    # 같은 doc_type 다수 + 다른 타입 → 타입 다양성 우선으로 최대 3건 인용.
+    reason = RecommendationService._build_server_fallback_reason(
+        evidence=[
+            EvidenceItem(type="paper", title="논문 A", chunk_id="paper_1_c000"),
+            EvidenceItem(type="paper", title="논문 B", chunk_id="paper_2_c000"),
+            EvidenceItem(type="paper", title="논문 C", chunk_id="paper_3_c000"),
+            EvidenceItem(type="project", title="과제 D", chunk_id="project_4_c000"),
+            EvidenceItem(type="patent", title="특허 E", chunk_id="patent_5_c000"),
+        ],
+        fallback="selected_evidence",
+        match_summary="",
+    )
+    # 타입 다양성 우선: 논문 A → 과제 D → 특허 E (각 타입 1건씩), 3건에서 종료.
+    assert "논문 A" in reason and "과제 D" in reason and "특허 E" in reason
+    assert "논문 B" not in reason and "논문 C" not in reason
+    assert "제한적" not in reason
+
+
+def test_server_fallback_reason_single_evidence_flags_review():
+    # 직접 근거 1건뿐이면 정직하게 추가 검토 권고를 유지.
+    reason = RecommendationService._build_server_fallback_reason(
+        evidence=[EvidenceItem(type="paper", title="논문 C", chunk_id="paper_1_c000")],
+        fallback="selected_evidence",
+        match_summary="",
+    )
+    assert "논문 C" in reason
+    assert "추가 검토가 권장됩니다" in reason

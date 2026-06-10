@@ -409,6 +409,7 @@ def create_app(
             include_orgs=request.include_orgs,
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
+            search_mode=request.search_mode,
         )
         trace = result.get("trace") or {}
         logger.info(
@@ -445,6 +446,7 @@ def create_app(
                     include_orgs=request.include_orgs,
                     exclude_orgs=request.exclude_orgs,
                     top_k=request.top_k,
+                    search_mode=request.search_mode,
                 ):
                     yield event_chunk
             except Exception as e:
@@ -477,6 +479,7 @@ def create_app(
             include_orgs=request.include_orgs,
             exclude_orgs=request.exclude_orgs,
             top_k=request.top_k,
+            search_mode=request.search_mode,
         )
 
         # 캡처된 로그 주입

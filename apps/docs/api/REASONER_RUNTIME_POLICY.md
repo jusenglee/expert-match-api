@@ -58,11 +58,13 @@ The public recommendation response schema is unchanged in shape (see [`API_SPECI
 Evidence ID policy (v2.x):
 
 - `selected_evidence_ids` MUST copy provided `chunk_id` values exactly.
-- A `chunk_id` follows the codec `<doc_type>_<numeric_doc_id>_c<NNN>` (e.g. `paper_100000045256_c000`); the `<NNN>` chunk index is zero-padded to 3 digits. The owning doc is `doc_id = <doc_type>_<numeric_doc_id>`.
-- Valid id is any `chunk_id` present in the candidate's provided evidence pool. There is no positional format (`paper:N` is removed). The server enforces the codec with the regex `^(?:paper|patent|project|assessor_activity|specialty)_\d+_c\d+$` and discards ids that fail it.
-- If no direct evidence can be selected, the model returns an empty `selected_evidence_ids` array instead of inventing ids.
-- The server resolves final `recommendation.evidence` from the selected `chunk_id`s; invalid or unresolved ids fall back deterministically to the highest-ranked chunks of the candidate.
-- Up to `4` evidence ids may be selected per candidate (`MAX_SELECTED_EVIDENCE_IDS`).
+- A `chunk_id` follows the codec `<doc_type>_<doc_id_body>_c<NNN>`; the `<NNN>` chunk index is zero-padded to 3 digits and the codec is anchored ONLY by the trailing `_c<NNN>`. `<doc_id_body>` may be numeric (`paper_100000045256_c000`) or a researcher-id form (`specialty_M1013800_c000`). The owning doc is `doc_id = <doc_type>_<doc_id_body>`.
+- There is no positional format (`paper:N` is removed). The server enforces **only the codec** on returned ids with the regex `^(?:paper|patent|project|assessor_activity|specialty)_.+_c\d+$` (the middle doc_id body is `.+`, anchored only by the trailing `_c<NNN>`) and records ids that fail it in trace. Pool membership is **not** enforced, because `selected_evidence_ids` does not drive evidence assembly (see below).
+- If no direct evidence can be cited, the model returns an empty `selected_evidence_ids` array instead of inventing ids.
+- The final `recommendation.evidence` is assembled deterministically from each candidate's selector-built relevant chunk pool (the full family-capped bundle), **independent of `selected_evidence_ids`**. `selected_evidence_ids` is only a citation hint for grounding the reason text and is recorded in trace; it never assembles or filters `recommendation.evidence`. Only candidates whose relevant pool is empty fall back to profile (or empty) evidence.
+- Up to `4` evidence ids may be cited per candidate (`MAX_SELECTED_EVIDENCE_IDS`).
+- `recommendation_reason` is truncated server-side to `320` characters (`REASON_MAX_CHARS`, suffix `...`) when the model exceeds it; affected candidates are recorded in trace.
+- The server also strips any leaked evidence_id/chunk_id token from `recommendation_reason` prose (deterministic backstop; the model is instructed to keep ids only in `selected_evidence_ids`). Scrubbed candidates are recorded in trace.
 
 ## Trace Signals
 
@@ -70,13 +72,15 @@ Batch-level: `mode`, `retry_count`, `returned_ratio`, `prompt_budget_mode`, `tri
 
 Top-level: `reason_generation_trace.reason_generation_failed`, `reason_generation_trace.server_fallback_reasons`.
 
-Per-candidate evidence-resolution:
-- `selected_evidence_ids` (chunk_ids returned by the model)
-- `resolver_available_evidence_ids` (chunk_ids actually offered to the model)
-- `invalid_selected_evidence_ids` (ids not present in the pool or failing the chunk_id codec)
-- `resolved_evidence_ids`
-- `relevant_bundle_empty`
-- `fallback`
+Per-candidate evidence resolution (`reason_generation_trace.batches[*]` for model output, `reason_generation_trace.selected_evidence[*]` for assembly):
+- `provided_evidence_ids` (chunk_ids of the candidate's selector-built relevant pool — these become `recommendation.evidence`)
+- `selected_evidence_ids` (chunk_ids the model cited; tracking only — not used to assemble or filter evidence)
+- `resolved_evidence_ids` (chunk_ids actually emitted as `recommendation.evidence`; equals `provided_evidence_ids`, or `["profile"]`/`[]` on fallback)
+- `fallback` (`none` | `profile` | `empty`)
+- `invalid_selected_evidence_ids_by_candidate` (model-returned ids failing the chunk_id codec; trace only)
+- `empty_selected_evidence_candidate_ids`, `empty_reason_candidate_ids`, `missing_candidate_ids`
+- `truncated_reason_candidate_ids` (reasons truncated to the 320-char server cap)
+- `leaked_reason_candidate_ids` (candidates whose prose had a leaked evidence_id stripped)
 
 ## Notes
 

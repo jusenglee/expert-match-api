@@ -339,6 +339,16 @@ class OpenAICompatChatModel(BaseChatModel):
         )
 
         msg = response.choices[0].message if response.choices else None
+        finish_reason = (
+            getattr(response.choices[0], "finish_reason", None) if response.choices else None
+        )
+        if finish_reason == "length":
+            logger.warning(
+                "[openai_compat_llm] non-stream completion truncated by token limit: request_id=%s model=%s request_max_tokens=%s — downstream tool-call/JSON parsing or later batch items may be incomplete",
+                request_id,
+                self.model_name,
+                request_kwargs.get("max_tokens"),
+            )
         content = (getattr(msg, "content", None) if msg is not None else None) or ""
         tool_calls = self._serialize_tool_calls(
             getattr(msg, "tool_calls", None) if msg is not None else None

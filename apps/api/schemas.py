@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from apps.domain.models import RecommendationDecision
+
+# 사용자 선택형 검색 모드(요청별). 기본=multiview(현행 멀티뷰 하이브리드).
+# · multiview: dense_full + sparse_raw/focus + concept 멀티뷰 RRF 융합(기존).
+# · hybrid: dense + SPLADE 단일 뷰 단순 RRF 융합.
+# · keyword_similarity: SPLADE 키워드 1차 후보 → 그 안에서 dense 유사도로만 재정렬(2단계).
+SearchMode = Literal["multiview", "hybrid", "keyword_similarity"]
 
 
 class RecommendationRequest(BaseModel):
@@ -15,6 +21,14 @@ class RecommendationRequest(BaseModel):
     query: str = Field(..., description="Natural-language recommendation query")
     top_k: int | None = Field(
         default=None, ge=1, le=15, description="Maximum number of returned results"
+    )
+    search_mode: SearchMode = Field(
+        default="multiview",
+        description=(
+            "Retrieval strategy: 'multiview'(default multiview hybrid), "
+            "'hybrid'(dense+SPLADE simple RRF), "
+            "'keyword_similarity'(SPLADE keyword shortlist then dense-similarity rerank)"
+        ),
     )
     filters_override: dict[str, Any] = Field(
         default_factory=dict, description="Explicit search filter overrides"

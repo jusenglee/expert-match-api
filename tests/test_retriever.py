@@ -13,6 +13,7 @@
 import asyncio
 from types import SimpleNamespace
 
+from apps.core.cache import RetrievalResultCache
 from apps.core.config import Settings
 from apps.domain.models import ConceptSpec, PlannerOutput, ResearcherCandidate
 from apps.search.query_builder import CompiledQueries, QueryTextBuilder
@@ -400,6 +401,62 @@ def test_search_org_filter_ignores_project_doc_attrs_organizations():
     assert result.filtered_out_candidates == []
 
 
+def test_l3_cache_does_not_bypass_org_filter(tmp_path):
+    """회귀: L3 캐시 적중이 include/exclude org 필터를 우회하면 안 된다.
+
+    버그(수정 전): 캐시 키가 org를 빼고 (compiled_json|filter_json|snapshot)만으로 구성돼,
+    무필터 질의가 캐시한 결과를 exclude_orgs 요청이 그대로 재사용 → 제외 대상이 결과에 남았다.
+    """
+    points = [
+        (_chunk_payload("1", "Keep", text="인공지능 반도체", organization="서울대학교"), 0.9),
+        (_chunk_payload("2", "Drop", text="인공지능 반도체", organization="한국전자통신연구원"), 0.9),
+    ]
+    client = FakeFlatClient(default_points=points)
+    retriever = QdrantHybridRetriever(
+        client=client,
+        settings=_settings(cache_enabled=True),
+        dense_encoder=RecordingDenseEncoder(),
+        query_builder=QueryTextBuilder(),
+        l3_cache=RetrievalResultCache(tmp_path),
+    )
+
+    base_plan = dict(
+        intent_summary="x",
+        retrieval_core=["인공지능", "반도체"],
+        core_keywords=["인공지능", "반도체"],
+    )
+
+    # 1) 무필터 질의 → 두 후보 모두 회수되고 L3에 캐시된다.
+    first = asyncio.run(
+        retriever.search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(**base_plan),
+            query_filter=None,
+        )
+    )
+    assert {hit.researcher_id for hit in first.hits} == {"1", "2"}
+
+    # 2) 같은 질의 + exclude_orgs → 캐시 적중이어도 제외 대상이 남으면 안 된다.
+    excluded = asyncio.run(
+        retriever.search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(exclude_orgs=["한국전자통신연구원"], **base_plan),
+            query_filter=None,
+        )
+    )
+    assert {hit.researcher_id for hit in excluded.hits} == {"1"}
+
+    # 3) 같은 질의 + include_orgs → 소속 일치 후보만 남아야 한다.
+    included = asyncio.run(
+        retriever.search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(include_orgs=["서울대학교"], **base_plan),
+            query_filter=None,
+        )
+    )
+    assert {hit.researcher_id for hit in included.hits} == {"1"}
+
+
 def test_search_skips_invalid_points():
     points = [
         ({"researcher_id": "bad", "researcher_name": "Broken"}, 0.9),  # chunk_id/doc_type 없음
@@ -451,6 +508,123 @@ def test_search_weighted_is_multiview_alias():
     assert result.query_payload["retrieval_mode"] == "multiview_flat_relevance"
     assert client.calls  # flat 검색 사용
     assert client.group_calls == []  # grouped 미사용
+
+
+# ---------------------------------------------------------------------------
+# 사용자 선택형 검색 모드 (search_mode)
+# ---------------------------------------------------------------------------
+def test_hybrid_mode_uses_dense_plus_single_sparse_view():
+    raw = "인공지능 반도체 연구자"
+    dense_encoder = RecordingDenseEncoder()
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Alpha", text="인공지능 반도체"), 0.9)])
+    retriever = QdrantHybridRetriever(
+        client=client, settings=_settings(),
+        dense_encoder=dense_encoder, query_builder=QueryTextBuilder(),
+    )
+    result = asyncio.run(
+        retriever.search(
+            query=raw,
+            plan=PlannerOutput(
+                intent_summary=raw,
+                retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"],
+                concept_specs=AI_SEMI_SPECS,
+            ),
+            query_filter=None,
+            search_mode="hybrid",
+        )
+    )
+
+    # hybrid = dense_full + sparse_raw 2뷰만(focus/concept 뷰 미사용).
+    assert len(client.calls) == 2
+    assert client.calls[0]["using"] == DENSE_VECTOR_NAME
+    assert client.calls[1]["using"] == SPARSE_VECTOR_NAME
+    assert client.calls[1]["query"].text == raw  # sparse_raw = 원문 보존
+    assert result.query_payload["retrieval_mode"] == "hybrid_dense_sparse_rrf"
+    assert result.query_payload["search_mode"] == "hybrid"
+    assert result.query_payload["concept_plan"]["view_sources"] == ["dense_full", "sparse_raw"]
+    # hybrid 가중은 균등(1.0/1.0) — multiview의 sparse_raw=0.25 보조채널과 구분.
+    assert result.query_payload["weights"]["view"] == {"dense_full": 1.0, "sparse_raw": 1.0}
+    assert [hit.researcher_id for hit in result.hits] == ["M1"]
+
+
+def test_keyword_similarity_mode_sparse_shortlist_then_dense_rerank():
+    from qdrant_client import models
+
+    client = FakeFlatClient(
+        default_points=[(_chunk_payload("M1", "Alpha", text="인공지능 반도체"), 0.87)]
+    )
+    retriever = _retriever(client)
+    result = asyncio.run(
+        retriever.search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(
+                intent_summary="x",
+                retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"],
+            ),
+            query_filter=None,
+            search_mode="keyword_similarity",
+        )
+    )
+
+    # 2단계 cascade: 1차 SPLADE(키워드) → 2차 dense(유사도) = 정확히 2콜.
+    assert len(client.calls) == 2
+    assert client.calls[0]["using"] == SPARSE_VECTOR_NAME  # 1차 키워드 검색
+    assert client.calls[0]["with_payload"] is False  # 1차는 point id만 필요
+    assert client.calls[1]["using"] == DENSE_VECTOR_NAME  # 2차 dense 유사도 재정렬
+    # 2차 dense는 1차 후보 point id 집합으로만 한정(HasIdCondition).
+    stage2_filter = client.calls[1]["query_filter"]
+    has_id_conds = [c for c in (stage2_filter.must or []) if isinstance(c, models.HasIdCondition)]
+    assert has_id_conds and set(has_id_conds[0].has_id) == {"paper_100000000001_c000"}
+
+    assert [hit.researcher_id for hit in result.hits] == ["M1"]
+    assert result.query_payload["retrieval_mode"] == "keyword_then_dense_similarity"
+    assert result.query_payload["search_mode"] == "keyword_similarity"
+    assert result.query_payload["view_counts"] == {"sparse_keyword": 1, "dense_rerank": 1}
+    # chunk 점수 = dense 유사도(raw) — 순위 RRF 융합이 아님.
+    chunk = result.hits[0].chunks[0]
+    assert chunk.score == 0.87
+    assert chunk.sources == ["dense_similarity"]
+
+
+def test_keyword_similarity_mode_empty_when_no_keyword_candidates():
+    client = FakeFlatClient(default_points=[])  # 1차 SPLADE가 후보 0건
+    retriever = _retriever(client)
+    result = asyncio.run(
+        retriever.search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(
+                intent_summary="x",
+                retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"],
+            ),
+            query_filter=None,
+            search_mode="keyword_similarity",
+        )
+    )
+    # 1차 후보가 없으면 2차 dense는 호출하지 않는다(콜 1건).
+    assert len(client.calls) == 1
+    assert result.hits == []
+    assert result.query_payload["view_counts"] == {"sparse_keyword": 0, "dense_rerank": 0}
+
+
+def test_unknown_search_mode_falls_back_to_multiview():
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Alpha", text="인공지능 반도체"), 0.9)])
+    result = asyncio.run(
+        _retriever(client).search(
+            query="인공지능 반도체",
+            plan=PlannerOutput(
+                intent_summary="x",
+                retrieval_core=["인공지능", "반도체"],
+                core_keywords=["인공지능", "반도체"],
+            ),
+            query_filter=None,
+            search_mode="does_not_exist",
+        )
+    )
+    assert result.query_payload["retrieval_mode"] == "multiview_flat_relevance"
+    assert result.query_payload["search_mode"] == "multiview"
 
 
 def test_search_grouped_diagnostic_uses_query_points_groups():

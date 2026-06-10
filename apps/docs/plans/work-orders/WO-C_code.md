@@ -202,7 +202,7 @@
 - [ ] `tests/test_cross_encoder_evidence_selector.py` 8개 테스트 전부 **green**(정렬/floor drop/top-N cap/pre-gate/dedup/lexical fallback/semantic_query 우선).
 - [ ] retriever 집계 단위테스트: 동일 doc_type 4개 chunk hit인 연구자가 `doc_type_chunk_cap=3`에서 상위 3개만 점수에 기여; RRF 기여가 doc_type별 균등(prior 미설정 시); 연구자당 1건 dedupe.
 - [ ] filters 단위테스트: `recent_years`+`recent_doc_types`가 2개 이상일 때 `min_should(min_count=1)` OR로 컴파일(0건 회귀 방지); `researcher_id MatchAny` pool 합성 후에도 OR 가드 보존.
-- [ ] reasoner: `selected_evidence_ids`가 chunk_id 패턴이 아니면 무효 처리되고 결정론적 fallback으로 evidence 조립(REASONER_RUNTIME_POLICY); `paper:N` 형식은 무효.
+- [ ] reasoner: `selected_evidence_ids`가 chunk_id 코덱 형식이 아니면 trace(`invalid_selected_evidence_ids_by_candidate`)에 기록(`paper:N` 형식 무효). evidence 조립은 `selected_evidence_ids`와 무관하게 선별 relevant 풀로 결정론적 수행(REASONER_RUNTIME_POLICY).
 - [ ] evidence_selector가 후보 score/정렬에 영향 0(집계 결과는 evidence 선별 전후 동일 — 회귀 테스트).
 - [ ] `pytest` 전체(WO-0 기준선 포함) green. ruff/타입 체크(프로젝트 표준) 통과.
 - [ ] (통합, WO-B 필요) `GET /health/ready`가 `ntis_researcher_chunks`에 대해 단일 벡터/인덱스/chunk_id 샘플 점검 통과(200, ready=true).

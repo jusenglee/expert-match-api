@@ -64,11 +64,11 @@
 
 ### 14. chunk_id 기반 evidence (NEW)
 - Input: 추천 후보가 다수 관련 chunk 보유
-- Expected: LLM에 family별 캡이 적용된 chunk 풀 전달, LLM은 풀의 `chunk_id`만 `selected_evidence_ids`로 복사, 최종 `recommendation.evidence`가 그 `chunk_id`로 resolve.
+- Expected: LLM에 family별 캡이 적용된 chunk 풀 전달, LLM은 풀의 `chunk_id`만 `selected_evidence_ids`로 인용. 최종 `recommendation.evidence`는 `selected_evidence_ids`와 무관하게 선별된 relevant chunk 풀 **전체**로 결정론적으로 조립되며, `selected_evidence_ids`는 trace에만 기록된다.
 
 ### 15. evidence id 계약과 fallback
 - Input: LLM이 풀에 없는/형식이 깨진 id 반환
-- Expected: 무효 id는 별도 기록(`invalid_selected_evidence_ids`), trace에 제공 id(`resolver_available_evidence_ids`)와 반환 id 동시 노출, 결정론적 chunk fallback으로 evidence 조립.
+- Expected: 코덱 위반 id는 trace(`invalid_selected_evidence_ids_by_candidate`)에만 기록되고 evidence 조립에는 영향이 없다(evidence는 `selected_evidence_ids`와 무관하게 선별 풀로 조립). 선별 풀이 빈 후보만 profile(또는 빈) fallback으로 대체된다.
 
 ### 16. evidence 선별 캡
 - Input: 매칭 chunk이 매우 많은 후보
@@ -107,8 +107,8 @@
 - hard filter는 시스템이 deterministic 보장(flat root 메타 기준), 다중 doc_type `doc_date` recency는 OR 결합. `doc_attrs.*`는 필터/인덱스 대상이 아니다.
 - `/search/candidates`와 `/recommend`는 검색·집계 순서를 유지하고 사용자 노출 결과를 최대 15명으로 제한한다. `/recommend`는 이 Top-k만 LLM에 전달한다.
 - evidence 선별은 family별 캡을 적용하되 후보 순위를 바꾸지 않는다.
-- `recommendation.evidence`는 LLM이 고른 `chunk_id`로 resolve, 무효 시 결정론적 fallback.
+- `recommendation.evidence`는 `selected_evidence_ids`와 무관하게 EvidenceSelector가 선별한 relevant chunk 풀 전체로 결정론적으로 조립한다. 선별 풀이 빈 후보만 profile(또는 빈) fallback으로 대체되며, `selected_evidence_ids`는 사유 인용 힌트로 trace에만 기록된다.
 - `/recommend.recommendations[*]`는 UI 보조 메타데이터(`match_badges`, `match_summary`, `match_details`, `score_explanation`, `evidence_summary`)를 additive로 노출한다.
-- Trace는 `planner_keywords`, `retrieval_keywords`, `retrieval_skipped_reason`, `retrieval_score_traces`, `strict_filter`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.search_query_plan`, `query_payload.view_counts`, `query_payload.merged_chunk_count`, `query_payload.main_count`, `query_payload.fallback_count`, `query_payload.relevance_gate_active_concepts`, `query_payload.relevance_kept_chunk_count`, `query_payload.relevance_dropped_chunk_count`, `query_payload.relevance_filtered_candidate_count`, `server_logs`, `reason_generation_trace.*`, 후보별 evidence resolution 상세를 노출한다.
+- Trace는 `planner_keywords`, `retrieval_keywords`, `retrieval_skipped_reason`, `retrieval_score_traces`, `strict_filter`, `final_sort_policy`, `top_k_used`, `query_payload.retrieval_mode`, `query_payload.search_mode`, `query_payload.search_query_plan`, `query_payload.view_counts`, `query_payload.merged_chunk_count`, `query_payload.main_count`, `query_payload.fallback_count`, `query_payload.relevance_gate_active_concepts`, `server_logs`, `reason_generation_trace.*`, 후보별 evidence 조립/선별 상세(`provided_evidence_ids`/`selected_evidence_ids`/`resolved_evidence_ids`/`fallback`)를 노출한다. (`relevance_kept_chunk_count`/`relevance_dropped_chunk_count`/`relevance_filtered_candidate_count`는 진단 전용 `search_grouped_diagnostic` 경로에만 존재.)
 - evidence id는 `chunk_id`이며, 구 `paper:N`/`project:N`/`patent:N` 형식은 더 이상 계약에 없다.
 - 구 verifier / multi-view retrieval / branch named vector / judge-as-core 구조는 active 계약이 아니다.

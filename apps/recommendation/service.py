@@ -32,7 +32,7 @@ from apps.recommendation.reasoner import (
 from apps.search.doc_types import DOC_TYPES
 from apps.search.filters import QdrantFilterCompiler
 from apps.search.query_builder import QueryTextBuilder
-from apps.search.retriever import QdrantHybridRetriever
+from apps.search.retriever import SEARCH_MODE_MULTIVIEW, QdrantHybridRetriever
 from apps.domain.models import ResearcherCandidate
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ REASON_GENERATION_BATCH_SIZE = 5
 MAX_USER_FACING_RESULTS = 15
 
 # fit 캘리브레이션: coverage_type 기반 deterministic 밴드로 LLM fit을 클램프(rubric).
-# joint(두 조건 동시충족 근거)=최소 중간, separate=전 범위, partial(일부 미충족)=높음 불가.
+# joint(두 조건 동시충족 근거)=최소 중간이자 '높음' 유일 허용. separate/partial/미상(개념 미감지)=최대 중간('높음' 불가).
 _FIT_RANK: dict[str, int] = {"보통": 0, "중간": 1, "높음": 2}
 _RANK_FIT: dict[int, str] = {0: "보통", 1: "중간", 2: "높음"}
 _COVERAGE_FIT_BAND: dict[str, tuple[str, str]] = {
@@ -109,9 +109,10 @@ class RecommendationService:
         include_orgs: list[str] | None = None,
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
+        search_mode: str = SEARCH_MODE_MULTIVIEW,
     ) -> dict[str, Any]:
         """
-        [/recommend 내부용] RRF 기반 후보자 검색 파이프라인.
+        [/recommend 내부용] 검색 파이프라인. search_mode로 검색 전략을 선택(기본=multiview).
         """
         return await self._run_search_pipeline(
             query=query,
@@ -120,7 +121,8 @@ class RecommendationService:
             exclude_orgs=exclude_orgs,
             top_k=top_k,
             retrieve=self.retriever.search,
-            mode_label="grouped_hybrid_rrf",
+            mode_label=search_mode,
+            search_mode=search_mode,
         )
 
     async def search_weighted_candidates(
@@ -131,10 +133,11 @@ class RecommendationService:
         include_orgs: list[str] | None = None,
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
+        search_mode: str = SEARCH_MODE_MULTIVIEW,
     ) -> dict[str, Any]:
         """
-        [/search/candidates 전용] grouped RRF로 통일된 검색 파이프라인(/recommend과 동일 경로).
-        query_points_groups(group_by=researcher_id) + 앱단 RRF 누적. (구 가중 0.6/0.4 융합 폐기.)
+        [/search/candidates 전용] 검색 파이프라인(/recommend과 동일 경로).
+        search_mode로 검색 전략을 선택(multiview/hybrid/keyword_similarity, 기본=multiview).
         """
         return await self._run_search_pipeline(
             query=query,
@@ -143,7 +146,8 @@ class RecommendationService:
             exclude_orgs=exclude_orgs,
             top_k=top_k,
             retrieve=self.retriever.search_weighted,
-            mode_label="grouped_hybrid_rrf",
+            mode_label=search_mode,
+            search_mode=search_mode,
         )
 
     async def _run_search_pipeline(
@@ -156,6 +160,7 @@ class RecommendationService:
         top_k: int | None,
         retrieve: Any,
         mode_label: str,
+        search_mode: str = SEARCH_MODE_MULTIVIEW,
     ) -> dict[str, Any]:
         logger.info(
             "검색 파이프라인 시작: query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d override_filter_keys=%s",
@@ -252,6 +257,7 @@ class RecommendationService:
                 query=query,
                 plan=plan,
                 query_filter=query_filter,
+                search_mode=search_mode,
             )
 
         retrieval_payload = retrieval.query_payload or {}
@@ -313,14 +319,17 @@ class RecommendationService:
         include_orgs: list[str] | None = None,
         exclude_orgs: list[str] | None = None,
         top_k: int | None = None,
+        search_mode: str = SEARCH_MODE_MULTIVIEW,
     ) -> dict[str, Any]:
         """
         사용자의 질의를 바탕으로 전체 추천 프로세스(검색 + 심사)를 수행합니다.
+        search_mode로 검색 전략을 선택합니다(multiview/hybrid/keyword_similarity, 기본=multiview).
         """
         logger.info(
-            "추천 파이프라인 시작: query_chars=%d top_k=%s include_orgs=%d exclude_orgs=%d override_filter_keys=%s query=%r",
+            "추천 파이프라인 시작: query_chars=%d top_k=%s search_mode=%s include_orgs=%d exclude_orgs=%d override_filter_keys=%s query=%r",
             len(query),
             top_k,
+            search_mode,
             len(include_orgs or []),
             len(exclude_orgs or []),
             _sorted_filter_keys(filters_override),
@@ -335,6 +344,7 @@ class RecommendationService:
             include_orgs=include_orgs,
             exclude_orgs=exclude_orgs,
             top_k=top_k,
+            search_mode=search_mode,
         )
 
         plan: PlannerOutput = search_result["planner"]
@@ -812,9 +822,12 @@ class RecommendationService:
 
         질의 두 조건을 동시충족(joint)한 후보는 최소 '중간', 일부 미충족(partial)은 최대 '중간'으로
         제한한다. LLM은 밴드 안에서만 자유 판정 → '충족인데 보통' / '미충족인데 높음' 모순 차단.
+        '높음'은 joint 전용이므로 separate·partial뿐 아니라 coverage_type 미상/빈(개념 미감지 generic 질의)도
+        최대 '중간'으로 클램프한다(미상이 separate보다 관대해지는 역전 방지).
         """
         current = _FIT_RANK.get(fit, 0)
-        floor_label, ceiling_label = _COVERAGE_FIT_BAND.get(coverage_type or "", ("보통", "높음"))
+        # 미상/빈/예상 밖 coverage_type → 기본 밴드도 최대 '중간'('높음' 불가, joint 전용 유지).
+        floor_label, ceiling_label = _COVERAGE_FIT_BAND.get(coverage_type or "", ("보통", "중간"))
         clamped = min(max(current, _FIT_RANK[floor_label]), _FIT_RANK[ceiling_label])
         return _RANK_FIT[clamped]
 
@@ -1011,13 +1024,16 @@ class RecommendationService:
         fallback: str,
         match_summary: str = "",
     ) -> str:
-        # concept-aware match_summary(예: '인공지능, 반도체 근거가 확인되었습니다')를 앞세우고
-        # 실제 evidence 제목을 구체적으로 인용한 뒤, 직접 근거 부족을 정직하게 명시한다.
+        # concept-aware match_summary를 앞세우고 실제 evidence 제목을 구체적으로 인용한다.
+        # 후보가 충분한 근거를 가졌는데 LLM이 누락한 경우(직접 근거 ≥2건)에는 '근거 제한적'으로
+        # 깎아내리지 않고, 실제로 희박할 때(≤1건)만 추가 검토를 권고한다.
         summary = " ".join((match_summary or "").split())
         if not evidence:
             return summary or "직접적인 질의 일치 근거를 확인하지 못했습니다."
 
-        if all(item.type == "profile" for item in evidence):
+        direct_items = [item for item in evidence if item.type != "profile"]
+        titled_items = [item for item in direct_items if (item.title or "").strip()]
+        if not titled_items:
             lead = summary or "질의와 직접 매칭된 근거는 제한적입니다."
             return f"{lead} 프로필 기반으로 검토된 후보입니다."
 
@@ -1029,29 +1045,41 @@ class RecommendationService:
             "specialty": "전문분야",
             "profile": "프로필",
         }
+
+        def _ref(item: EvidenceItem) -> str:
+            return f"'{item.title}' {type_labels.get(item.type, item.type)}"
+
+        # 서로 다른 doc_type을 우선해 최대 3건 인용(다양성), 부족하면 같은 타입에서 보충.
         referenced_items: list[str] = []
         seen_titles: set[tuple[str, str]] = set()
-        for item in evidence:
-            if item.type == "profile":
-                continue
+        seen_types: set[str] = set()
+        for item in titled_items:
             key = (item.type, item.title)
-            if key in seen_titles:
+            if item.type in seen_types or key in seen_titles:
                 continue
             seen_titles.add(key)
-            referenced_items.append(f"'{item.title}' {type_labels.get(item.type, item.type)}")
-            if len(referenced_items) == 2:
+            seen_types.add(item.type)
+            referenced_items.append(_ref(item))
+            if len(referenced_items) == 3:
                 break
-
-        if not referenced_items:
-            lead = summary or "질의와 직접 매칭된 근거는 제한적입니다."
-            return f"{lead} 프로필 기반으로 검토된 후보입니다."
+        if len(referenced_items) < 3:
+            for item in titled_items:
+                key = (item.type, item.title)
+                if key in seen_titles:
+                    continue
+                seen_titles.add(key)
+                referenced_items.append(_ref(item))
+                if len(referenced_items) == 3:
+                    break
 
         referenced = "와 ".join(referenced_items)
         lead = summary or "질의와 관련된 전문성 근거가 확인되었습니다."
-        return (
-            f"{lead} 구체적으로 {referenced} 등에서 관련 내용이 확인되었으며, "
-            "직접 근거 수가 제한적이라 추가 검토가 권장됩니다."
-        )
+        if len(direct_items) <= 1:
+            return (
+                f"{lead} 구체적으로 {referenced} 등에서 관련 내용이 확인되었으며, "
+                "직접 근거 수가 제한적이라 추가 검토가 권장됩니다."
+            )
+        return f"{lead} 구체적으로 {referenced} 등에서 관련 실적이 확인됩니다."
 
     @classmethod
     def _build_candidate_evidence(

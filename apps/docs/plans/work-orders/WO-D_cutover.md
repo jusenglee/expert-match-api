@@ -61,8 +61,8 @@
    - **시나리오 11. "researcher_meta 기반 hard filter"(`:49-51`):** `publication_count_min`/`highest_degree`로 chunk 단계 deterministic 필터, 위반 후보 0건.
    - **시나리오 12. "제외 기관(cross-chunk)"(`:53-55`):** `exclude_orgs`가 `researcher_meta.affiliated_organization` + 매칭 chunk의 `performing_organization`/`managing_agency`/`appointing_organization`/`evaluation_agency_name` 어디에도 없는 후보만.
    - **시나리오 13. "평가이력 신호"(`:57-59`):** `researcher_assessor`/`expert_assessor` chunk이 검색·evidence에 1급 포함, (옵트인 시) assessment family prior 반영.
-   - **시나리오 14. "chunk_id 기반 evidence"(`:61-63`):** LLM에 family별 캡 적용 chunk 풀 전달 → LLM은 풀의 `chunk_id`만 `selected_evidence_ids`로 복사 → 최종 `recommendation.evidence`가 그 chunk_id로 resolve.
-   - **시나리오 15. "evidence id 계약과 fallback"(`:65-67`):** 무효 id는 `invalid_selected_evidence_ids`에 별기, trace에 `resolver_available_evidence_ids`+반환 id 동시 노출, 결정론적 chunk fallback.
+   - **시나리오 14. "chunk_id 기반 evidence"(`:61-63`):** LLM에 family별 캡 적용 chunk 풀 전달 → LLM은 풀의 `chunk_id`만 `selected_evidence_ids`로 인용 → 최종 `recommendation.evidence`는 `selected_evidence_ids`와 무관하게 선별 relevant 풀 전체로 결정론적으로 조립, `selected_evidence_ids`는 trace에만 기록.
+   - **시나리오 15. "evidence id 계약과 fallback"(`:65-67`):** 코덱 위반 id는 trace(`invalid_selected_evidence_ids_by_candidate`)에만 기록되고 evidence 조립에는 영향 없음, 선별 풀이 빈 후보만 profile(또는 빈) fallback.
    - **시나리오 16. "evidence 선별 캡"(`:69-71`):** family별 캡(`achievement:10`/`assessment:6`/`expertise:6`/`identity:1`) 적용하되 **후보 순위 불변**(grounding 한정). → HARD 제약 5.
 2. **[대상: CI 워크플로 + `pyproject.toml`]** 위 테스트를 CI에 추가한다. WO-0에서 `tests/test_cross_encoder_evidence_selector.py:16-19`가 참조하던 `CrossEncoderEvidenceSelector`/`rerank_source`가 WO-C에서 구현되어 있어야 시나리오 16이 통과한다(미구현 시 CI red → 컷오버 보류). **근거:** GOLDEN_TESTS Acceptance Criteria(`:85-96`).
 
@@ -192,7 +192,7 @@ $env:NTIS_QDRANT_COLLECTION_NAME = "researcher_recommend_proto"  # revert
 1. **equal RRF 고정 (제약 1·2):** 비교 하니스/golden은 v2.0 후보 순위가 **equal RRF(FusionQuery) 누적**으로 산출됨을 전제로 검증한다. 회귀가 보여도 가중 RRF/score 가중합으로 "교정" 금지. doc_type 중요도는 앱단 `NTIS_DOC_TYPE_PRIORS`(기본 equal)로만.
 2. **후보 리랭커 기본 OFF (제약 2):** 컷오버 환경은 `NTIS_CANDIDATE_RERANKER=off`(`ENVIRONMENT.md:110`). 비교 하니스도 off로 실행. band 옵트인 검증이 필요하면 별도 실행으로 격리(동률 밴드 내 재배열만, 탈락/생성 금지).
 3. **OR recency 보존 (제약 4):** golden #10이 `filters.py:169-175`의 OR(min_should, min_count=1) 가드를 검증한다. **과거 0건 장애 회귀 방지** — AND로 좁아지면 게이트 fail 처리.
-4. **LLM no-rerank (제약 3):** golden #5/#14/#15가 LLM이 후보 재정렬·탈락·신규 id 생성을 하지 않고 chunk_id 선택만 함을 검증. 비교 시 `recommendation.evidence`는 LLM 선택 chunk_id의 resolve 결과여야.
+4. **LLM no-rerank (제약 3):** golden #5/#14/#15가 LLM이 후보 재정렬·탈락·신규 id 생성을 하지 않고 chunk_id 인용만 함을 검증. 비교 시 `recommendation.evidence`는 `selected_evidence_ids`와 무관하게 선별 relevant 풀 전체로 결정론적으로 조립된다(LLM 선택이 evidence를 좌우하지 않음).
 5. **evidence 리랭커는 grounding 한정 (제약 5):** golden #16이 family 캡 적용 후 **후보 순위 불변**을 검증. evidence 선별이 순위에 영향 0임을 어서트.
 6. **researcher_meta 비정규화 (제약 6):** golden #7/#11/#12가 한 연구자의 모든 chunk에서 `researcher_meta` 동일, hard filter deterministic을 검증. 적재 lockstep은 WO-A 책임이나 본 WO 표본 점검으로 재확인.
 

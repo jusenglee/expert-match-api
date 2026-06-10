@@ -60,7 +60,23 @@ from apps.search.text_utils import normalize_org_name
 logger = logging.getLogger(__name__)
 
 RETRIEVAL_MODE = "multiview_flat_relevance"
+HYBRID_MODE = "hybrid_dense_sparse_rrf"
+KEYWORD_SIMILARITY_MODE = "keyword_then_dense_similarity"
 GROUPED_DIAGNOSTIC_MODE = "grouped_hybrid_rrf"
+
+# 요청 search_mode 토큰(클라이언트 노출) → 내부 retrieval_mode 라벨.
+# multiview=기존 멀티뷰(기본), hybrid=dense+sparse 단순 RRF, keyword_similarity=키워드 1차→dense 재정렬.
+SEARCH_MODE_MULTIVIEW = "multiview"
+SEARCH_MODE_HYBRID = "hybrid"
+SEARCH_MODE_KEYWORD_SIMILARITY = "keyword_similarity"
+SEARCH_MODE_TO_RETRIEVAL_MODE = {
+    SEARCH_MODE_MULTIVIEW: RETRIEVAL_MODE,
+    SEARCH_MODE_HYBRID: HYBRID_MODE,
+    SEARCH_MODE_KEYWORD_SIMILARITY: KEYWORD_SIMILARITY_MODE,
+}
+# 프로필 보강(hydration)은 비핵심 enrichment다. Qdrant 클라이언트 전역 timeout(20s)을 그대로 물리면
+# 일시적 불통 시 핵심 추천 경로를 20s 막으므로, 보강 조회만 짧게 바운드해 빠르게 강등한다(정상은 ~50ms).
+PROFILE_HYDRATION_TIMEOUT_S = 5.0
 
 # 도메인 org가 들어있는 doc_attrs 키(교차-chunk 배제 후보).
 _RELEVANCE_GATE_VERSION = "v1"
@@ -340,6 +356,29 @@ class QdrantHybridRetriever:
             add_sparse(f"{CONCEPT_VIEW_PREFIX}{key}", text)
         return views
 
+    def _build_hybrid_view_queries(
+        self, search_query_plan: SearchQueryPlan
+    ) -> list[tuple[str, str, Any]]:
+        """[hybrid 모드] dense_full + sparse_raw 2뷰만(단순 하이브리드). focus/concept 뷰 미사용."""
+        views: list[tuple[str, str, Any]] = [
+            ("dense_full", DENSE_VECTOR_NAME, self._build_dense_query(search_query_plan.dense_query))
+        ]
+        raw = " ".join((search_query_plan.raw_query or "").split())
+        if raw:
+            views.append(("sparse_raw", SPARSE_VECTOR_NAME, self._build_sparse_query(raw)))
+        return views
+
+    def _view_plan_for_mode(
+        self, search_mode: str, search_query_plan: SearchQueryPlan, concept_plan: ConceptPlan
+    ) -> tuple[list[tuple[str, str, Any]], dict[str, float]]:
+        """view 기반 모드(multiview/hybrid)의 (view_queries, view_weights)."""
+        if search_mode == SEARCH_MODE_HYBRID:
+            return self._build_hybrid_view_queries(search_query_plan), self.settings.hybrid_view_weights
+        return (
+            self._build_view_queries(search_query_plan, concept_plan),
+            self.settings.search_view_weights,
+        )
+
     @staticmethod
     def _concept_of_source(source: str, concept_plan: ConceptPlan) -> str | None:
         """concept:<key> source → base concept id. 'semiconductor_experience'→'semiconductor'."""
@@ -395,6 +434,136 @@ class QdrantHybridRetriever:
                     merge[payload.chunk_id] = entry
                 entry.observe(source, rank0, concept)
         return merge
+
+    def _fuse_chunks_to_researchers(
+        self,
+        merge: dict[str, _ChunkMerge],
+        *,
+        view_weights: dict[str, float],
+        rrf_k: int,
+        query: str,
+        concept_plan: ConceptPlan,
+    ) -> dict[str, list[ChunkHit]]:
+        """[view 기반 모드] 병합 chunk → 융합점수(Σ view_weight × rank score) + concept 태깅 → researcher 그룹."""
+        # 운영성/교육/행정 과제 근거 하향은 '질의 자체가 운영/교육을 찾는' 경우엔 끈다(역효과 방지).
+        op_query = " ".join(query.split()).casefold().replace(" ", "")
+        op_penalty_active = (
+            self._operation_factor < 1.0
+            and bool(self._operation_markers)
+            and not any(marker in op_query for marker in self._operation_markers)
+        )
+        by_researcher: dict[str, list[ChunkHit]] = {}
+        for entry in merge.values():
+            fused = fuse_chunk_score(entry.view_best_rank0, view_weights=view_weights, rrf_k=rrf_k)
+            # 운영성/교육/행정 과제(프로그램 운영비)는 근거 가치 하향(설계 실적 아님).
+            if op_penalty_active and has_operation_marker(entry.payload, self._operation_markers):
+                fused *= self._operation_factor
+            concepts = tag_chunk_concepts(
+                entry.payload, view_concept_hits=entry.concept_hits, concept_plan=concept_plan
+            )
+            hit = ChunkHit(
+                score=fused,
+                payload=entry.payload,
+                concepts=concepts,
+                sources=sorted(entry.view_best_rank0),
+                display_only_concepts=chunk_display_only_concepts(entry.payload, concept_plan),
+            )
+            by_researcher.setdefault(entry.payload.researcher_id, []).append(hit)
+        return by_researcher
+
+    async def _retrieve_keyword_then_similarity(
+        self,
+        *,
+        search_query_plan: SearchQueryPlan,
+        concept_plan: ConceptPlan,
+        base_filter: models.Filter | None,
+        query: str,
+    ) -> tuple[dict[str, list[ChunkHit]], dict[str, int], int]:
+        """[keyword_similarity 모드] SPLADE 1차 후보 풀 → 그 안에서 dense 유사도로만 재정렬.
+
+        1) sparse_raw(원문) SPLADE 검색으로 1차 후보 point 풀을 회수(keyword_first_stage_limit).
+        2) 1차 point id 집합으로 한정(HasIdCondition)해 dense 검색 → chunk 점수 = dense 유사도(raw score).
+        3) chunk_id로 중복 제거(최상위 dense rank 보존) + concept 태깅 후 researcher 그룹으로 반환.
+
+        반환: (by_researcher, view_counts, merged_chunk_count). 융합/순위 RRF는 쓰지 않는다.
+        """
+        keyword_text = " ".join((search_query_plan.raw_query or "").split()) or " ".join(
+            (search_query_plan.sparse_joint_query or "").split()
+        )
+        empty: tuple[dict[str, list[ChunkHit]], dict[str, int], int] = (
+            {},
+            {"sparse_keyword": 0, "dense_rerank": 0},
+            0,
+        )
+        if not keyword_text:
+            return empty
+
+        # --- stage 1: SPLADE 키워드 1차 후보 풀(point id만 수집) ---
+        try:
+            stage1 = await asyncio.to_thread(
+                self.client.query_points,
+                collection_name=self.settings.qdrant_collection_name,
+                query=self._build_sparse_query(keyword_text),
+                using=SPARSE_VECTOR_NAME,
+                limit=self.settings.keyword_first_stage_limit,
+                query_filter=base_filter,
+                with_payload=False,
+                with_vectors=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — 1차 실패는 빈 결과로 강등.
+            logger.error("keyword_similarity stage1(sparse) failed: %s", exc, exc_info=exc)
+            return empty
+        stage1_points = getattr(stage1, "points", None)
+        if stage1_points is None and isinstance(stage1, dict):
+            stage1_points = stage1.get("points")
+        point_ids: list[Any] = []
+        for point in stage1_points or []:
+            pid = getattr(point, "id", None)
+            if pid is None and isinstance(point, dict):
+                pid = point.get("id")
+            if pid is not None:
+                point_ids.append(pid)
+        if not point_ids:
+            return empty
+
+        # --- stage 2: 1차 후보 한정 dense 유사도 재정렬 ---
+        id_filter = self._merge_filters(base_filter, models.HasIdCondition(has_id=point_ids))
+        try:
+            stage2 = await asyncio.to_thread(
+                self.client.query_points,
+                collection_name=self.settings.qdrant_collection_name,
+                query=self._build_dense_query(search_query_plan.dense_query),
+                using=DENSE_VECTOR_NAME,
+                limit=self.settings.prefetch_limit,
+                query_filter=id_filter,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — 2차 실패는 빈 결과로 강등.
+            logger.error("keyword_similarity stage2(dense) failed: %s", exc, exc_info=exc)
+            return empty
+        stage2_points = getattr(stage2, "points", None)
+        if stage2_points is None and isinstance(stage2, dict):
+            stage2_points = stage2.get("points")
+
+        by_researcher: dict[str, list[ChunkHit]] = {}
+        seen_chunk_ids: set[str] = set()
+        for point in stage2_points or []:
+            payload = self._validate_chunk(self._point_payload_data(point))
+            if payload is None or payload.chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(payload.chunk_id)
+            # chunk 점수 = dense 유사도(raw). 사용자 선택형 cascade는 순위 RRF 융합을 쓰지 않는다.
+            hit = ChunkHit(
+                score=self._point_score(point),
+                payload=payload,
+                concepts=tag_chunk_concepts(payload, concept_plan=concept_plan),
+                sources=["dense_similarity"],
+                display_only_concepts=chunk_display_only_concepts(payload, concept_plan),
+            )
+            by_researcher.setdefault(payload.researcher_id, []).append(hit)
+        view_counts = {"sparse_keyword": len(point_ids), "dense_rerank": len(seen_chunk_ids)}
+        return by_researcher, view_counts, len(seen_chunk_ids)
 
     def _score_generic(self, chunks: list[ChunkHit]) -> float:
         """concept 미감지 질의용 폴백 점수: 융합 점수를 doc_type cap+harmonic으로 capped 누적."""
@@ -628,8 +797,21 @@ class QdrantHybridRetriever:
         query: str,
         plan: PlannerOutput,
         query_filter: models.Filter | None,
+        search_mode: str = SEARCH_MODE_MULTIVIEW,
     ) -> RetrievalResult:
-        """멀티뷰 flat 검색 → chunk_id 병합 → 관련도 융합/태깅 → capped evidence 재점수."""
+        """검색 모드 선택형 진입점(요청 search_mode로 선택, 기본=multiview).
+
+        · multiview(기본): dense_full + sparse_raw/focus + concept 멀티뷰를 순위 RRF로 융합(현행).
+        · hybrid: dense_full + sparse_raw 2뷰만 동일 RRF로 융합(단순 하이브리드, focus/concept 뷰 미사용).
+        · keyword_similarity: SPLADE 1차 후보 풀 → 그 집합 안에서만 dense 유사도로 재정렬(2단계 cascade).
+        공통: chunk_id 병합 → concept 태깅/관련도 게이트 → capped evidence 재점수 → org 필터 → 정렬. LLM no-rerank.
+        """
+        mode = search_mode or SEARCH_MODE_MULTIVIEW
+        if mode not in SEARCH_MODE_TO_RETRIEVAL_MODE:
+            logger.warning("알 수 없는 search_mode=%r → multiview 폴백", mode)
+            mode = SEARCH_MODE_MULTIVIEW
+        retrieval_mode = SEARCH_MODE_TO_RETRIEVAL_MODE[mode]
+
         concept_plan = self._resolve_concept_plan(query, plan)
         search_query_plan = self.query_builder.build_search_query_plan(query, plan, concept_plan)
         queries = CompiledQueries(
@@ -642,14 +824,11 @@ class QdrantHybridRetriever:
         base_filter = self._merge_filters(query_filter, self._retrieval_doc_type_filter())
         required_active = self.settings.relevance_gate_enabled and bool(concept_plan.required)
 
-        view_queries = self._build_view_queries(search_query_plan, concept_plan)
-        view_sources = [source for source, _, _ in view_queries]
-
         logger.info(
-            "multiview 검색 컴파일: mode=%s views=%s required=%s(source=%s) optional=%s "
+            "검색 컴파일: search_mode=%s mode=%s required=%s(source=%s) optional=%s "
             "limits={prefetch:%d} gate=%s",
-            RETRIEVAL_MODE,
-            view_sources,
+            mode,
+            retrieval_mode,
             concept_plan.required,
             concept_plan.source,
             concept_plan.optional,
@@ -659,13 +838,21 @@ class QdrantHybridRetriever:
 
         compiled_json = json.dumps(
             {
-                "mode": RETRIEVAL_MODE,
+                # retrieval_mode + search_mode를 키에 포함해 모드별 캐시를 분리한다(서로 다른 검색 결과).
+                "mode": retrieval_mode,
+                "search_mode": mode,
                 "dense_query": search_query_plan.dense_query,
-                "view_sources": view_sources,
+                "raw_query": search_query_plan.raw_query,
                 "sparse_concept_queries": search_query_plan.sparse_concept_queries,
                 "required_concepts": sorted(concept_plan.required),
                 "optional_concepts": sorted(concept_plan.optional),
                 "concept_source": concept_plan.source,
+                # 소속 기관 include/exclude는 base_filter(Qdrant)에 들어가지 않고 앱단 post-filter로만
+                # 적용된다(org_survivors). 따라서 캐시 키에 직접 넣지 않으면, 무필터 질의가 캐시한
+                # 결과를 다른 org 필터 요청이 그대로 재사용해 include/exclude가 침묵 우회된다(governance 사고).
+                # org를 키에 포함해 org 조합별로 캐시를 분리한다.
+                "include_orgs": sorted(plan.include_orgs),
+                "exclude_orgs": sorted(plan.exclude_orgs),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -677,13 +864,14 @@ class QdrantHybridRetriever:
             cached = self.l3_cache.get(compiled_json, filter_json, snapshot_id)
             if cached:
                 hits = [ResearcherCandidate.model_validate(h) for h in cached]
-                logger.info("검색 캐시 적중: layer=L3 mode=%s hits=%d", RETRIEVAL_MODE, len(hits))
+                logger.info("검색 캐시 적중: layer=L3 mode=%s hits=%d", retrieval_mode, len(hits))
                 return RetrievalResult(
                     hits=hits,
                     query_payload={
                         "cache": "hit",
                         "l3": True,
-                        "retrieval_mode": RETRIEVAL_MODE,
+                        "retrieval_mode": retrieval_mode,
+                        "search_mode": mode,
                         "retrieval_keywords": retrieval_keywords,
                         "search_query_plan": self._search_query_plan_trace(search_query_plan),
                         "relevance_gate_active_concepts": sorted(concept_plan.required) if required_active else [],
@@ -694,38 +882,44 @@ class QdrantHybridRetriever:
                     cache_hit=True,
                 )
 
-        with Timer() as search_timer:
-            view_results = await self._run_views(view_queries, base_filter)
-
-        view_counts = {source: len(points) for source, points in view_results}
-        merge = self._merge_views(view_results, concept_plan)
-
-        view_weights = self.settings.search_view_weights
         rrf_k = self.settings.view_rrf_k
-        # 운영성/교육/행정 과제 근거 하향은 '질의 자체가 운영/교육을 찾는' 경우엔 끈다(역효과 방지).
-        op_query = " ".join(query.split()).casefold().replace(" ", "")
-        op_penalty_active = (
-            self._operation_factor < 1.0
-            and bool(self._operation_markers)
-            and not any(marker in op_query for marker in self._operation_markers)
-        )
-        by_researcher: dict[str, list[ChunkHit]] = {}
-        for entry in merge.values():
-            fused = fuse_chunk_score(entry.view_best_rank0, view_weights=view_weights, rrf_k=rrf_k)
-            # 운영성/교육/행정 과제(프로그램 운영비)는 근거 가치 하향(설계 실적 아님).
-            if op_penalty_active and has_operation_marker(entry.payload, self._operation_markers):
-                fused *= self._operation_factor
-            concepts = tag_chunk_concepts(
-                entry.payload, view_concept_hits=entry.concept_hits, concept_plan=concept_plan
-            )
-            hit = ChunkHit(
-                score=fused,
-                payload=entry.payload,
-                concepts=concepts,
-                sources=sorted(entry.view_best_rank0),
-                display_only_concepts=chunk_display_only_concepts(entry.payload, concept_plan),
-            )
-            by_researcher.setdefault(entry.payload.researcher_id, []).append(hit)
+        with Timer() as search_timer:
+            if mode == SEARCH_MODE_KEYWORD_SIMILARITY:
+                # 2단계 cascade: SPLADE 1차 풀 → dense 유사도 재정렬(뷰 융합 미사용).
+                by_researcher, view_counts, merged_chunk_count = (
+                    await self._retrieve_keyword_then_similarity(
+                        search_query_plan=search_query_plan,
+                        concept_plan=concept_plan,
+                        base_filter=base_filter,
+                        query=query,
+                    )
+                )
+                view_sources = ["sparse_keyword", "dense_rerank"]
+                view_weights_used: dict[str, float] = {}
+                search_limits = {
+                    "keyword_first_stage_limit": self.settings.keyword_first_stage_limit,
+                    "prefetch_limit": self.settings.prefetch_limit,
+                }
+            else:
+                view_queries, view_weights_used = self._view_plan_for_mode(
+                    mode, search_query_plan, concept_plan
+                )
+                view_sources = [source for source, _, _ in view_queries]
+                view_results = await self._run_views(view_queries, base_filter)
+                view_counts = {source: len(points) for source, points in view_results}
+                merge = self._merge_views(view_results, concept_plan)
+                by_researcher = self._fuse_chunks_to_researchers(
+                    merge,
+                    view_weights=view_weights_used,
+                    rrf_k=rrf_k,
+                    query=query,
+                    concept_plan=concept_plan,
+                )
+                merged_chunk_count = len(merge)
+                search_limits = {
+                    "prefetch_limit": self.settings.prefetch_limit,
+                    "views": len(view_queries),
+                }
 
         main_tier: list[ResearcherCandidate] = []
         fallback_tier: list[ResearcherCandidate] = []
@@ -781,11 +975,12 @@ class QdrantHybridRetriever:
         final_hits = self._sort_hits(main_tier) + self._sort_hits(fallback_kept)
 
         logger.info(
-            "멀티뷰 검색 집계: elapsed_ms=%.2f view_counts=%s merged_chunks=%d main=%d fallback=%d "
+            "검색 집계: mode=%s elapsed_ms=%.2f view_counts=%s merged_chunks=%d main=%d fallback=%d "
             "org_filtered=%d final=%d",
+            retrieval_mode,
             search_timer.elapsed_ms,
             view_counts,
-            len(merge),
+            merged_chunk_count,
             len(main_tier),
             len(fallback_kept),
             org_filtered_count,
@@ -805,7 +1000,8 @@ class QdrantHybridRetriever:
         return RetrievalResult(
             hits=final_hits,
             query_payload={
-                "retrieval_mode": RETRIEVAL_MODE,
+                "retrieval_mode": retrieval_mode,
+                "search_mode": mode,
                 "retrieval_keywords": retrieval_keywords,
                 "search_query_plan": self._search_query_plan_trace(search_query_plan),
                 "semantic_query": plan.semantic_query,
@@ -818,20 +1014,17 @@ class QdrantHybridRetriever:
                 "relevance_gate_enabled": required_active,
                 "relevance_gate_active_concepts": sorted(concept_plan.required) if required_active else [],
                 "view_counts": view_counts,
-                "merged_chunk_count": len(merge),
+                "merged_chunk_count": merged_chunk_count,
                 "main_count": len(main_tier),
                 "fallback_count": len(fallback_kept),
                 "org_filtered_count": org_filtered_count,
                 "final_hit_count": len(final_hits),
                 "weights": {
-                    "view": dict(view_weights),
+                    "view": dict(view_weights_used),
                     "researcher": dict(self.settings.researcher_score_weights),
                     "view_rrf_k": rrf_k,
                 },
-                "search_limits": {
-                    "prefetch_limit": self.settings.prefetch_limit,
-                    "views": len(view_queries),
-                },
+                "search_limits": search_limits,
                 "timers": {"search_ms": search_timer.elapsed_ms},
             },
             queries=queries,
@@ -847,9 +1040,12 @@ class QdrantHybridRetriever:
         query: str,
         plan: PlannerOutput,
         query_filter: models.Filter | None,
+        search_mode: str = SEARCH_MODE_MULTIVIEW,
     ) -> RetrievalResult:
-        """[/search/candidates 전용] 멀티뷰 flat 경로로 통일(커스텀 가중 fan-out 폐기)."""
-        return await self.search(query=query, plan=plan, query_filter=query_filter)
+        """[/search/candidates 전용] search()로 위임(선택 search_mode 전달)."""
+        return await self.search(
+            query=query, plan=plan, query_filter=query_filter, search_mode=search_mode
+        )
 
     async def hydrate_profile_evidence(
         self,
@@ -873,14 +1069,25 @@ class QdrantHybridRetriever:
             self._retrieval_doc_type_filter(),
         )
         try:
-            response = await asyncio.to_thread(
-                self.client.scroll,
-                collection_name=self.settings.qdrant_collection_name,
-                scroll_filter=scroll_filter,
-                limit=max(1, fetch_limit),
-                with_payload=True,
-                with_vectors=False,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.scroll,
+                    collection_name=self.settings.qdrant_collection_name,
+                    scroll_filter=scroll_filter,
+                    limit=max(1, fetch_limit),
+                    with_payload=True,
+                    with_vectors=False,
+                ),
+                timeout=PROFILE_HYDRATION_TIMEOUT_S,
             )
+        except (asyncio.TimeoutError, TimeoutError):
+            # 보강만 빠르게 강등(검색은 별도 경로). Qdrant 클라이언트 20s를 기다리지 않는다.
+            logger.warning(
+                "hydrate_profile_evidence timed out after %.1fs (non-critical; continuing without hydration): researchers=%d",
+                PROFILE_HYDRATION_TIMEOUT_S,
+                len(ids),
+            )
+            return {}
         except Exception as exc:  # noqa: BLE001 — 보강 실패는 격리(주 추천 흐름은 계속).
             logger.error("hydrate_profile_evidence scroll failed: %s", exc, exc_info=exc)
             return {}

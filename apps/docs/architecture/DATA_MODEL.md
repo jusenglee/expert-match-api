@@ -24,7 +24,7 @@ payload는 **FLAT**이다. 연구자 공통 메타는 payload **ROOT에 비정�
 
 | 항목 | 값 | 비고 |
 |---|---|---|
-| 컬렉션 이름 | `ntis_researcher_chunks` (기본값) | `NTIS_QDRANT_COLLECTION_NAME`으로 override. 구 `researcher_recommend_proto`는 레거시 v1.x(blue/green 가드로 보호, 절대 재생성 안 함) |
+| 컬렉션 이름 | `researcher_recommend_v1` (기본값) | `NTIS_QDRANT_COLLECTION_NAME`으로 override. 구 `researcher_recommend_proto`는 레거시 v1.x(blue/green 가드로 보호, 절대 재생성 안 함) |
 | Point 단위 | **chunk 1개 = Point 1개** | nested 배열 없음. 한 연구자 = 다수 Point |
 | Payload evidence ID | root `chunk_id` 문자열 (예: `paper_100000045256_c000`) | 런타임 evidence resolve/trace의 authoritative id |
 | Point ID | `chunk_id` 권장, UUID 허용 | 멱등 적재에는 `chunk_id`가 유리하나, 런타임은 payload `chunk_id`를 기준으로 동작 |

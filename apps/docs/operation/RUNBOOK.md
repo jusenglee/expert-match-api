@@ -14,7 +14,7 @@ python -m pip install -e .[dev]
 ## 2. Qdrant 및 데이터 준비 (chunk 컬렉션)
 
 - Qdrant 서버 구동 및 `NTIS_QDRANT_URL` 접근 확인.
-- 기본 컬렉션 이름은 `ntis_researcher_chunks`(`NTIS_QDRANT_COLLECTION_NAME`으로 override).
+- 기본 컬렉션 이름은 `researcher_recommend_v1`(`NTIS_QDRANT_COLLECTION_NAME`으로 override).
 - 컬렉션 스키마(필수):
   - payload root `chunk_id` 문자열 (`<doc_type>_<숫자doc_id>_c<NNN>`, 예: `paper_100000045256_c000`)이 authoritative evidence id.
   - Point ID는 신규/멱등 컬렉션에서는 `chunk_id`를 권장하나, 운영 컬렉션이 UUID Point ID를 쓰더라도 런타임은 `payload.chunk_id`를 기준으로 evidence를 resolve한다.
@@ -34,11 +34,11 @@ python -m pip install -e .[dev]
 
 ### 2.2 컬렉션 부트스트랩 CLI (WO-B, VPN 필요)
 
-`apps/tools/bootstrap_chunks.py` — `ntis_researcher_chunks` 컬렉션 생성·점검·스모크.
+`apps/tools/bootstrap_chunks.py` — `researcher_recommend_v1` 컬렉션 생성·점검·스모크.
 
 ```bash
 # 컬렉션 생성(단일 vector_e5i + vector_splade + flat payload 인덱스)
-NTIS_QDRANT_COLLECTION_NAME=ntis_researcher_chunks python -m apps.tools.bootstrap_chunks ensure
+NTIS_QDRANT_COLLECTION_NAME=researcher_recommend_v1 python -m apps.tools.bootstrap_chunks ensure
 # 스키마/인덱스 확인 + 레거시 컬렉션 Point 수(보존) 확인
 ... python -m apps.tools.bootstrap_chunks inspect
 # 표본 chunk upsert + query_points(dense/sparse/doc_type 필터/OR recency) + 멱등 확인

@@ -20,8 +20,9 @@ class FakeRecommendationService:
         self.last_recommend_query = None
         self.last_search_query = None
 
-    async def recommend(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
+    async def recommend(self, *, query, filters_override, include_orgs, exclude_orgs, top_k, search_mode="multiview"):
         self.last_recommend_query = query
+        self.last_search_mode = search_mode
         return {
             "intent_summary": query,
             "applied_filters": filters_override,
@@ -62,7 +63,7 @@ class FakeRecommendationService:
             },
         }
 
-    async def search_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
+    async def search_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k, search_mode="multiview"):
         self.last_search_query = query
         class Planner(SimpleNamespace):
             def model_dump(self, mode="json"):
@@ -117,13 +118,14 @@ class FakeRecommendationService:
             "timers": {},
         }
 
-    async def search_weighted_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k):
+    async def search_weighted_candidates(self, *, query, filters_override, include_orgs, exclude_orgs, top_k, search_mode="multiview"):
         return await self.search_candidates(
             query=query,
             filters_override=filters_override,
             include_orgs=include_orgs,
             exclude_orgs=exclude_orgs,
             top_k=top_k,
+            search_mode=search_mode,
         )
 
     def save_feedback(self, *, query, selected_expert_ids, rejected_expert_ids, notes, metadata):
@@ -178,6 +180,42 @@ def test_recommend_endpoint_contract():
     assert any("사용자 질의 수신: endpoint=/recommend" in line for line in server_logs)
     assert any("[trace=" in line and "[POST /recommend]" in line for line in server_logs)
     assert any("추천 응답 준비 완료" in line for line in server_logs)
+
+
+def test_recommend_endpoint_forwards_search_mode():
+    service = FakeRecommendationService()
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=service,
+        validator=FakeValidator(),
+    )
+    with TestClient(app) as client:
+        # 명시 search_mode가 서비스까지 전달된다.
+        response = client.post(
+            "/recommend",
+            json={"query": "Recommend reviewers", "search_mode": "keyword_similarity"},
+        )
+        assert response.status_code == 200
+        assert service.last_search_mode == "keyword_similarity"
+
+        # 미지정 시 기본 multiview.
+        client.post("/recommend", json={"query": "Recommend reviewers"})
+        assert service.last_search_mode == "multiview"
+
+
+def test_recommend_endpoint_rejects_invalid_search_mode():
+    service = FakeRecommendationService()
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=service,
+        validator=FakeValidator(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/recommend",
+            json={"query": "Recommend reviewers", "search_mode": "not_a_mode"},
+        )
+    assert response.status_code == 422  # Literal 검증 실패
 
 
 def test_playground_distinguishes_profile_counts_from_query_evidence_counts():
