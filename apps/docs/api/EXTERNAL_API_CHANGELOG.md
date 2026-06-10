@@ -50,7 +50,7 @@
 - 검색 대상 영역 필드는 응답에서 여전히 **`searched_branches`** 라는 이름으로 노출되며, 값은 doc_type 5종 문자열 목록입니다(`/recommend`, `/search/candidates`, `/health`). *(v2.0 문서가 예고한 `searched_doc_types` 리네임은 코드에 반영되지 않았습니다 — 필드명은 `searched_branches` 유지, 값만 doc_type으로 전환.)*
 - `/search/candidates.candidates[*]`는 family boolean 맵(`doc_type_coverage`)이나 `matched_doc_types`가 아니라 **`doc_types_present`**(이번 검색에서 hit한 doc_type 문자열 목록) 단일 필드를 노출합니다.
 - `recommendations[*].evidence[*].chunk_id`는 evidence 참조 식별자입니다(불변).
-- 컬렉션 기본값 `ntis_researcher_chunks`. named vector는 단일 `vector_e5i`(dense, 1024, Cosine) + 단일 `vector_splade`(sparse). doc_type은 **payload 필터**이며 별도 named vector가 아닙니다.
+- 컬렉션 기본값 `researcher_recommend_v1`. named vector는 단일 `vector_e5i`(dense, 1024, Cosine) + 단일 `vector_splade`(sparse). doc_type은 **payload 필터**이며 별도 named vector가 아닙니다.
 
 ### D. hard_filter 키 (flat)
 
@@ -93,7 +93,7 @@
 
 ### D. 컬렉션/스키마 변경
 
-- 기본 컬렉션 `researcher_recommend_proto` → `ntis_researcher_chunks`.
+- 기본 컬렉션 `researcher_recommend_proto` → `researcher_recommend_v1`.
 - named vector `basic/art/pat/pjt_vector_*` 4쌍 → 단일 dense `vector_e5i`(1024, Cosine) + 단일 sparse `vector_splade`. *(v2.1 확정 명칭. v2.0 초안의 `dense_e5i`/`sparse_splade`는 실제 코드와 다릅니다.)*
 - 외부 API 호출 형태(요청 스키마)는 변하지 않습니다.
 
@@ -136,7 +136,7 @@
 - 검색 대상 영역 필드는 응답에서 **`searched_branches`** 이며 값은 doc_type 5종 문자열 목록입니다(`paper`/`patent`/`project`/`assessor_activity`/`specialty`). `/search/candidates`의 후보별 보유 doc_type은 **`candidates[*].doc_types_present`**(문자열 목록)입니다. *(family boolean 맵 `doc_type_coverage`나 `matched_doc_types`는 실재하지 않습니다.)*
 - 근거 식별자는 `evidence[*].chunk_id`(형식 `<doc_type>_<숫자doc_id>_c<NNN>`)이며, `evidence[*].type`은 doc_type 5종 또는 `profile`입니다.
 - payload는 flat입니다(연구자 공통 메타 root 비정규화, doc_type별 `doc_attrs{}`, 단일 `doc_date`). `researcher_meta` 중첩, `event_date`/`event_year`, `domain_attrs`, `tags`, `chunk_text_len`은 존재하지 않습니다.
-- 컬렉션 기본값은 `ntis_researcher_chunks`, named vector는 단일 `vector_e5i`(dense, 1024, Cosine) + `vector_splade`(sparse)이며 doc_type은 payload 필터입니다.
+- 컬렉션 기본값은 `researcher_recommend_v1`, named vector는 단일 `vector_e5i`(dense, 1024, Cosine) + `vector_splade`(sparse)이며 doc_type은 payload 필터입니다.
 - `trace.query_payload.search_query_plan`은 dense/sparse/concept별 실제 검색 텍스트와 `required_concepts`를 담습니다. dense 검색 텍스트는 planner `semantic_query` 우선이고, SPLADE 검색 텍스트는 `sparse_raw`, `sparse_joint_query`, `sparse_concept_queries`입니다.
 - 사용자 노출 결과 수는 `/recommend`와 `/search/candidates` 모두 최대 15명입니다. 실제 제한값은 `trace.top_k_used`(`/search/candidates`도 동일)로 확인합니다.
 - concept 확정/gate는 `chunk_text`/`doc_id` 직접 evidence만 사용하며, `doc_attrs` 값은 표시·상세 메타로만 사용합니다.

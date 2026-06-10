@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
 import textwrap
 from typing import Any, Protocol
 
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 MAX_PLANNER_ATTEMPTS = 2
 
 
-PLANNER_VERSION = "v0.5.2"  # Solar 102B vLLM 전제 명시 + heuristic retrieval_core 보강 — 캐시 무효화
+PLANNER_VERSION = "v0.5.3"  # concept grounding guard(질의 미근거 concept 제거) + 프롬프트 강화 — 캐시 무효화
 
 
 # planner 출력을 vLLM guided decoding(JSON 스키마)으로 강제 — prose JSON-only 요청을 구조적으로 보증.
@@ -107,6 +108,60 @@ def _heuristic_keywords(
         if len(normalized) > 1 and normalized not in keywords:
             keywords.append(normalized)
     return keywords or ([normalized_query] if normalized_query else [])
+
+
+# concept grounding(질의 근거) 판정에서 제외하는 일반어 — 이 단어가 질의에 우연히 겹쳐도 concept이
+# '근거 있다'고 보지 않는다(예: 'ai' concept의 query_term '시스템'이 '논문투고심사시스템'에 부분일치하는
+# 거짓 근거 방지). concept 고유어(label·고유 query/evidence term)로만 grounding을 인정한다.
+_GROUNDING_STOPWORDS = frozenset(
+    {
+        "시스템", "연구", "개발", "기술", "분야", "전문", "산업", "데이터",
+        "관리", "서비스", "활용", "기반", "응용", "관련", "방법", "장치",
+        "소재", "설계", "분석", "평가", "지원", "구축", "운영", "사업",
+        "전문가", "경험", "스마트", "지능형", "고도화", "솔루션",
+    }
+)
+
+
+def _term_grounded_in_query(term: str, haystack: str) -> bool:
+    """concept term이 질의 haystack(casefold)에 실제 등장하는가. 짧은 영숫자(ai/npu)는 단어경계 강제."""
+    normalized = " ".join(term.casefold().split())
+    if len(normalized) < 2 or normalized in _GROUNDING_STOPWORDS:
+        return False
+    if normalized.isascii() and normalized.isalnum() and len(normalized) <= 3:
+        return re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", haystack) is not None
+    return normalized in haystack
+
+
+def _concept_grounded_in_query(spec: Any, haystack: str) -> bool:
+    """concept의 고유어(label·query_terms·evidence_terms·id 토큰) 중 하나라도 질의에 등장하면 근거 있음."""
+    needles: list[str] = [getattr(spec, "label", "") or ""]
+    needles.extend(getattr(spec, "query_terms", None) or [])
+    needles.extend(getattr(spec, "evidence_terms", None) or [])
+    needles.extend((getattr(spec, "id", "") or "").split("_"))
+    return any(_term_grounded_in_query(n, haystack) for n in needles if n)
+
+
+def _sanitize_concept_specs(
+    specs: list[Any], normalized_query: str, retrieval_core: list[str]
+) -> tuple[list[Any], list[str]]:
+    """질의에 근거 없는(hallucinated) concept을 제거한다.
+
+    haystack = 사용자 질의 원문 + retrieval_core(planner 추출 키워드). semantic_query는 LLM이 만든
+    문장이라(환각 자기-정당화 방지) 근거 판정에서 제외한다. 어떤 고유어도 질의에 없으면 spurious로 보고
+    드롭한다 → required gate가 엉뚱한 개념으로 전체 후보를 탈락시키는 0건 사고를 막는다(정밀도 보강).
+    """
+    if not specs:
+        return specs, []
+    haystack = " ".join([normalized_query, *(retrieval_core or [])]).casefold()
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for spec in specs:
+        if _concept_grounded_in_query(spec, haystack):
+            kept.append(spec)
+        else:
+            dropped.append(getattr(spec, "id", "") or getattr(spec, "label", "") or "?")
+    return kept, dropped
 
 
 class HeuristicPlanner:
@@ -253,6 +308,7 @@ class OpenAICompatPlanner:
                 - head-noun을 evidence로 올리는 것은 기술/도메인 명사에만 적용합니다. 기관명·역할어·행위어는 concept이 아니므로 evidence 대상이 아닙니다.
                 - concept은 최대 5개. 질의에 명시된 기술/도메인만 만드세요. 도메인 개념이 없으면 concept_specs는 빈 배열 [] 로 두세요.
                 - 영문 약어(AI/NPU/ADAS 등)는 그 자체로 분별력이 있을 때만 evidence_terms에 넣으세요.
+                - **[근거(grounding) 필수 — 환각 금지]** 각 concept은 그 `label` 또는 `query_terms` 중 최소 하나가 **사용자 질의 원문에 실제로 등장**해야 합니다. 질의에 없는 도메인을 추측해서 만들지 마세요. 특히 질의에 인공지능/AI 언급이 전혀 없는데 `ai` concept을 넣는 식의 환각은 절대 금지입니다(예: "논문투고심사시스템 제안평가"는 행정/프로세스 질의이므로 기술 도메인 concept이 없습니다 → `concept_specs: []`). 도메인이 모호하면 `role`을 "optional"로 두거나 `concept_specs`를 비우세요. 런타임은 질의에 근거 없는 concept을 자동 제거합니다.
 
                 # 출력 스키마
                 {
@@ -394,6 +450,32 @@ class OpenAICompatPlanner:
                   ]
                 }
                 주의: "반도체"는 그 개념을 고유하게 지시하는 head-noun이라 evidence. "소자"는 반도체소자·광소자·표시소자 등 무관 도메인에 공통 매칭되는 모호어라 weak. concept id는 표준 id "semiconductor"를 재사용했습니다.
+
+                # 예시 5 (행정/프로세스 질의 — 기술 도메인 없음 → concept_specs 비움)
+                Input:
+                {
+                  "query": "논문투고심사시스템 제안평가 가능한 전문가를 추천해줘",
+                  "filters_override": {},
+                  "include_orgs": [],
+                  "exclude_orgs": [],
+                  "top_k": 5
+                }
+
+                Output:
+                {
+                  "intent_summary": "논문투고심사시스템 제안평가 관련 전문가 탐색",
+                  "retrieval_core": ["논문투고심사시스템", "제안평가"],
+                  "semantic_query": "논문투고심사시스템 구축/운영 및 제안서 평가 경험이 있는 전문가",
+                  "role_terms": ["전문가"],
+                  "action_terms": ["추천", "평가"],
+                  "intent_flags": {},
+                  "hard_filters": {},
+                  "include_orgs": [],
+                  "exclude_orgs": [],
+                  "top_k": 5,
+                  "concept_specs": []
+                }
+                주의: 질의에 인공지능/반도체 등 특정 기술 도메인이 **명시되지 않았습니다**. 시스템·평가·제안 같은 일반 프로세스어만 있으므로 concept을 만들지 않습니다(`concept_specs: []`). 질의에 없는 'ai' 같은 도메인을 추측해 넣으면 안 됩니다.
             """
         return textwrap.dedent(prompt).strip()
 
@@ -433,6 +515,24 @@ class OpenAICompatPlanner:
         # Backward compatibility mapping
         output.core_keywords = list(output.retrieval_core)
         output.task_terms = _normalize_string_list(output.role_terms + output.action_terms)
+
+        # Concept grounding guard(정밀도 보강, gate 불변):
+        # planner(LLM)가 질의에 없는 도메인(예: 비-AI 질의에 'ai' required)을 만들면 required gate가
+        # 전체 후보를 탈락시켜 추천 0건이 되는 사고가 있었다. 어떤 concept 고유어도 질의 원문/retrieval_core에
+        # 등장하지 않으면 spurious로 보고 제거한다. cache-hit·LLM 두 경로 모두 통과하므로 캐시된 잘못된
+        # concept도 읽는 즉시 정화된다(캐시 무효화 불필요).
+        if output.concept_specs:
+            grounded, dropped = _sanitize_concept_specs(
+                output.concept_specs, normalized_query, output.retrieval_core
+            )
+            if dropped:
+                logger.warning(
+                    "planner concept grounding: 질의 미근거 concept 제거 dropped=%s kept=%s query=%r",
+                    dropped,
+                    [getattr(s, "id", "") for s in grounded],
+                    normalized_query,
+                )
+            output.concept_specs = grounded
 
         if filters_override:
             merged_filters = dict(output.hard_filters)

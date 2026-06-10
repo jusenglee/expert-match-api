@@ -246,6 +246,24 @@ class Settings(BaseSettings):
     # keyword_similarity 1차(SPLADE) 후보 풀 상한. 이 풀로 dense 재정렬 대상을 한정(HasIdCondition).
     keyword_first_stage_limit: int = 512
 
+    # multiview에서 required concept이 없는(query_exact/generic) 질의용 dense-우세 view 가중(source-aware).
+    # required gate가 없으면 dense 의미신호가 순위를 주도해야 한다. 그런데 흔한 토큰(제안평가/시스템 등)이
+    # 여러 sparse 뷰(sparse_raw + sparse_focus + concept:<id>)에서 동시에 잡혀 view_weight가 누적되며
+    # 단일 dense 뷰를 이기는 정밀도 저하가 있었다(substring 빈도 > 의미 관련도). 이 경우 dense_full을
+    # 우세하게 두고 sparse 비중을 낮춘다. 앱단 등수 RRF는 그대로 — 가중치만 source별로 바꾼다(가중 RRF/raw
+    # 합산 아님). required concept 질의(gate 활성)는 기존 search_view_weights를 그대로 쓴다.
+    multiview_generic_view_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "dense_full": 2.0,
+            "sparse_focus": 0.5,
+            "sparse_raw": 0.15,
+            "sparse_concept": 0.3,
+        }
+    )
+    # query_exact(합성) concept은 실제 도메인이 아니라 retrieval_core 구절이라, 그 concept:<id> sparse 뷰는
+    # 흔한 토큰 substring 노이즈만 키운다. query_exact일 때 concept 뷰를 만들지 않는다(planner 산출 concept은 유지).
+    multiview_drop_query_exact_concept_views: bool = True
+
     # researcher capped evidence score 가중(단순 합산 금지).
     # joint=한 chunk가 required 다개념 동시충족 / balance=min(개념별 best) / concept=개념별 best 합 / support=보조 근거.
     researcher_score_weights: dict[str, float] = Field(

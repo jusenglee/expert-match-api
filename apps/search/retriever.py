@@ -330,9 +330,16 @@ class QdrantHybridRetriever:
         return resolve_concept_plan(plan, query)
 
     def _build_view_queries(
-        self, search_query_plan: SearchQueryPlan, concept_plan: ConceptPlan
+        self,
+        search_query_plan: SearchQueryPlan,
+        concept_plan: ConceptPlan,
+        *,
+        include_concept_views: bool = True,
     ) -> list[tuple[str, str, Any]]:
-        """검색 view 목록: (source, using, query_value). 동일 sparse 텍스트는 1회만(중복 제거)."""
+        """검색 view 목록: (source, using, query_value). 동일 sparse 텍스트는 1회만(중복 제거).
+
+        include_concept_views=False면 concept:<id> sparse 뷰를 만들지 않는다(query_exact 노이즈 억제).
+        """
         views: list[tuple[str, str, Any]] = [
             ("dense_full", DENSE_VECTOR_NAME, self._build_dense_query(search_query_plan.dense_query))
         ]
@@ -352,8 +359,9 @@ class QdrantHybridRetriever:
         add_sparse("sparse_focus", search_query_plan.sparse_joint_query)
         # concept view = concept_plan.specs의 query_terms 중심(recall). evidence_terms는 검색에
         # 과투입하지 않는다(SPLADE recall 과확장 방지) — 태깅(확정)에서만 evidence를 쓴다.
-        for key, text in concept_plan.concept_queries.items():
-            add_sparse(f"{CONCEPT_VIEW_PREFIX}{key}", text)
+        if include_concept_views:
+            for key, text in concept_plan.concept_queries.items():
+                add_sparse(f"{CONCEPT_VIEW_PREFIX}{key}", text)
         return views
 
     def _build_hybrid_view_queries(
@@ -371,13 +379,29 @@ class QdrantHybridRetriever:
     def _view_plan_for_mode(
         self, search_mode: str, search_query_plan: SearchQueryPlan, concept_plan: ConceptPlan
     ) -> tuple[list[tuple[str, str, Any]], dict[str, float]]:
-        """view 기반 모드(multiview/hybrid)의 (view_queries, view_weights)."""
+        """view 기반 모드(multiview/hybrid)의 (view_queries, view_weights).
+
+        multiview에서 required concept이 없으면(query_exact/generic) dense 의미신호가 순위를 주도하도록
+        dense-우세 가중(multiview_generic_view_weights)을 쓰고, query_exact 합성 concept의 sparse 뷰는
+        흔한 토큰 substring 노이즈를 키우므로 만들지 않는다. required concept 질의(gate 활성)는 기존 동작 유지.
+        """
         if search_mode == SEARCH_MODE_HYBRID:
             return self._build_hybrid_view_queries(search_query_plan), self.settings.hybrid_view_weights
-        return (
-            self._build_view_queries(search_query_plan, concept_plan),
-            self.settings.search_view_weights,
+
+        has_required = bool(concept_plan.required)
+        include_concept_views = not (
+            concept_plan.source == "query_exact"
+            and getattr(self.settings, "multiview_drop_query_exact_concept_views", True)
         )
+        views = self._build_view_queries(
+            search_query_plan, concept_plan, include_concept_views=include_concept_views
+        )
+        weights = (
+            self.settings.search_view_weights
+            if has_required
+            else self.settings.multiview_generic_view_weights
+        )
+        return views, weights
 
     @staticmethod
     def _concept_of_source(source: str, concept_plan: ConceptPlan) -> str | None:
@@ -580,13 +604,19 @@ class QdrantHybridRetriever:
         return round(total, 6)
 
     def _build_candidate(self, researcher_id: str, chunks: list[ChunkHit], concept_plan: ConceptPlan) -> ResearcherCandidate:
-        """병합된 chunk → ResearcherCandidate(capped evidence score 또는 generic 폴백)."""
+        """병합된 chunk → ResearcherCandidate.
+
+        required 개념이 있으면 capped evidence(coverage gate) 점수를 쓴다. required 개념이 없으면
+        (query_exact optional-only 또는 concept 미감지) coverage 점수가 0으로 붕괴해 전 후보가 동점→이름순
+        으로 정렬되는 사고가 있었으므로, 검색 융합 관련도(_score_generic)로 순위를 매긴다. optional concept
+        확정분은 표시/증거선별용으로 matched_concepts에 보존한다.
+        """
         chunks.sort(key=lambda h: -h.score)
         for index, hit in enumerate(chunks, start=1):
             hit.rank = index
         identity = chunks[0].payload
 
-        if concept_plan.all_concepts:
+        if concept_plan.required:
             scored = score_researcher(
                 chunks,
                 concept_plan,
@@ -614,7 +644,9 @@ class QdrantHybridRetriever:
                 score_breakdown=scored.breakdown,
             )
 
+        # required 개념 없음: 융합 관련도로 순위(동점→이름순 붕괴 방지). optional 확정분은 표시용 보존.
         generic_score = self._score_generic(chunks)
+        matched_concepts = sorted({c for hit in chunks for c in (hit.concepts or [])})
         return ResearcherCandidate(
             researcher_id=researcher_id,
             researcher_name=identity.researcher_name,
@@ -624,6 +656,7 @@ class QdrantHybridRetriever:
             group_score=generic_score,
             rank_score=generic_score,
             chunks=chunks,
+            matched_concepts=matched_concepts,
         )
 
     # --------------------------------------------------------- aggregation

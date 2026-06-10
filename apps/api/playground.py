@@ -65,7 +65,7 @@ PLAYGROUND_HTML = dedent(
         }
 
         .container {
-          max-width: 1200px;
+          max-width: 1440px;
           margin: 2rem auto;
           padding: 0 1.5rem;
           display: grid;
@@ -269,6 +269,8 @@ PLAYGROUND_HTML = dedent(
           background: var(--assistant-msg);
           border-bottom-left-radius: 0.25rem;
           border: 1px solid var(--panel-border);
+          max-width: 100%;
+          width: 100%;
         }
 
         .msg .role {
@@ -351,6 +353,172 @@ PLAYGROUND_HTML = dedent(
           font-size: 0.85rem;
           margin-top: 0.5rem;
         }
+
+        /* ── 검색 점수 근거 패널: 증거 패널과 구분되는 인디고 분석형 카드 ── */
+        .score-details {
+          background: linear-gradient(180deg, rgba(99,102,241,0.10), rgba(99,102,241,0.02));
+          border: 1px solid rgba(129,140,248,0.28);
+          border-left: 3px solid #818cf8;
+          border-radius: 0.9rem;
+          padding: 0.8rem 1rem;
+          margin-top: 1rem;
+        }
+        .score-details > summary {
+          cursor: pointer;
+          font-weight: 700;
+          font-size: 0.85rem;
+          color: #a5b4fc;
+          display: flex;
+          align-items: center;
+          gap: 0.45rem;
+          list-style: none;
+        }
+        .score-details > summary::-webkit-details-marker { display: none; }
+        .score-details > summary::before { content: '📊'; font-size: 0.95rem; }
+        .score-panel { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 1rem; }
+        .score-hero {
+          display: flex;
+          align-items: center;
+          gap: 1.5rem;
+          flex-wrap: wrap;
+          padding-bottom: 0.85rem;
+          border-bottom: 1px dashed rgba(255,255,255,0.12);
+        }
+        .score-hero .metric { display: flex; flex-direction: column; gap: 2px; }
+        .score-hero .metric .k {
+          font-size: 0.66rem; color: var(--text-muted);
+          text-transform: uppercase; letter-spacing: 0.06em;
+        }
+        .score-hero .metric .v { font-size: 1.55rem; font-weight: 800; color: #c7d2fe; line-height: 1; }
+        .score-hero .metric .v.sub { font-size: 1.05rem; color: var(--text-main); }
+        .cov-badge { padding: 4px 11px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }
+        .cov-joint { background: rgba(16,185,129,0.16); color: #34d399; }
+        .cov-separate { background: rgba(59,130,246,0.16); color: #60a5fa; }
+        .cov-partial { background: rgba(245,158,11,0.16); color: #fbbf24; }
+        .score-section-label {
+          font-size: 0.68rem; font-weight: 700; color: var(--text-muted);
+          text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 0.5rem;
+        }
+        .bar-row {
+          display: grid; grid-template-columns: 90px 1fr 72px;
+          align-items: center; gap: 0.65rem; margin-bottom: 0.4rem; font-size: 0.78rem;
+        }
+        .bar-row .bk { color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .bar-track { height: 8px; background: rgba(255,255,255,0.07); border-radius: 999px; overflow: hidden; }
+        .bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #6366f1, #a5b4fc); }
+        .bar-fill.neg { background: linear-gradient(90deg, #ef4444, #f87171); }
+        .bar-row .bv { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-main); font-weight: 600; }
+        .bar-row .bv.neg { color: #f87171; }
+        .chip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+        .chip-concept {
+          padding: 3px 10px; border-radius: 6px; font-size: 0.73rem;
+          background: rgba(129,140,248,0.16); color: #a5b4fc; font-weight: 600;
+        }
+        .match-list { display: flex; flex-direction: column; gap: 0.5rem; }
+        .match-item {
+          display: flex; align-items: flex-start; gap: 0.65rem;
+          padding: 0.55rem 0.65rem; background: rgba(255,255,255,0.025);
+          border: 1px solid rgba(255,255,255,0.06); border-radius: 0.65rem;
+        }
+        .match-rank {
+          flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px;
+          background: rgba(99,102,241,0.22); color: #a5b4fc;
+          font-size: 0.7rem; font-weight: 700;
+          display: flex; align-items: center; justify-content: center;
+        }
+        .match-body { flex: 1; min-width: 0; }
+        .match-top { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+        .doc-badge {
+          padding: 2px 8px; border-radius: 5px; font-size: 0.68rem; font-weight: 700;
+          background: rgba(129,140,248,0.14); color: #c7d2fe;
+        }
+        .match-title {
+          font-size: 0.8rem; font-weight: 600; color: var(--text-main);
+          flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .match-score {
+          margin-left: auto; font-size: 0.78rem; font-variant-numeric: tabular-nums;
+          color: #c7d2fe; font-weight: 700;
+        }
+        .match-meta { font-size: 0.7rem; color: var(--text-muted); margin-top: 3px; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+
+        /* ── 수행 증거/참고 프로필 패널: 그린 액센트 실적 기록 카드 ── */
+        .evidence-details {
+          background: linear-gradient(180deg, rgba(16,185,129,0.08), rgba(16,185,129,0.015));
+          border: 1px solid rgba(16,185,129,0.22);
+          border-left: 3px solid var(--accent);
+          border-radius: 0.9rem;
+          padding: 0.8rem 1rem;
+          margin-top: 1rem;
+        }
+        .evidence-details.is-profile {
+          background: rgba(255,255,255,0.02);
+          border: 1px dashed rgba(148,163,184,0.3);
+          border-left: 3px dashed var(--text-muted);
+        }
+        .evidence-details > summary {
+          cursor: pointer;
+          font-weight: 700;
+          font-size: 0.85rem;
+          color: var(--accent);
+          display: flex;
+          align-items: center;
+          gap: 0.45rem;
+          list-style: none;
+        }
+        .evidence-details.is-profile > summary { color: var(--text-muted); }
+        .evidence-details > summary::-webkit-details-marker { display: none; }
+        .evidence-details > summary::before { content: '🗂️'; font-size: 0.95rem; }
+        .evidence-details.is-profile > summary::before { content: '👤'; }
+        .ev-list { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 0.6rem; }
+        .ev-item {
+          display: flex; gap: 0.7rem; align-items: flex-start;
+          padding: 0.7rem 0.8rem;
+          background: rgba(255,255,255,0.025);
+          border: 1px solid rgba(255,255,255,0.06);
+          border-radius: 0.7rem;
+        }
+        .ev-type {
+          flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+          gap: 3px; min-width: 54px; padding-top: 2px;
+        }
+        .ev-type .ic { font-size: 1.1rem; line-height: 1; }
+        .ev-type .lb {
+          font-size: 0.62rem; font-weight: 700; letter-spacing: 0.02em;
+          padding: 1px 7px; border-radius: 999px;
+          background: rgba(16,185,129,0.14); color: #34d399; white-space: nowrap;
+        }
+        .ev-type.t-patent .lb { background: rgba(245,158,11,0.14); color: #fbbf24; }
+        .ev-type.t-project .lb { background: rgba(59,130,246,0.14); color: #60a5fa; }
+        .ev-type.t-assessor_activity .lb { background: rgba(168,85,247,0.14); color: #c084fc; }
+        .ev-type.t-specialty .lb { background: rgba(236,72,153,0.14); color: #f472b6; }
+        .ev-type.t-profile .lb { background: rgba(148,163,184,0.14); color: var(--text-muted); }
+        .ev-body { flex: 1; min-width: 0; }
+        .ev-title {
+          font-size: 0.88rem; font-weight: 600; color: var(--text-main); line-height: 1.4;
+          display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+          overflow: hidden; word-break: break-word;
+        }
+        .ev-meta { margin-top: 0.35rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+        .ev-date {
+          font-size: 0.72rem; font-weight: 600; color: var(--text-muted);
+          font-variant-numeric: tabular-nums;
+        }
+        .ev-detail {
+          font-size: 0.72rem; padding: 2px 8px; border-radius: 5px;
+          background: rgba(16,185,129,0.12); color: #34d399; font-weight: 600;
+        }
+        .ev-snippet {
+          margin-top: 0.5rem; padding: 0.45rem 0.65rem;
+          font-size: 0.78rem; line-height: 1.5; color: var(--text-muted);
+          background: rgba(0,0,0,0.18); border-left: 2px solid rgba(16,185,129,0.4);
+          border-radius: 0 0.4rem 0.4rem 0;
+        }
+        .ev-id {
+          margin-top: 0.4rem; font-size: 0.64rem; color: rgba(148,163,184,0.6);
+          font-family: 'Fira Code', monospace; word-break: break-all;
+        }
+        .ev-empty { font-size: 0.85rem; margin-top: 0.6rem; color: var(--text-muted); }
 
         @keyframes fadeInDown {
           from { opacity: 0; transform: translateY(-20px); }
@@ -533,46 +701,125 @@ PLAYGROUND_HTML = dedent(
           return new Map(traces.map(item => [item.expert_id, item]));
         }
 
+        const DOC_TYPE_LABEL = {
+          paper: '논문', patent: '특허', project: '과제',
+          assessor_activity: '평가활동', specialty: '전문분야', profile: '프로필'
+        };
+        const BREAKDOWN_LABEL = {
+          joint: '동시 매칭', balance: '균형', concept: '개념 합',
+          support: '보조 근거', weak_penalty: '약근거 감점'
+        };
+        const FAMILY_LABEL = {
+          achievement: '실적', assessment: '평가', expertise: '전문성', identity: '정체성'
+        };
+        const COVERAGE_META = {
+          joint: { label: '동시 충족', cls: 'cov-joint' },
+          separate: { label: '개별 충족', cls: 'cov-separate' },
+          partial: { label: '부분 충족', cls: 'cov-partial' }
+        };
+
+        function fmtScore(v) {
+          const n = Number(v);
+          return Number.isFinite(n) ? n.toFixed(3) : escapeHtml(v ?? '-');
+        }
+
+        function renderBars(obj, labelMap, sectionLabel, signed) {
+          const entries = Object.entries(obj || {})
+            .filter(([, v]) => Number.isFinite(Number(v)) && Number(v) !== 0);
+          if (!entries.length) return '';
+          const maxAbs = Math.max(...entries.map(([, v]) => Math.abs(Number(v))), 1e-9);
+          const rows = entries.map(([key, val]) => {
+            const v = Number(val);
+            const pct = Math.max(3, Math.round(Math.abs(v) / maxAbs * 100));
+            const neg = v < 0;
+            const sign = signed && v > 0 ? '+' : '';
+            return `<div class="bar-row">
+              <span class="bk">${escapeHtml(labelMap[key] || key)}</span>
+              <span class="bar-track"><span class="bar-fill ${neg ? 'neg' : ''}" style="width:${pct}%"></span></span>
+              <span class="bv ${neg ? 'neg' : ''}">${sign}${fmtScore(v)}</span>
+            </div>`;
+          }).join('');
+          return `<div><div class="score-section-label">${escapeHtml(sectionLabel)}</div>${rows}</div>`;
+        }
+
+        function renderConceptChips(concepts) {
+          const items = (concepts || []).filter(Boolean);
+          if (!items.length) return '';
+          return `<div><div class="score-section-label">매칭 개념</div>
+            <div class="chip-row">${items.map(c => `<span class="chip-concept">${escapeHtml(c)}</span>`).join('')}</div></div>`;
+        }
+
+        function renderMatchItems(items) {
+          const list = (items || []).filter(Boolean);
+          if (!list.length) return '';
+          const rows = list.map((it, i) => {
+            const dt = DOC_TYPE_LABEL[it.doc_type] || it.doc_type || '-';
+            const concepts = (it.concepts || []).filter(Boolean);
+            const displayOnly = (it.display_only_concepts || []).filter(Boolean);
+            const sources = (it.sources || []).filter(Boolean);
+            const meta = [
+              concepts.length ? `개념 ${concepts.map(escapeHtml).join(', ')}` : '',
+              displayOnly.length ? `제목만 ${displayOnly.map(escapeHtml).join(', ')}` : '',
+              sources.length ? `경로 ${sources.map(escapeHtml).join(', ')}` : '',
+              it.chunk_id ? `id ${escapeHtml(it.chunk_id)}` : ''
+            ].filter(Boolean).map(m => `<span>${m}</span>`).join('');
+            const score = it.score != null ? it.score : it.fused_score;
+            return `<div class="match-item">
+              <span class="match-rank">${it.rank != null ? escapeHtml(it.rank) : i + 1}</span>
+              <div class="match-body">
+                <div class="match-top">
+                  <span class="doc-badge">${escapeHtml(dt)}</span>
+                  ${it.title ? `<span class="match-title" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>` : ''}
+                  ${score != null ? `<span class="match-score">${fmtScore(score)}</span>` : ''}
+                </div>
+                ${meta ? `<div class="match-meta">${meta}</div>` : ''}
+              </div>
+            </div>`;
+          }).join('');
+          return `<div><div class="score-section-label">매칭 청크 (상위 ${list.length})</div><div class="match-list">${rows}</div></div>`;
+        }
+
+        function renderScorePanel(d) {
+          const hasBreakdown = Object.keys(d.breakdown || {}).length > 0;
+          if (d.finalScore == null && !(d.items && d.items.length) && !hasBreakdown) return '';
+          const cov = COVERAGE_META[d.coverageType];
+          const covBadge = cov ? `<span class="cov-badge ${cov.cls}">${cov.label}</span>` : '';
+          const rankMetric = d.rankScore != null
+            ? `<div class="metric"><span class="k">표시 순위 점수</span><span class="v sub">${fmtScore(d.rankScore)}</span></div>` : '';
+          const hero = `<div class="score-hero">
+            <div class="metric"><span class="k">검색 원점수</span><span class="v">${fmtScore(d.finalScore)}</span></div>
+            ${rankMetric}
+            ${covBadge}
+          </div>`;
+          const body = [
+            hero,
+            renderBars(d.breakdown, BREAKDOWN_LABEL, '점수 구성', true),
+            renderConceptChips(d.matchedConcepts),
+            renderBars(d.familyContributions, FAMILY_LABEL, '영역별 기여', false),
+            renderMatchItems(d.items)
+          ].filter(Boolean).join('');
+          return `<details class="score-details">
+            <summary>검색 점수 근거</summary>
+            <div class="score-panel">${body}</div>
+          </details>`;
+        }
+
         function renderRetrievalTrace(expertId, retrievalTraceMap) {
           const trace = retrievalTraceMap.get(expertId);
           if (!trace) return '';
-
-          const matches = trace.matches || [];
-          const matchLines = matches.length
-            ? `<ul style="font-size: 0.85rem; margin-top: 0.5rem">
-                ${matches.map(item => {
-                  const contribution = item.contribution != null ? `RRF +${escapeHtml(item.contribution)}` : '';
-                  const rawScore = item.raw_score != null || item.score != null ? `raw ${escapeHtml(item.raw_score ?? item.score)}` : '';
-                  const meta = [
-                    escapeHtml(item.doc_type),
-                    `${escapeHtml(item.path || '-')} rank ${escapeHtml(item.rank)}`,
-                    contribution,
-                    rawScore,
-                    item.chunk_id ? `id ${escapeHtml(item.chunk_id)}` : ''
-                  ].filter(Boolean).join(' · ');
-                  return `<li style="margin-bottom: 0.6rem">
-                    <div>${meta}</div>
-                    ${item.title ? `<div style="font-weight: 600; color: var(--text-main)">${escapeHtml(item.title)}${item.date ? ` (${escapeHtml(item.date)})` : ''}</div>` : ''}
-                    ${item.snippet ? `<div style="color: var(--text-muted); line-height: 1.45">${escapeHtml(item.snippet)}</div>` : ''}
-                  </li>`;
-                }).join('')}
-              </ul>`
-            : '<div style="font-size: 0.85rem; margin-top: 0.5rem">chunk match trace unavailable</div>';
-
-          const docTypes = (trace.doc_types || []).join(', ') || 'unknown';
-
-          return `
-            <details>
-              <summary>검색 점수 근거</summary>
-              <div style="font-size: 0.85rem; margin-top: 0.5rem">
-                <div><b>매칭 doc_type:</b> ${escapeHtml(docTypes)}</div>
-                <div><b>집계 점수(RRF 원점수):</b> ${escapeHtml(trace.final_score)}</div>
-                <div><b>hit 수:</b> stable ${escapeHtml(trace.stable_hits ?? 0)} / expanded ${escapeHtml(trace.expanded_hits ?? 0)}</div>
-                ${trace.score_formula ? `<div><b>계산식:</b> ${escapeHtml(trace.score_formula)}</div>` : ''}
-              </div>
-              ${matchLines}
-            </details>
-          `;
+          return renderScorePanel({
+            finalScore: trace.final_score,
+            rankScore: null,
+            coverageType: trace.coverage_type,
+            breakdown: trace.score_breakdown,
+            matchedConcepts: trace.matched_concepts,
+            familyContributions: trace.family_contributions,
+            items: (trace.matches || []).map(m => ({
+              doc_type: m.doc_type, title: m.title, score: m.fused_score,
+              concepts: m.concepts, display_only_concepts: m.display_only_concepts,
+              sources: m.sources, rank: m.rank, chunk_id: m.chunk_id
+            }))
+          });
         }
 
         function renderMatchBadges(badges) {
@@ -598,59 +845,68 @@ PLAYGROUND_HTML = dedent(
 
         function renderScoreExplanation(recommendation, retrievalTraceMap) {
           const explanation = recommendation.score_explanation || {};
+          const trace = retrievalTraceMap.get(recommendation.expert_id) || {};
           const chunks = explanation.top_chunks || [];
-          if (!chunks.length) return renderRetrievalTrace(recommendation.expert_id, retrievalTraceMap);
-          const breakdown = explanation.score_breakdown || {};
-          const breakdownText = Object.keys(breakdown).length
-            ? Object.entries(breakdown).map(([key, value]) => `${escapeHtml(key)} ${escapeHtml(value)}`).join(' · ')
-            : '';
-          return `
-            <details>
-              <summary>검색 점수 근거</summary>
-              <div style="font-size: 0.85rem; margin-top: 0.5rem">
-                <div><b>최종 검색 원점수:</b> ${escapeHtml(explanation.final_score ?? '-')}</div>
-                <div><b>표시 순위 점수:</b> ${escapeHtml(explanation.rank_score ?? '-')}</div>
-                ${breakdownText ? `<div><b>점수 분해:</b> ${breakdownText}</div>` : ''}
-              </div>
-              <ul style="font-size: 0.85rem; margin-top: 0.5rem">
-                ${chunks.map(item => {
-                  const meta = [
-                    escapeHtml(item.doc_type || '-'),
-                    item.score != null ? `score ${escapeHtml(item.score)}` : '',
-                    (item.concepts || []).length ? `concepts ${(item.concepts || []).map(escapeHtml).join(', ')}` : '',
-                    (item.display_only_concepts || []).length ? `제목만(미확정) ${(item.display_only_concepts || []).map(escapeHtml).join(', ')}` : '',
-                    (item.sources || []).length ? `sources ${(item.sources || []).map(escapeHtml).join(', ')}` : ''
-                  ].filter(Boolean).join(' · ');
-                  return `<li style="margin-bottom: 0.6rem">
-                    <div>${meta}</div>
-                    ${item.title ? `<div style="font-weight: 600; color: var(--text-main)">${escapeHtml(item.title)}</div>` : ''}
-                  </li>`;
-                }).join('')}
-              </ul>
-            </details>
-          `;
+          if (!chunks.length && !Object.keys(explanation).length) {
+            return renderRetrievalTrace(recommendation.expert_id, retrievalTraceMap);
+          }
+          const breakdown = (explanation.score_breakdown && Object.keys(explanation.score_breakdown).length)
+            ? explanation.score_breakdown : trace.score_breakdown;
+          const source = chunks.length ? chunks : (trace.matches || []);
+          return renderScorePanel({
+            finalScore: explanation.final_score != null ? explanation.final_score : trace.final_score,
+            rankScore: explanation.rank_score,
+            coverageType: trace.coverage_type,
+            breakdown: breakdown,
+            matchedConcepts: trace.matched_concepts,
+            familyContributions: trace.family_contributions,
+            items: source.map(m => ({
+              doc_type: m.doc_type, title: m.title,
+              score: m.score != null ? m.score : m.fused_score,
+              concepts: m.concepts, display_only_concepts: m.display_only_concepts,
+              sources: m.sources, rank: m.rank, chunk_id: m.chunk_id
+            }))
+          });
         }
 
+        const EV_TYPE_ICON = {
+          paper: '📄', patent: '🔖', project: '🧪',
+          assessor_activity: '⚖️', specialty: '🎯', profile: '👤'
+        };
+
         function renderEvidenceItems(evidence) {
-          const items = evidence || [];
+          const items = (evidence || []).filter(Boolean);
           if (!items.length) {
-            return '<div style="font-size: 0.85rem; margin-top: 0.5rem; color: var(--text-muted)">표시할 증거가 없습니다.</div>';
+            return '<div class="ev-empty">표시할 증거가 없습니다.</div>';
           }
-          return `<ul style="font-size: 0.85rem; margin-top: 0.5rem">
+          return `<div class="ev-list">
             ${items.map(ev => {
-              const meta = [
-                `[${escapeHtml(ev.type)}]`,
-                ev.date ? escapeHtml(ev.date) : '',
-                ev.detail ? escapeHtml(ev.detail) : '',
-                ev.chunk_id ? `id ${escapeHtml(ev.chunk_id)}` : ''
-              ].filter(Boolean).join(' · ');
-              return `<li style="margin-bottom: 0.75rem">
-                <div style="font-weight: 600; color: var(--text-main)">${escapeHtml(ev.title || ev.chunk_id || '-')}</div>
-                <div style="color: var(--text-muted)">${meta}</div>
-                ${ev.snippet ? `<div style="margin-top: 0.25rem; line-height: 1.45">${escapeHtml(ev.snippet)}</div>` : ''}
-              </li>`;
+              const type = ev.type || '';
+              const ic = EV_TYPE_ICON[type] || '📁';
+              const label = DOC_TYPE_LABEL[type] || type || '기타';
+              const titleText = escapeHtml(ev.title || ev.chunk_id || '-');
+              // 제목과 사실상 같은 스니펫(specialty 경력 블롭 등)은 중복이라 숨긴다.
+              const t = (ev.title || '').trim();
+              const s = (ev.snippet || '').trim();
+              const showSnippet = s.length > 0 && !(t.length > 0
+                && (t.startsWith(s.slice(0, 40)) || s.startsWith(t.slice(0, 40))));
+              return `<div class="ev-item">
+                <div class="ev-type t-${escapeHtml(type)}">
+                  <span class="ic">${ic}</span>
+                  <span class="lb">${escapeHtml(label)}</span>
+                </div>
+                <div class="ev-body">
+                  <div class="ev-title" title="${titleText}">${titleText}</div>
+                  ${(ev.date || ev.detail) ? `<div class="ev-meta">
+                    ${ev.date ? `<span class="ev-date">${escapeHtml(ev.date)}</span>` : ''}
+                    ${ev.detail ? `<span class="ev-detail">${escapeHtml(ev.detail)}</span>` : ''}
+                  </div>` : ''}
+                  ${showSnippet ? `<div class="ev-snippet">${escapeHtml(ev.snippet)}</div>` : ''}
+                  ${ev.chunk_id ? `<div class="ev-id">${escapeHtml(ev.chunk_id)}</div>` : ''}
+                </div>
+              </div>`;
             }).join('')}
-          </ul>`;
+          </div>`;
         }
         
         function pushMessage(role, html, isError = false) {
@@ -748,12 +1004,12 @@ PLAYGROUND_HTML = dedent(
                     ${renderEvidenceSummary(r.evidence_summary)}
                     <div style="font-size: 0.9rem; margin-bottom: 0.5rem"><b>추천 사유:</b> ${escapeHtml(r.recommendation_reason || '')}</div>
                     ${renderScoreExplanation(r, retrievalTraceMap)}
-                    <details>
+                    <details class="evidence-details">
                       <summary>수행 증거 및 실적</summary>
                       ${renderEvidenceItems(r.evidence)}
                     </details>
                     ${(r.profile_evidence && r.profile_evidence.length) ? `
-                    <details>
+                    <details class="evidence-details is-profile">
                       <summary>참고 프로필 (질의 매칭 아님 · ${r.profile_evidence.length}건)</summary>
                       ${renderEvidenceItems(r.profile_evidence)}
                     </details>` : ''}

@@ -267,3 +267,60 @@ def test_apply_request_constraints_preserves_concept_specs():
         filters_override=None, include_orgs=None, exclude_orgs=None, top_k=None,
     )
     assert result.concept_specs and result.concept_specs[0].id == "semiconductor"
+
+
+# ---------------------------------------------------------------------------
+# concept grounding guard — 질의 미근거(hallucinated) concept 제거 (정밀도 보강)
+# ---------------------------------------------------------------------------
+def test_grounding_guard_drops_ungrounded_required_concept():
+    # 질의에 인공지능/AI가 전혀 없는데 planner가 'ai' required를 산출 → gate 0건 사고. 제거되어야 한다.
+    out = PlannerOutput(
+        intent_summary="x",
+        retrieval_core=["논문투고심사시스템", "제안평가"],
+        concept_specs=[
+            ConceptSpec(
+                id="ai", label="인공지능", role="required",
+                query_terms=["인공지능", "AI"], evidence_terms=["인공지능", "AI", "딥러닝"],
+            ),
+        ],
+    )
+    result = OpenAICompatPlanner._apply_request_constraints(
+        output=out,
+        normalized_query="논문투고심사시스템 제안평가 가능한 전문가를 추천해줘",
+        filters_override=None, include_orgs=None, exclude_orgs=None, top_k=None,
+    )
+    assert result.concept_specs == []  # spurious 'ai' 제거 → required gate 미작동
+
+
+def test_grounding_guard_keeps_grounded_drops_spurious():
+    out = PlannerOutput(
+        intent_summary="x",
+        retrieval_core=["반도체"],
+        concept_specs=[
+            ConceptSpec(id="ai", label="인공지능", role="required",
+                        query_terms=["인공지능", "AI"], evidence_terms=["딥러닝"]),
+            ConceptSpec(id="semiconductor", label="반도체", role="required",
+                        query_terms=["반도체"], evidence_terms=["반도체"]),
+        ],
+    )
+    result = OpenAICompatPlanner._apply_request_constraints(
+        output=out, normalized_query="반도체 설계 전문가 추천",
+        filters_override=None, include_orgs=None, exclude_orgs=None, top_k=None,
+    )
+    assert [s.id for s in result.concept_specs] == ["semiconductor"]
+
+
+def test_grounding_guard_ignores_generic_substring_match():
+    # 'ai' concept의 유일한 근거어가 generic 'system' 부분일치라면 grounding 불인정 → 제거.
+    out = PlannerOutput(
+        intent_summary="x",
+        retrieval_core=["논문투고심사시스템"],
+        concept_specs=[
+            ConceptSpec(id="ai", label="인공지능", role="required", query_terms=["시스템"]),
+        ],
+    )
+    result = OpenAICompatPlanner._apply_request_constraints(
+        output=out, normalized_query="논문투고심사시스템 제안평가",
+        filters_override=None, include_orgs=None, exclude_orgs=None, top_k=None,
+    )
+    assert result.concept_specs == []

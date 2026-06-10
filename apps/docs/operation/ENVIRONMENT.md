@@ -92,6 +92,10 @@ Sparse fallback 체인: `로컬 PIXIE-Splade-v1.0 → online telepix/PIXIE-Splad
 |---|---|---|
 | `NTIS_HYBRID_VIEW_WEIGHTS` | `{"dense_full": 1.0, "sparse_raw": 1.0}` | `hybrid` 모드의 view 가중(균등 RRF) |
 | `NTIS_KEYWORD_FIRST_STAGE_LIMIT` | `512` | `keyword_similarity` 모드 1차(SPLADE) 후보 풀 상한 |
+| `NTIS_MULTIVIEW_GENERIC_VIEW_WEIGHTS` | `{"dense_full": 2.0, "sparse_focus": 0.5, "sparse_raw": 0.15, "sparse_concept": 0.3}` | multiview에서 **required concept이 없는**(query_exact/generic) 질의용 dense-우세 가중. required 질의는 `NTIS_SEARCH_VIEW_WEIGHTS`를 그대로 쓴다 |
+| `NTIS_MULTIVIEW_DROP_QUERY_EXACT_CONCEPT_VIEWS` | `true` | query_exact(합성) concept의 `concept:<id>` sparse 뷰 생성 안 함(흔한 토큰 substring 노이즈 억제). planner 산출 concept 뷰는 유지 |
+
+> **source-aware 가중(정밀도 보강):** required concept이 없으면 dense 의미신호가 순위를 주도해야 하는데, `제안평가`/`시스템` 같은 흔한 토큰이 여러 sparse 뷰에서 동시에 잡혀 융합 점수가 누적되며 dense를 이기는 저하가 있었다. 이 경우 dense-우세 가중 + query_exact concept 뷰 제거로 dense를 anchor한다. 앱단 등수 RRF는 그대로(가중치만 source별) — 가중 RRF/raw 합산이 아니다. [`../architecture/DESIGN_GUIDELINES.md §6.5`](../architecture/DESIGN_GUIDELINES.md).
 
 ## Evidence 리랭커 (chunk 근거 선별)
 

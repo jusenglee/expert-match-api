@@ -174,6 +174,7 @@ SearchQueryPlan = {
 ### 5.3 연구자 집계 (v2.x 핵심)
 chunk hit을 `researcher_id`로 묶어 연구자 후보 1건으로 만든다.
 - 각 연구자 점수 = 그 연구자의 chunk hit들에 대한 **RRF 누적**.
+- **점수 경로 분기(required 유무):** `required_concepts`가 **있으면** capped evidence 점수(joint/balance/concept/support, `score_researcher`)를 쓴다. **없으면**(query_exact 합성/도메인 미감지) 이 점수는 0으로 붕괴하므로 — concept 충족이 전제라서 — 대신 **검색 융합 관련도(`_score_generic`)** 로 순위를 매긴다. 그러지 않으면 전 후보가 동점(0)→이름순으로 정렬되는 사고가 난다. optional concept 확정분은 표시/증거선별용 `matched_concepts`로 보존한다.
 - **concept coverage gate:** `required_concepts`가 있는 질의는 연구자 단위로 필수 개념을 모두 만족해야 한다. 개념 근거가 없는 chunk는 제거하고, 남은 chunk의 concept union이 부족하면 해당 연구자는 탈락한다.
 - **doc_type별 캡:** 한 doc_type에서 상위 `N`개 chunk까지만 점수에 기여(`doc_type_chunk_cap`, 기본 3). 다작 연구자가 한 영역 chunk 수로 순위를 독식하지 못하게 한다.
 - **doc_type prior(기본 equal):** intent에 따라 family별 기여 가중을 줄 수 있으나 기본값은 equal. (§6)
@@ -221,6 +222,12 @@ chunk이 1급 단위가 되면서 evidence 선별에 cross-encoder가 자연스�
 
 - **결정:** 기본값 `multiview`는 §2/§6의 고정 제약(가중 RRF·리랭커 금지)을 **변함없이** 유지한다. `hybrid`/`keyword_similarity`는 사용자가 요청에서 명시 선택해야만 동작하는 opt-in 대체 전략이다. 특히 `keyword_similarity`의 dense 재정렬은 cascade 리랭크 성격이라 기본 제약을 비켜가므로 **기본 경로로 승격하지 않는다.**
 - **이유:** 기본 추천 품질의 토대는 단순·결정론적으로 유지하되(§6.3), 운영/실험이 다른 회수 전략을 비교할 수 있게 레버를 설계에 명시한다. 모드는 L3 캐시 키에 포함돼 모드별 결과가 섞이지 않는다.
+
+#### 6.5.1 multiview source-aware 가중 (정밀도 보강, 고정 제약 미위반)
+multiview에서 **required concept이 없는**(query_exact 합성/도메인 미감지) 질의는 dense 의미신호가 순위를 주도해야 한다. 그런데 `fuse_chunk_score`가 한 chunk의 **모든 view weight를 합산**하므로, `제안평가`/`시스템` 같은 흔한 토큰이 `sparse_raw`+`sparse_focus`+`concept:<id>` 여러 sparse 뷰에서 동시에 잡히면 그 누적(예: 0.25+0.7+0.5+0.5)이 단일 dense 뷰(1.0)를 이겨, substring 빈도가 의미 관련도를 누르는 저하가 있었다.
+
+- **동작:** required concept이 없으면 dense-우세 가중(`multiview_generic_view_weights`, 기본 dense_full=2.0)을 쓰고, query_exact 합성 concept의 `concept:<id>` sparse 뷰는 만들지 않는다(`multiview_drop_query_exact_concept_views=true`). required concept 질의(gate 활성)는 기존 `search_view_weights`·concept 뷰를 **그대로** 쓴다.
+- **제약 관계:** 앱단 **등수 기반 RRF는 그대로**이고 view weight 값만 source별로 바꾼 것이다(§6.1의 가중 RRF/raw score 합산 금지를 위반하지 않음). 리랭커도 아니다 — 순위 산출 입력(view 구성·가중)만 정밀화했다.
 
 ---
 

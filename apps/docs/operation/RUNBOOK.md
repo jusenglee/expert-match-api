@@ -114,14 +114,16 @@ curl -X POST http://127.0.0.1:8011/recommend `
 - **Fallback:** LLM 오류/JSON 파싱 실패 시 휴리스틱·결정론적 전환 안내
 - **Data Gap:** 특정 연구자의 데이터 누락 경고
 
-### 로그 예시 (질의 → 플래너 → 1차 → 2차 → 집계)
+### 로그 예시 (질의 → 플래너 → multiview 검색 → 집계 → 사유)
 ```
-[09:45:51.125] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend top_k=5 exclude_orgs=1 query='드론 화재 진압 평가위원 추천'
-[09:45:52.010] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 완료: retrieval_core=['드론','화재 진압'] core_keywords=['드론','화재 진압'] role_terms=['평가위원'] action_terms=['추천'] semantic_query='드론 기반 화재 진압 기술 전문가' exclude_orgs=['A기관'] hard_filters={} top_k=5
-[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 쿼리 컴파일: mode=multiview_flat_relevance retrieval_keywords=['드론','화재','진압'] dense_query='드론 기반 화재 진압 기술 전문가' sparse_queries={'sparse_joint':'드론 화재 진압'} limits={prefetch:256,groups:80}
-[09:45:52.095] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] relevance gate: version=v1 active_concepts=[]
-[09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 집계 완료: elapsed_ms=210.0 groups=37 candidates=24 org_filtered=1 final_hits=23
-[09:45:54.330] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 추천 응답 준비: retrieved_count=15 recommendations=5 data_gaps=0 top_k_used=5 timers={'plan_ms':880,'search_ms':210,'total_ms':3205}
+[09:45:51.125] [INFO] [trace=abc123] [POST /recommend] [apps.api.main] 사용자 질의 수신: endpoint=/recommend raw_chars=18 normalized_chars=18 top_k=5 include_orgs=0 exclude_orgs=1 filter_keys=[] query='드론 화재 진압 평가위원 추천'
+[09:45:51.130] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.service] 추천 파이프라인 시작: query_chars=18 top_k=5 search_mode=multiview include_orgs=0 exclude_orgs=1 query='드론 화재 진압 평가위원 추천'
+[09:45:52.010] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.planner] 플래너 내부 완료: mode=openai_compat retrieval_core=['드론','화재 진압'] core_keywords=['드론','화재 진압'] role_terms=['평가위원'] action_terms=['추천'] semantic_query='드론 기반 화재 진압 기술 전문가' hard_filters={} top_k=5
+[09:45:52.080] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 컴파일: search_mode=multiview mode=multiview_flat_relevance required=['fire_suppression','drone'](source=planner) optional=[] limits={prefetch:256} gate=True
+[09:45:52.220] [INFO] [trace=abc123] [POST /recommend] [apps.search.retriever] 검색 집계: mode=multiview_flat_relevance elapsed_ms=140.0 view_counts={'dense_full':256,'sparse_raw':256,'sparse_focus':256,'concept:fire_suppression':256,'concept:drone':256} merged_chunks=812 main=23 fallback=4 org_filtered=1 final=27
+[09:45:52.230] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.service] 검색 단계 완료: elapsed_ms=150.0 hits=27 cache_hit=False mode=multiview_flat_relevance retrieval_keywords=['드론','화재 진압'] group_count=None aggregated=None org_filtered=1 final=27
+[09:45:54.330] [INFO] [trace=abc123] [POST /recommend] [apps.recommendation.service] 추천 파이프라인 완료: query='드론 화재 진압 평가위원 추천' retrieved=27 recommended=5 data_gaps=0 total_ms=3205.0
 ```
+> `group_count`/`aggregated`가 `None`인 것은 정상이다 — production search()는 진단용 grouped 필드를 방출하지 않는다(아래). search_mode가 `keyword_similarity`면 `검색 집계`의 view_counts는 `{'sparse_keyword':..,'dense_rerank':..}`, `hybrid`면 `{'dense_full':..,'sparse_raw':..}`로 나온다.
 
-`trace.query_payload`에서 `retrieval_mode`, `retrieval_keywords`, `search_query_plan`, `semantic_query`, `group_count`, `aggregated_candidate_count`, `relevance_gate_active_concepts`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`, `org_filtered_count`를 확인할 수 있다(벡터 값·전체 payload는 미노출).
+`trace.query_payload`(production `search()`)에서 `retrieval_mode`, `search_mode`, `retrieval_keywords`, `search_query_plan`, `semantic_query`, `concept_plan`, `relevance_gate_enabled`, `relevance_gate_active_concepts`, `view_counts`, `merged_chunk_count`, `main_count`, `fallback_count`, `org_filtered_count`, `final_hit_count`, `weights`, `search_limits`를 확인할 수 있다(벡터 값·전체 payload는 미노출). 참고: `group_count`, `aggregated_candidate_count`, `relevance_kept_chunk_count`, `relevance_dropped_chunk_count`, `relevance_filtered_candidate_count`는 진단용 `search_grouped_diagnostic` 경로에서만 포함된다.

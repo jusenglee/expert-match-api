@@ -44,6 +44,7 @@
 - 사용자 노출 결과 수는 최대 15명이다. 요청 `top_k`는 1~15만 허용하고, planner가 더 큰 `top_k`를 내도 런타임이 15로 clamp한다.
 - 출력이 무효이거나 `core_keywords`가 비면 1회 재시도, 그래도 비면 검색 생략.
 - planner는 doc_type on/off를 결정하지 않는다. 검색 대상 doc_type 축소는 운영 화이트리스트(`NTIS_RETRIEVAL_DOC_TYPES`)로만 한다.
+- **concept grounding(런타임 가드):** `concept_specs`의 각 concept은 그 `label`/`query_terms`/`evidence_terms`/`id` 중 하나가 **질의 원문 또는 `retrieval_core`에 실제 등장**해야 한다. 어느 것도 근거가 없으면(예: AI 무관 질의에 `ai` required concept 환각) 런타임이 그 concept을 결정론적으로 제거한다(`OpenAICompatPlanner._apply_request_constraints`, cache-hit·LLM 두 경로 공통). 일반어(시스템/연구/평가 등)는 grounding 근거로 인정하지 않는다. → 잘못된 required concept 하나가 relevance gate로 전체 후보를 탈락시키는 사고를 막는다(정밀도 보강, gate 로직 불변).
 
 ### 1.1 `hard_filters` 허용 키 (flat chunk 모델)
 

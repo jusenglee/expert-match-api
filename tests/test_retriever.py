@@ -320,6 +320,74 @@ def test_search_query_exact_when_planner_and_registry_miss():
     assert set(result.hits[0].matched_concepts) == {"메타물질", "음굴절"}
 
 
+def test_query_exact_ranks_by_fused_relevance_not_name():
+    # required concept이 없고 concept이 chunk에 확정되지 않는 질의(예: '논문 투고 시스템')에서,
+    # coverage 점수가 0으로 붕괴해 전 후보가 동점→이름순 정렬되던 회귀를 방지.
+    # 검색 상위(M2, 이름 'ZZZ')가 검색 하위(M1, 이름 'AAA')보다 관련도가 높으면 1위여야 한다.
+    points = [
+        (_chunk_payload("M2", "ZZZ", text="유체 펌핑 시스템 설계 연구"), 0.9),  # 검색 상위
+        (_chunk_payload("M1", "AAA", text="논문 데이터 분석 일반"), 0.5),       # 검색 하위
+    ]
+    client = FakeFlatClient(default_points=points)
+    result = _run(_retriever(client), query="논문 투고 시스템", core=["논문 투고 시스템"])
+
+    assert result.query_payload["concept_plan"]["source"] == "query_exact"
+    assert result.query_payload["relevance_gate_active_concepts"] == []  # required 없음 → gate 미작동
+    # 융합 관련도 순위 → 이름이 뒤인 M2가 1위(이름순이면 M1이 1위였을 것).
+    assert [hit.researcher_id for hit in result.hits] == ["M2", "M1"]
+    assert result.hits[0].group_score > 0  # 0 붕괴 아님
+
+
+def test_multiview_query_exact_drops_concept_views_and_uses_dense_dominant_weights():
+    # source-aware: required 없는 query_exact 질의는 concept:<id> sparse 뷰(노이즈 증폭원)를 만들지 않고
+    # dense-우세 가중을 쓴다. dense_full + sparse_raw + sparse_focus만, weights.dense_full=2.0.
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Meta", text="메타물질 음굴절 광학 소자"), 0.9)])
+    result = _run(_retriever(client), query="메타물질 음굴절 전문가", core=["메타물질", "음굴절"])
+
+    assert result.query_payload["concept_plan"]["source"] == "query_exact"
+    view_sources = result.query_payload["concept_plan"]["view_sources"]
+    assert not any(s.startswith("concept:") for s in view_sources)  # query_exact concept 뷰 미생성
+    assert set(view_sources) <= {"dense_full", "sparse_raw", "sparse_focus"}
+    assert result.query_payload["weights"]["view"]["dense_full"] == 2.0  # dense-우세 가중
+    # concept 뷰가 없으니 sparse 호출은 dense_full 외 sparse_raw/sparse_focus만(<=2).
+    assert sum(1 for c in client.calls if c["using"] == SPARSE_VECTOR_NAME) <= 2
+
+
+def test_multiview_required_concept_keeps_concept_views_and_default_weights():
+    # required concept 질의(gate 활성)는 기존 동작 유지: concept 뷰 생성 + 기본 search_view_weights.
+    client = FakeFlatClient(default_points=[(_chunk_payload("M1", "Alpha", text="인공지능 반도체 설계"), 0.9)])
+    result = _run(_retriever(client), query="인공지능 반도체", core=["인공지능", "반도체"], concept_specs=AI_SEMI_SPECS)
+
+    view_sources = result.query_payload["concept_plan"]["view_sources"]
+    assert any(s.startswith("concept:") for s in view_sources)  # required → concept 뷰 유지
+    assert result.query_payload["weights"]["view"]["dense_full"] == 1.0  # 기본 가중(dense-우세 아님)
+    assert result.query_payload["relevance_gate_active_concepts"] == ["ai", "semiconductor"]
+
+
+def test_multiview_generic_dense_signal_beats_sparse_substring_noise():
+    # 정밀도 회귀 방지(핵심): required 없는 질의에서 dense 의미신호(단일 dense_full)가, 흔한 토큰을
+    # 여러 sparse 뷰(sparse_raw + sparse_focus + concept 2개)에서 substring 매칭한 노이즈 후보를 이긴다.
+    # 구(舊) 동작(dense_full=1.0 + query_exact concept 뷰 생성)이었다면 sparse 다중매칭(누적 1.95)이
+    # dense(1.0)를 이겼다. dense-우세 가중 + concept 뷰 제거로 dense가 순위를 주도해야 한다.
+    dense_strong = _chunk_payload("M1", "DenseStrong", text="메타물질 음굴절 전용 연구")
+    sparse_noise = _chunk_payload("M2", "SparseNoise", text="일반 전문가 활동 기록")
+    client = FakeFlatClient(
+        points_by_view={
+            "dense": [(dense_strong, 0.95)],                            # dense에서만 강함
+            ("sparse", "메타물질 음굴절 전문가"): [(sparse_noise, 0.9)],  # sparse_raw
+            ("sparse", "메타물질 음굴절"): [(sparse_noise, 0.9)],         # sparse_focus
+            ("sparse", "메타물질"): [(sparse_noise, 0.9)],               # (구) concept:메타물질
+            ("sparse", "음굴절"): [(sparse_noise, 0.9)],                 # (구) concept:음굴절
+        }
+    )
+    result = _run(_retriever(client), query="메타물질 음굴절 전문가", core=["메타물질", "음굴절"])
+
+    ids = [hit.researcher_id for hit in result.hits]
+    assert set(ids) == {"M1", "M2"}
+    assert ids[0] == "M1"  # dense 의미신호가 sparse 다중매칭 노이즈를 이김
+    assert result.hits[0].group_score > result.hits[1].group_score
+
+
 # ---------------------------------------------------------------------------
 # org exclusion / invalid / empty
 # ---------------------------------------------------------------------------
