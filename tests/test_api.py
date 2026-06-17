@@ -6,8 +6,7 @@ from fastapi.testclient import TestClient
 from pathlib import Path
 from types import SimpleNamespace
 
-from apps.api.main import create_app
-from apps.api.playground import PLAYGROUND_HTML
+from apps.api.main import create_app, load_playground_html
 from apps.api.schemas import RecommendationResponse, ReadinessResponse
 from apps.core.config import Settings
 from apps.domain.models import RecommendationDecision
@@ -35,7 +34,11 @@ class FakeRecommendationService:
                     name="Hong Gildong",
                     fit="높음",
                     recommendation_reason="Publication evidence is available.",
-                    evidence=[{"type": "paper", "title": "Test paper"}],
+                    evidence=[
+                        {"type": "paper", "title": "Test paper", "date": "2023-01-01"},
+                        {"type": "project", "title": "Test project"},
+                    ],
+                    rank_score=80.0,
                     risks=[],
                 )
             ],
@@ -218,10 +221,70 @@ def test_recommend_endpoint_rejects_invalid_search_mode():
     assert response.status_code == 422  # Literal 검증 실패
 
 
+def test_open_api_relay_endpoint_maps_internal_recommendation():
+    service = FakeRecommendationService()
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=service,
+        validator=FakeValidator(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/openAPI", json={"query": "Recommend AI semiconductor reviewers"}
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    # 외부 계약에는 totalCount/items만 노출된다(trace/applied_filters 등 비노출).
+    assert set(payload.keys()) == {"totalCount", "items"}
+    assert payload["totalCount"] == 1
+
+    item = payload["items"][0]
+    assert set(item.keys()) == {"researcherId", "score", "reason", "evidences"}
+    assert item["researcherId"] == "1"
+    assert item["score"] == 0.8  # rank_score 80.0 → 0~1 정규화
+    assert item["reason"] == "Publication evidence is available."
+    assert item["evidences"] == [
+        {"type": "paper", "title": "Test paper", "date": "2023-01-01"},
+        {"type": "project", "title": "Test project", "date": None},
+    ]
+
+
+def test_open_api_relay_endpoint_normalizes_multiline_query_and_uses_defaults():
+    service = FakeRecommendationService()
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=service,
+        validator=FakeValidator(),
+    )
+    multiline_query = "인공지능 모델 개발\n벡터DB 구축"
+
+    with TestClient(app) as client:
+        response = client.post("/openAPI", json={"query": multiline_query})
+
+    assert response.status_code == 200
+    # /recommend와 동일한 정규화·기본 검색 모드(multiview)를 사용한다.
+    assert service.last_recommend_query == "인공지능 모델 개발, 벡터DB 구축"
+    assert service.last_search_mode == "multiview"
+
+
+def test_open_api_relay_endpoint_requires_query():
+    app = create_app(
+        settings=Settings(app_env="test", strict_runtime_validation=False),
+        service=FakeRecommendationService(),
+        validator=FakeValidator(),
+    )
+    with TestClient(app) as client:
+        response = client.post("/openAPI", json={})
+
+    assert response.status_code == 422  # query 필수
+
+
 def test_playground_distinguishes_profile_counts_from_query_evidence_counts():
-    assert "누적 논문" in PLAYGROUND_HTML
-    assert "이번 매칭 근거" in PLAYGROUND_HTML
-    assert "화면 표시 근거" in PLAYGROUND_HTML
+    playground_html = load_playground_html()
+    assert "누적 논문" in playground_html
+    assert "이번 매칭 근거" in playground_html
+    assert "화면 표시 근거" in playground_html
 
 
 def test_recommend_endpoint_normalizes_multiline_query_with_commas():

@@ -37,7 +37,7 @@ MAX_SELECTED_EVIDENCE_IDS = 4
 # recommendation_reason 서버측 상한(시스템 프롬프트 지시와 동일). LLM이 초과해도 결정론적으로 컷한다.
 REASON_MAX_CHARS = 320
 REASON_TOOL_NAME = "submit_recommendation_batch"
-REASON_GENERATION_MAX_TOKENS = 8192
+REASON_GENERATION_MAX_TOKENS = 32,768
 # evidence id == chunk_id 코덱: <doc_type>_<doc_id본문>_c<NNN>
 # doc_id 본문은 숫자(paper_100000045256_c000) 또는 연구자ID형(specialty_M1013800_c000) 모두 가능 → 끝의 _c<NNN>로만 앵커링.
 _DOC_TYPE_ALT = "|".join(re.escape(dt) for dt in DOC_TYPES)

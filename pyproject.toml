@@ -31,6 +31,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["apps*"]
 
+[tool.setuptools.package-data]
+"apps.api" = ["playground.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

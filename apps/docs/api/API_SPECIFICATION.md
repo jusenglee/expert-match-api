@@ -231,6 +231,54 @@
 }
 ```
 
+### 6) 외부 중계 (단순 추천) — `POST /openAPI`
+
+`/recommend`를 인프로세스로 호출한 뒤, 외부 소비자용으로 **단순화한 형태**(추천 점수·사유·근거만)로 변환해 반환하는 중계 엔드포인트다. 검색 옵션은 받지 않고 자연어 질의만 받으며, 내부적으로 `/recommend` 기본값(`search_mode=multiview`, planner 기본 `top_k`)을 사용한다. 인증 없음(내부망 전용), 스트리밍 미지원.
+
+> [!IMPORTANT]
+> `/recommend`와 동일하게 검색 결과가 없어도 `200 OK` + `items=[]`(이때 `totalCount=0`)를 반환한다. 내부 디버깅 필드(`trace`, `applied_filters`, `score_explanation`, `match_*` 등)는 노출하지 않는다.
+
+#### 요청
+```json
+{
+  "query": "인공지능 반도체 분야에서 최근 국책 과제 수행 경험이 있는 박사급 전문가 추천"
+}
+```
+- `query` (string, 필수): 자연어 질의. 여러 줄은 `, `로 합쳐 단일 질의로 정규화(`/recommend`와 동일).
+
+#### 응답 (`200 OK`)
+```json
+{
+  "totalCount": 1,
+  "items": [
+    {
+      "researcherId": "M1006328",
+      "score": 0.958,
+      "reason": "AI 반도체 국책 과제 수행과 관련 평가위원 활동 이력이 있습니다.",
+      "evidences": [
+        { "type": "project", "title": "차세대 지능형 반도체 설계", "date": "2023-01-01" },
+        { "type": "paper",   "title": "고체전해질 계면 안정성 연구",   "date": null }
+      ]
+    }
+  ]
+}
+```
+
+**응답 필드:**
+- `totalCount` (integer): 추천 항목 수(= `items` 길이).
+- `items` (list[object]):
+  - `researcherId` (string): 추천 연구자 식별자(내부 `expert_id` = `researcher_id`).
+  - `score` (float): 추천 점수. 내부 `rank_score`(RRF 집계 0~100 정규화)를 **0~1로 환산**한 값(`rank_score/100`). 상대 정규화 값이며 절대 적합도가 아니다.
+  - `reason` (string): 추천 사유(내부 `recommendation_reason`).
+  - `evidences` (list[object]): 질의에 **매칭된 근거**(`evidence`)만 포함한다. 질의 무관 참고 실적(`profile_evidence`)은 제외한다.
+    - `type` (string): 근거 유형 — `paper` / `patent` / `project` / `assessor_activity` / `specialty` / `profile`.
+    - `title` (string): 근거 제목.
+    - `date` (string|null): 근거 날짜(결측 시 `null`).
+
+내부 매핑 대응: `researcherId←expert_id`, `score←rank_score/100`, `reason←recommendation_reason`, `evidences←evidence[]`(type/title/date). 더 풍부한 내부 응답은 §2-1) `/recommend` 참조.
+
+---
+
 ## 3. 에러 처리
 - 입력 범위 초과: `422 Unprocessable Entity`
 - 백엔드 타임아웃/초기화 미완료: `503 Service Unavailable`

@@ -1,0 +1,1071 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NTIS 전문가 추천 시스템 - 테스트 베드</title>
+  <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --panel: rgba(30, 41, 59, 0.7);
+      --panel-border: rgba(255, 255, 255, 0.1);
+      --accent: #10b981;
+      --accent-glow: rgba(16, 185, 129, 0.2);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --user-msg: #334155;
+      --assistant-msg: rgba(30, 41, 59, 0.8);
+      --error: #ef4444;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+      --font: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, Roboto, "Helvetica Neue", "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f8fafc;
+        --panel: rgba(255, 255, 255, 0.8);
+        --panel-border: rgba(0, 0, 0, 0.05);
+        --text-main: #1e293b;
+        --text-muted: #64748b;
+        --user-msg: #e2e8f0;
+        --assistant-msg: #ffffff;
+        --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text-main);
+      background-color: var(--bg);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(16, 185, 129, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(59, 130, 246, 0.15) 0px, transparent 50%);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 1440px;
+      margin: 2rem auto;
+      padding: 0 1.5rem;
+      display: grid;
+      gap: 2rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 1rem;
+      animation: fadeInDown 0.8s ease-out;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      background: var(--accent-glow);
+      color: var(--accent);
+      border-radius: 9999px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      margin: 0;
+      letter-spacing: -0.025em;
+      background: linear-gradient(to right, #10b981, #3b82f6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    p.desc {
+      color: var(--text-muted);
+      font-size: 1.125rem;
+      margin-top: 0.5rem;
+    }
+
+    .glass-panel {
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--panel-border);
+      border-radius: 1.5rem;
+      box-shadow: var(--shadow);
+      padding: 2rem;
+      transition: transform 0.3s ease;
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 1.5rem;
+      background: rgba(0, 0, 0, 0.05);
+      border-radius: 100px;
+      margin-bottom: 2rem;
+    }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+
+    .dot.ok { background: var(--ok); box-shadow: 0 0 12px var(--ok); }
+    .dot.error { background: var(--error); box-shadow: 0 0 12px var(--error); }
+    .dot.loading { background: var(--warn); animation: pulse 1.5s infinite; }
+
+    .app-layout {
+      display: grid;
+      /* minmax(0, 1fr): 1fr 트랙의 암묵적 min-width:auto가 펼쳐진 패널의 min-content에
+         밀려 화면 밖으로 넘치는 것을 방지(우측 컬럼이 콘텐츠보다 작게도 줄어들 수 있게). */
+      grid-template-columns: 400px minmax(0, 1fr);
+      gap: 2rem;
+      align-items: start;
+    }
+
+    @media (max-width: 1024px) {
+      .app-layout { grid-template-columns: 1fr; }
+    }
+
+    .form-section {
+      position: sticky;
+      top: 2rem;
+    }
+
+    .input-group {
+      margin-bottom: 1.5rem;
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    textarea, input, select {
+      width: 100%;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--panel-border);
+      border-radius: 0.75rem;
+      padding: 0.75rem 1rem;
+      color: var(--text-main);
+      font-family: inherit;
+      font-size: 1rem;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    textarea:focus, input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    /* 드롭다운 옵션은 브라우저별로 부모 색을 무시하므로 테마 변수로 명시(다크/라이트 모두 가독). */
+    select option { background: var(--bg); color: var(--text-main); }
+
+    textarea { min-height: 120px; resize: vertical; }
+
+    .endpoint-selector {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .btn-toggle {
+      flex: 1;
+      padding: 0.75rem;
+      border-radius: 0.75rem;
+      border: 1px solid var(--panel-border);
+      background: transparent;
+      color: var(--text-muted);
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-toggle.active {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+
+    .btn-primary {
+      width: 100%;
+      padding: 1rem;
+      background: linear-gradient(135deg, #10b981, #059669);
+      color: white;
+      border: none;
+      border-radius: 1rem;
+      font-weight: 700;
+      font-size: 1.1rem;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+      box-shadow: 0 10px 15px -3px rgba(16, 185, 129, 0.4);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 20px 25px -5px rgba(16, 185, 129, 0.5);
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .chat-container {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      min-height: 600px;
+    }
+
+    .msg {
+      padding: 1.25rem 1.5rem;
+      border-radius: 1.25rem;
+      max-width: 85%;
+      position: relative;
+      animation: slideInUp 0.4s ease-out;
+    }
+
+    .msg.user {
+      align-self: flex-end;
+      background: var(--user-msg);
+      border-bottom-right-radius: 0.25rem;
+    }
+
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--assistant-msg);
+      border-bottom-left-radius: 0.25rem;
+      border: 1px solid var(--panel-border);
+      max-width: 100%;
+      width: 100%;
+    }
+
+    .msg .role {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 0.5rem;
+      opacity: 0.6;
+    }
+
+    .expert-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--panel-border);
+      border-radius: 1rem;
+      padding: 1.25rem;
+      margin-top: 1rem;
+    }
+
+    .expert-card h4 {
+      margin: 0 0 0.5rem 0;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+      gap: 0.75rem;
+      margin: 1rem 0;
+    }
+
+    .stat-box {
+      background: rgba(0, 0, 0, 0.2);
+      padding: 0.5rem;
+      border-radius: 0.5rem;
+      text-align: center;
+    }
+
+    .stat-box .label { font-size: 0.7rem; color: var(--text-muted); display: block; }
+    .stat-box .value { font-weight: 800; font-size: 1rem; }
+
+    .badge-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-top: 0.5rem;
+    }
+
+    .tag {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      background: rgba(16, 185, 129, 0.1);
+      color: #10b981;
+    }
+
+    details {
+      background: rgba(0, 0, 0, 0.1);
+      border-radius: 1rem;
+      padding: 0.75rem;
+      margin-top: 1rem;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    pre {
+      background: #000;
+      color: #10b981;
+      padding: 1rem;
+      border-radius: 0.5rem;
+      overflow: auto;
+      font-size: 0.85rem;
+      margin-top: 0.5rem;
+    }
+
+    /* ── 검색 점수 근거 패널: 증거 패널과 구분되는 인디고 분석형 카드 ── */
+    .score-details {
+      background: linear-gradient(180deg, rgba(99,102,241,0.10), rgba(99,102,241,0.02));
+      border: 1px solid rgba(129,140,248,0.28);
+      border-left: 3px solid #818cf8;
+      border-radius: 0.9rem;
+      padding: 0.8rem 1rem;
+      margin-top: 1rem;
+    }
+    .score-details > summary {
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.85rem;
+      color: #a5b4fc;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      list-style: none;
+    }
+    .score-details > summary::-webkit-details-marker { display: none; }
+    .score-details > summary::before { content: '📊'; font-size: 0.95rem; }
+    .score-panel { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 1rem; }
+    .score-hero {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      padding-bottom: 0.85rem;
+      border-bottom: 1px dashed rgba(255,255,255,0.12);
+    }
+    .score-hero .metric { display: flex; flex-direction: column; gap: 2px; }
+    .score-hero .metric .k {
+      font-size: 0.66rem; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .score-hero .metric .v { font-size: 1.55rem; font-weight: 800; color: #c7d2fe; line-height: 1; }
+    .score-hero .metric .v.sub { font-size: 1.05rem; color: var(--text-main); }
+    .cov-badge { padding: 4px 11px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }
+    .cov-joint { background: rgba(16,185,129,0.16); color: #34d399; }
+    .cov-separate { background: rgba(59,130,246,0.16); color: #60a5fa; }
+    .cov-partial { background: rgba(245,158,11,0.16); color: #fbbf24; }
+    .score-section-label {
+      font-size: 0.68rem; font-weight: 700; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 0.5rem;
+    }
+    .bar-row {
+      display: grid; grid-template-columns: 90px 1fr 72px;
+      align-items: center; gap: 0.65rem; margin-bottom: 0.4rem; font-size: 0.78rem;
+    }
+    .bar-row .bk { color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bar-track { height: 8px; background: rgba(255,255,255,0.07); border-radius: 999px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #6366f1, #a5b4fc); }
+    .bar-fill.neg { background: linear-gradient(90deg, #ef4444, #f87171); }
+    .bar-row .bv { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-main); font-weight: 600; }
+    .bar-row .bv.neg { color: #f87171; }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    .chip-concept {
+      padding: 3px 10px; border-radius: 6px; font-size: 0.73rem;
+      background: rgba(129,140,248,0.16); color: #a5b4fc; font-weight: 600;
+    }
+    .match-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .match-item {
+      display: flex; align-items: flex-start; gap: 0.65rem;
+      padding: 0.55rem 0.65rem; background: rgba(255,255,255,0.025);
+      border: 1px solid rgba(255,255,255,0.06); border-radius: 0.65rem;
+    }
+    .match-rank {
+      flex: 0 0 auto; width: 22px; height: 22px; border-radius: 6px;
+      background: rgba(99,102,241,0.22); color: #a5b4fc;
+      font-size: 0.7rem; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .match-body { flex: 1; min-width: 0; }
+    .match-top { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .doc-badge {
+      padding: 2px 8px; border-radius: 5px; font-size: 0.68rem; font-weight: 700;
+      background: rgba(129,140,248,0.14); color: #c7d2fe;
+    }
+    .match-title {
+      font-size: 0.8rem; font-weight: 600; color: var(--text-main);
+      flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .match-score {
+      margin-left: auto; font-size: 0.78rem; font-variant-numeric: tabular-nums;
+      color: #c7d2fe; font-weight: 700;
+    }
+    .match-meta { font-size: 0.7rem; color: var(--text-muted); margin-top: 3px; display: flex; flex-wrap: wrap; gap: 0.5rem; min-width: 0; }
+    /* id/경로처럼 끊기지 않는 긴 토큰이 카드 밖으로 삐져나가지 않도록 강제 줄바꿈. */
+    .match-meta span { overflow-wrap: anywhere; word-break: break-word; }
+
+    /* ── 수행 증거/참고 프로필 패널: 그린 액센트 실적 기록 카드 ── */
+    .evidence-details {
+      background: linear-gradient(180deg, rgba(16,185,129,0.08), rgba(16,185,129,0.015));
+      border: 1px solid rgba(16,185,129,0.22);
+      border-left: 3px solid var(--accent);
+      border-radius: 0.9rem;
+      padding: 0.8rem 1rem;
+      margin-top: 1rem;
+    }
+    .evidence-details.is-profile {
+      background: rgba(255,255,255,0.02);
+      border: 1px dashed rgba(148,163,184,0.3);
+      border-left: 3px dashed var(--text-muted);
+    }
+    .evidence-details > summary {
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.85rem;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      list-style: none;
+    }
+    .evidence-details.is-profile > summary { color: var(--text-muted); }
+    .evidence-details > summary::-webkit-details-marker { display: none; }
+    .evidence-details > summary::before { content: '🗂️'; font-size: 0.95rem; }
+    .evidence-details.is-profile > summary::before { content: '👤'; }
+    .ev-list { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 0.6rem; }
+    .ev-item {
+      display: flex; gap: 0.7rem; align-items: flex-start;
+      padding: 0.7rem 0.8rem;
+      background: rgba(255,255,255,0.025);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 0.7rem;
+    }
+    .ev-type {
+      flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+      gap: 3px; min-width: 54px; padding-top: 2px;
+    }
+    .ev-type .ic { font-size: 1.1rem; line-height: 1; }
+    .ev-type .lb {
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.02em;
+      padding: 1px 7px; border-radius: 999px;
+      background: rgba(16,185,129,0.14); color: #34d399; white-space: nowrap;
+    }
+    .ev-type.t-patent .lb { background: rgba(245,158,11,0.14); color: #fbbf24; }
+    .ev-type.t-project .lb { background: rgba(59,130,246,0.14); color: #60a5fa; }
+    .ev-type.t-assessor_activity .lb { background: rgba(168,85,247,0.14); color: #c084fc; }
+    .ev-type.t-specialty .lb { background: rgba(236,72,153,0.14); color: #f472b6; }
+    .ev-type.t-profile .lb { background: rgba(148,163,184,0.14); color: var(--text-muted); }
+    .ev-body { flex: 1; min-width: 0; }
+    .ev-title {
+      font-size: 0.88rem; font-weight: 600; color: var(--text-main); line-height: 1.4;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      overflow: hidden; word-break: break-word;
+    }
+    .ev-meta { margin-top: 0.35rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+    .ev-date {
+      font-size: 0.72rem; font-weight: 600; color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .ev-detail {
+      font-size: 0.72rem; padding: 2px 8px; border-radius: 5px;
+      background: rgba(16,185,129,0.12); color: #34d399; font-weight: 600;
+    }
+    .ev-snippet {
+      margin-top: 0.5rem; padding: 0.45rem 0.65rem;
+      font-size: 0.78rem; line-height: 1.5; color: var(--text-muted);
+      background: rgba(0,0,0,0.18); border-left: 2px solid rgba(16,185,129,0.4);
+      border-radius: 0 0.4rem 0.4rem 0;
+    }
+    .ev-id {
+      margin-top: 0.4rem; font-size: 0.64rem; color: rgba(148,163,184,0.6);
+      font-family: 'Fira Code', monospace; word-break: break-all;
+    }
+    .ev-empty { font-size: 0.85rem; margin-top: 0.6rem; color: var(--text-muted); }
+
+    @keyframes fadeInDown {
+      from { opacity: 0; transform: translateY(-20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes slideInUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.2); opacity: 0.6; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
+    .loading-dots:after {
+      content: ' .';
+      animation: dots 1.5s steps(5, end) infinite;
+    }
+
+    @keyframes dots {
+      0%, 20% { content: ' .'; }
+      40% { content: ' ..'; }
+      60% { content: ' ...'; }
+      80%, 100% { content: ''; }
+    }
+
+    /* 로그 콘솔 스타일 */
+    .log-console {
+      margin-top: 2rem;
+      background: #000;
+      color: #d1d5db;
+      border-radius: 1rem;
+      padding: 1.5rem;
+      font-family: 'Fira Code', 'Courier New', Courier, monospace;
+      font-size: 0.85rem;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+      max-height: 400px;
+      overflow-y: auto;
+      border: 1px solid var(--panel-border);
+    }
+    .log-console .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+      color: var(--accent);
+      font-weight: 700;
+      border-bottom: 1px solid #333;
+      padding-bottom: 0.5rem;
+    }
+    .log-line {
+      margin-bottom: 2px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.4;
+    }
+    .log-INFO { color: #10b981; }
+    .log-DEBUG { color: #94a3b8; }
+    .log-WARNING { color: #f59e0b; }
+    .log-ERROR { color: #ef4444; }
+    .log-CRITICAL { color: #ef4444; font-weight: bold; background: rgba(239, 68, 68, 0.1); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge">Experimental</div>
+      <h1>NTIS 전문가 AI 추천 시스템</h1>
+      <p class="desc">준비 상태를 확인하고 전문가 추천 결과를 즉시 테스트해보세요.</p>
+    </header>
+
+    <section class="glass-panel status-bar">
+      <div class="status-indicator">
+        <div class="dot" id="statusDot"></div>
+        <div>
+          <strong id="statusTitle">상태 확인 중...</strong>
+          <div id="statusText" style="font-size: 0.8rem; color: var(--text-muted)">시스템 모듈을 연결 중입니다.</div>
+        </div>
+      </div>
+      <button type="button" class="btn-toggle" id="refreshStatusButton" style="width: auto; padding: 0.5rem 1rem;">새로고침</button>
+    </section>
+
+    <section class="glass-panel" style="padding: 1.25rem 1.5rem;">
+      <details>
+        <summary>Readiness details</summary>
+        <pre id="readinessDetails">{}</pre>
+      </details>
+    </section>
+
+    <main class="app-layout">
+      <section class="glass-panel form-section">
+        <div class="endpoint-selector">
+          <button type="button" class="btn-toggle active" data-endpoint="/recommend">추천 전문가</button>
+          <button type="button" class="btn-toggle" data-endpoint="/search/candidates">후보자 목록</button>
+        </div>
+
+        <form id="chatForm">
+          <div class="input-group">
+            <label for="queryInput">자연어 질의</label>
+            <textarea id="queryInput" required placeholder="예: 인공지능 반도체 분야에서 최근 국책 과제 수행 경험이 있는 박사급 전문가를 추천해줘."></textarea>
+          </div>
+
+          <div class="input-group">
+            <label for="topKInput">추천 인원 수 (top_k)</label>
+            <input id="topKInput" type="number" min="1" max="15" placeholder="기본값 사용">
+          </div>
+
+          <div class="input-group">
+            <label for="searchModeInput">검색 방식 (search_mode)</label>
+            <select id="searchModeInput">
+              <option value="multiview" selected>멀티뷰 하이브리드 (기본)</option>
+              <option value="hybrid">하이브리드 (dense + SPLADE)</option>
+              <option value="keyword_similarity">키워드 검색 후 유사도 재정렬</option>
+            </select>
+          </div>
+
+          <details>
+            <summary>고급 필터 설정</summary>
+            <div style="margin-top: 1rem">
+              <div class="input-group">
+                <label for="filtersInput">필터 재정의 (JSON 형식)</label>
+                <textarea id="filtersInput" placeholder='{&#10;  "highest_degree": "박사",&#10;  "scie_publication_count_min": 1,&#10;  "research_project_count_min": 3&#10;}'></textarea>
+              </div>
+              <div class="input-group">
+                <label for="includeInput">검색 대상 기관 (소속 제한)</label>
+                <textarea id="includeInput" placeholder="줄바꿈 또는 쉼표로 구분하여 입력&#10;예: 한국과학기술정보연구원"></textarea>
+              </div>
+              <div class="input-group">
+                <label for="excludeInput">제외할 기관</label>
+                <textarea id="excludeInput" placeholder="줄바꿈 또는 쉼표로 구분하여 입력"></textarea>
+              </div>
+            </div>
+          </details>
+
+          <div style="margin-top: 2rem; display: flex; gap: 1rem">
+            <button type="submit" class="btn-primary" id="submitButton">쿼리 실행</button>
+            <button type="button" class="btn-toggle" id="clearButton" style="flex: 0 0 auto;">초기화</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="glass-panel chat-container">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--panel-border); padding-bottom: 1rem;">
+          <h3 style="margin:0">분석 결과 대화창</h3>
+          <div class="badge" id="modeChip" style="margin:0">/recommend</div>
+        </div>
+        <div id="chatLog" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 1rem;"></div>
+
+        <!-- 서버 로그 콘솔 영역 -->
+        <div class="log-console" id="logConsole" style="display: none;">
+          <div class="header">
+            <span>📟 SERVER REAL-TIME LOGS</span>
+            <button type="button" class="btn-toggle" style="padding: 2px 8px; font-size: 0.7rem;" onclick="document.getElementById('logContent').innerHTML=''">Clear</button>
+          </div>
+          <div id="logContent"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const state = { endpoint: '/recommend', loading: false };
+    const $ = (id) => document.getElementById(id);
+    const chatLog = $('chatLog');
+    const submitButton = $('submitButton');
+    const modeChip = $('modeChip');
+    const statusDot = $('statusDot');
+    const statusTitle = $('statusTitle');
+    const statusText = $('statusText');
+    const readinessDetails = $('readinessDetails');
+    const modeButtons = [...document.querySelectorAll('.endpoint-selector .btn-toggle')];
+
+    const escapeHtml = (val) => String(val ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    function buildRetrievalTraceMap(data) {
+      const traces = data?.trace?.retrieval_score_traces || [];
+      return new Map(traces.map(item => [item.expert_id, item]));
+    }
+
+    const DOC_TYPE_LABEL = {
+      paper: '논문', patent: '특허', project: '과제',
+      assessor_activity: '평가활동', specialty: '전문분야', profile: '프로필'
+    };
+    const BREAKDOWN_LABEL = {
+      joint: '동시 매칭', balance: '균형', concept: '개념 합',
+      support: '보조 근거', weak_penalty: '약근거 감점'
+    };
+    const FAMILY_LABEL = {
+      achievement: '실적', assessment: '평가', expertise: '전문성', identity: '정체성'
+    };
+    const COVERAGE_META = {
+      joint: { label: '동시 충족', cls: 'cov-joint' },
+      separate: { label: '개별 충족', cls: 'cov-separate' },
+      partial: { label: '부분 충족', cls: 'cov-partial' }
+    };
+
+    function fmtScore(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n.toFixed(3) : escapeHtml(v ?? '-');
+    }
+
+    function renderBars(obj, labelMap, sectionLabel, signed) {
+      const entries = Object.entries(obj || {})
+        .filter(([, v]) => Number.isFinite(Number(v)) && Number(v) !== 0);
+      if (!entries.length) return '';
+      const maxAbs = Math.max(...entries.map(([, v]) => Math.abs(Number(v))), 1e-9);
+      const rows = entries.map(([key, val]) => {
+        const v = Number(val);
+        const pct = Math.max(3, Math.round(Math.abs(v) / maxAbs * 100));
+        const neg = v < 0;
+        const sign = signed && v > 0 ? '+' : '';
+        return `<div class="bar-row">
+          <span class="bk">${escapeHtml(labelMap[key] || key)}</span>
+          <span class="bar-track"><span class="bar-fill ${neg ? 'neg' : ''}" style="width:${pct}%"></span></span>
+          <span class="bv ${neg ? 'neg' : ''}">${sign}${fmtScore(v)}</span>
+        </div>`;
+      }).join('');
+      return `<div><div class="score-section-label">${escapeHtml(sectionLabel)}</div>${rows}</div>`;
+    }
+
+    function renderConceptChips(concepts) {
+      const items = (concepts || []).filter(Boolean);
+      if (!items.length) return '';
+      return `<div><div class="score-section-label">매칭 개념</div>
+        <div class="chip-row">${items.map(c => `<span class="chip-concept">${escapeHtml(c)}</span>`).join('')}</div></div>`;
+    }
+
+    function renderMatchItems(items) {
+      const list = (items || []).filter(Boolean);
+      if (!list.length) return '';
+      const rows = list.map((it, i) => {
+        const dt = DOC_TYPE_LABEL[it.doc_type] || it.doc_type || '-';
+        const concepts = (it.concepts || []).filter(Boolean);
+        const displayOnly = (it.display_only_concepts || []).filter(Boolean);
+        const sources = (it.sources || []).filter(Boolean);
+        const meta = [
+          concepts.length ? `개념 ${concepts.map(escapeHtml).join(', ')}` : '',
+          displayOnly.length ? `제목만 ${displayOnly.map(escapeHtml).join(', ')}` : '',
+          sources.length ? `경로 ${sources.map(escapeHtml).join(', ')}` : '',
+          it.chunk_id ? `id ${escapeHtml(it.chunk_id)}` : ''
+        ].filter(Boolean).map(m => `<span>${m}</span>`).join('');
+        const score = it.score != null ? it.score : it.fused_score;
+        return `<div class="match-item">
+          <span class="match-rank">${it.rank != null ? escapeHtml(it.rank) : i + 1}</span>
+          <div class="match-body">
+            <div class="match-top">
+              <span class="doc-badge">${escapeHtml(dt)}</span>
+              ${it.title ? `<span class="match-title" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>` : ''}
+              ${score != null ? `<span class="match-score">${fmtScore(score)}</span>` : ''}
+            </div>
+            ${meta ? `<div class="match-meta">${meta}</div>` : ''}
+          </div>
+        </div>`;
+      }).join('');
+      return `<div><div class="score-section-label">매칭 청크 (상위 ${list.length})</div><div class="match-list">${rows}</div></div>`;
+    }
+
+    function renderScorePanel(d) {
+      const hasBreakdown = Object.keys(d.breakdown || {}).length > 0;
+      if (d.finalScore == null && !(d.items && d.items.length) && !hasBreakdown) return '';
+      const cov = COVERAGE_META[d.coverageType];
+      const covBadge = cov ? `<span class="cov-badge ${cov.cls}">${cov.label}</span>` : '';
+      const rankMetric = d.rankScore != null
+        ? `<div class="metric"><span class="k">표시 순위 점수</span><span class="v sub">${fmtScore(d.rankScore)}</span></div>` : '';
+      const hero = `<div class="score-hero">
+        <div class="metric"><span class="k">검색 원점수</span><span class="v">${fmtScore(d.finalScore)}</span></div>
+        ${rankMetric}
+        ${covBadge}
+      </div>`;
+      const body = [
+        hero,
+        renderBars(d.breakdown, BREAKDOWN_LABEL, '점수 구성', true),
+        renderConceptChips(d.matchedConcepts),
+        renderBars(d.familyContributions, FAMILY_LABEL, '영역별 기여', false),
+        renderMatchItems(d.items)
+      ].filter(Boolean).join('');
+      return `<details class="score-details">
+        <summary>검색 점수 근거</summary>
+        <div class="score-panel">${body}</div>
+      </details>`;
+    }
+
+    function renderRetrievalTrace(expertId, retrievalTraceMap) {
+      const trace = retrievalTraceMap.get(expertId);
+      if (!trace) return '';
+      return renderScorePanel({
+        finalScore: trace.final_score,
+        rankScore: null,
+        coverageType: trace.coverage_type,
+        breakdown: trace.score_breakdown,
+        matchedConcepts: trace.matched_concepts,
+        familyContributions: trace.family_contributions,
+        items: (trace.matches || []).map(m => ({
+          doc_type: m.doc_type, title: m.title, score: m.fused_score,
+          concepts: m.concepts, display_only_concepts: m.display_only_concepts,
+          sources: m.sources, rank: m.rank, chunk_id: m.chunk_id
+        }))
+      });
+    }
+
+    function renderMatchBadges(badges) {
+      const items = badges || [];
+      if (!items.length) return '';
+      return `<div class="badge-list">${items.map(item => `<span class="tag">${escapeHtml(item)}</span>`).join('')}</div>`;
+    }
+
+    function renderEvidenceSummary(summary) {
+      const data = summary || {};
+      const counts = data.total_profile_counts || {};
+      return `
+        <div class="stat-grid">
+          <div class="stat-box"><span class="label">누적 논문</span><span class="value">${escapeHtml(counts.article_cnt ?? 0)}</span></div>
+          <div class="stat-box"><span class="label">누적 특허</span><span class="value">${escapeHtml(counts.patent_cnt ?? 0)}</span></div>
+          <div class="stat-box"><span class="label">누적 과제</span><span class="value">${escapeHtml(counts.project_cnt ?? 0)}</span></div>
+          <div class="stat-box"><span class="label">이번 매칭 근거</span><span class="value">${escapeHtml(data.matched_evidence_count ?? 0)}</span></div>
+          <div class="stat-box"><span class="label">화면 표시 근거</span><span class="value">${escapeHtml(data.shown_evidence_count ?? 0)}</span></div>
+          <div class="stat-box"><span class="label">참고 프로필</span><span class="value">${escapeHtml(data.profile_evidence_count ?? 0)}</span></div>
+        </div>
+      `;
+    }
+
+    function renderScoreExplanation(recommendation, retrievalTraceMap) {
+      const explanation = recommendation.score_explanation || {};
+      const trace = retrievalTraceMap.get(recommendation.expert_id) || {};
+      const chunks = explanation.top_chunks || [];
+      if (!chunks.length && !Object.keys(explanation).length) {
+        return renderRetrievalTrace(recommendation.expert_id, retrievalTraceMap);
+      }
+      const breakdown = (explanation.score_breakdown && Object.keys(explanation.score_breakdown).length)
+        ? explanation.score_breakdown : trace.score_breakdown;
+      const source = chunks.length ? chunks : (trace.matches || []);
+      return renderScorePanel({
+        finalScore: explanation.final_score != null ? explanation.final_score : trace.final_score,
+        rankScore: explanation.rank_score,
+        coverageType: trace.coverage_type,
+        breakdown: breakdown,
+        matchedConcepts: trace.matched_concepts,
+        familyContributions: trace.family_contributions,
+        items: source.map(m => ({
+          doc_type: m.doc_type, title: m.title,
+          score: m.score != null ? m.score : m.fused_score,
+          concepts: m.concepts, display_only_concepts: m.display_only_concepts,
+          sources: m.sources, rank: m.rank, chunk_id: m.chunk_id
+        }))
+      });
+    }
+
+    const EV_TYPE_ICON = {
+      paper: '📄', patent: '🔖', project: '🧪',
+      assessor_activity: '⚖️', specialty: '🎯', profile: '👤'
+    };
+
+    function renderEvidenceItems(evidence) {
+      const items = (evidence || []).filter(Boolean);
+      if (!items.length) {
+        return '<div class="ev-empty">표시할 증거가 없습니다.</div>';
+      }
+      return `<div class="ev-list">
+        ${items.map(ev => {
+          const type = ev.type || '';
+          const ic = EV_TYPE_ICON[type] || '📁';
+          const label = DOC_TYPE_LABEL[type] || type || '기타';
+          const titleText = escapeHtml(ev.title || ev.chunk_id || '-');
+          // 제목과 사실상 같은 스니펫(specialty 경력 블롭 등)은 중복이라 숨긴다.
+          const t = (ev.title || '').trim();
+          const s = (ev.snippet || '').trim();
+          const showSnippet = s.length > 0 && !(t.length > 0
+            && (t.startsWith(s.slice(0, 40)) || s.startsWith(t.slice(0, 40))));
+          return `<div class="ev-item">
+            <div class="ev-type t-${escapeHtml(type)}">
+              <span class="ic">${ic}</span>
+              <span class="lb">${escapeHtml(label)}</span>
+            </div>
+            <div class="ev-body">
+              <div class="ev-title" title="${titleText}">${titleText}</div>
+              ${(ev.date || ev.detail) ? `<div class="ev-meta">
+                ${ev.date ? `<span class="ev-date">${escapeHtml(ev.date)}</span>` : ''}
+                ${ev.detail ? `<span class="ev-detail">${escapeHtml(ev.detail)}</span>` : ''}
+              </div>` : ''}
+              ${showSnippet ? `<div class="ev-snippet">${escapeHtml(ev.snippet)}</div>` : ''}
+              ${ev.chunk_id ? `<div class="ev-id">${escapeHtml(ev.chunk_id)}</div>` : ''}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`;
+    }
+
+    function pushMessage(role, html, isError = false) {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      if (isError) div.style.borderColor = 'var(--error)';
+
+      const label = role === 'user' ? '사용자 질의' : 'AI 분석 결과';
+      div.innerHTML = `<div class="role">${label}</div>${html}`;
+
+      chatLog.appendChild(div);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    function clearLog() {
+      chatLog.innerHTML = '';
+      pushMessage('assistant', '<p>검색할 내용을 입력하신 후 <b>쿼리 실행</b> 버튼을 눌러주세요.</p>');
+    }
+
+    async function updateStatus() {
+      statusDot.className = 'dot loading';
+      statusTitle.textContent = '확인 중...';
+      try {
+        const res = await fetch('/health/ready');
+        const data = await res.json();
+        readinessDetails.textContent = JSON.stringify(data, null, 2);
+        if (res.ok && data.ready) {
+          statusDot.className = 'dot ok';
+          statusTitle.textContent = '시스템 정상';
+          statusText.textContent = `${data.collection_name} 데이터베이스가 연결되었습니다.`;
+        } else {
+          statusDot.className = 'dot error';
+          statusTitle.textContent = '시스템 오류';
+          statusText.textContent = data.issues?.join(', ') || '준비 상태 확인 실패';
+        }
+      } catch (e) {
+        statusDot.className = 'dot error';
+        statusTitle.textContent = '연결 불가';
+        statusText.textContent = '서버에 연결할 수 없습니다.';
+        readinessDetails.textContent = JSON.stringify({ error: String(e) }, null, 2);
+      }
+    }
+
+    function setMode(ep) {
+      state.endpoint = ep;
+      modeChip.textContent = ep;
+      modeButtons.forEach(b => b.classList.toggle('active', b.dataset.endpoint === ep));
+    }
+
+    async function handleSearch(e) {
+      e.preventDefault();
+      if (state.loading) return;
+
+      const query = $('queryInput').value.trim();
+      if (!query) return;
+
+      const payload = {
+        query,
+        top_k: parseInt($('topKInput').value) || undefined,
+        search_mode: $('searchModeInput').value,
+        filters_override: $('filtersInput').value ? JSON.parse($('filtersInput').value) : {},
+        include_orgs: $('includeInput').value.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
+        exclude_orgs: $('excludeInput').value.split(/[\n,]/).map(s => s.trim()).filter(Boolean)
+      };
+
+      pushMessage('user', `<p>${escapeHtml(query)}</p>`);
+      state.loading = true;
+      submitButton.disabled = true;
+      submitButton.innerHTML = '<span class="loading-dots">분석 중</span>';
+
+      try {
+        const res = await fetch(state.endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+
+        if (!res.ok) throw new Error(data.detail || '요청 처리 중 오류가 발생했습니다.');
+
+        let html = '';
+        const retrievalTraceMap = buildRetrievalTraceMap(data);
+        if (state.endpoint === '/recommend') {
+          html = `
+            <p><b>분석 요약:</b> ${escapeHtml(data.intent_summary)}</p>
+            <div class="stat-grid">
+              <div class="stat-box"><span class="label">검색 대상</span><span class="value">${data.retrieved_count}명</span></div>
+              <div class="stat-box"><span class="label">최종 추천</span><span class="value">${data.recommendations.length}명</span></div>
+            </div>
+            ${data.recommendations.map(r => `
+              <div class="expert-card">
+                <h4>#${r.rank} ${escapeHtml(r.name)} <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500; margin-left: 0.5rem;">${escapeHtml(r.organization || '소속 미상')}</span> <span class="tag" style="margin-left: auto;">${r.fit}</span></h4>
+                ${renderMatchBadges(r.match_badges)}
+                ${r.match_summary ? `<div style="font-size: 0.9rem; margin: 0.5rem 0;"><b>매칭 요약:</b> ${escapeHtml(r.match_summary)}</div>` : ''}
+                ${renderEvidenceSummary(r.evidence_summary)}
+                <div style="font-size: 0.9rem; margin-bottom: 0.5rem"><b>추천 사유:</b> ${escapeHtml(r.recommendation_reason || '')}</div>
+                ${renderScoreExplanation(r, retrievalTraceMap)}
+                <details class="evidence-details">
+                  <summary>수행 증거 및 실적</summary>
+                  ${renderEvidenceItems(r.evidence)}
+                </details>
+                ${(r.profile_evidence && r.profile_evidence.length) ? `
+                <details class="evidence-details is-profile">
+                  <summary>참고 프로필 (질의 매칭 아님 · ${r.profile_evidence.length}건)</summary>
+                  ${renderEvidenceItems(r.profile_evidence)}
+                </details>` : ''}
+              </div>
+            `).join('')}
+          `;
+        } else {
+          html = `
+            <p><b>분석 요약:</b> ${escapeHtml(data.intent_summary)}</p>
+            <p>검색된 후보자 ${data.candidates.length}명의 목록입니다.</p>
+            ${data.candidates.map(c => `
+              <div class="expert-card">
+                <h4>${escapeHtml(c.name)} <span style="font-size: 0.8rem; color: var(--text-muted)">${escapeHtml(c.organization)}</span></h4>
+                <div class="stat-grid">
+                  <div class="stat-box"><span class="label">논문</span><span class="value">${c.counts.article_cnt}</span></div>
+                  <div class="stat-box"><span class="label">특허</span><span class="value">${c.counts.patent_cnt}</span></div>
+                  <div class="stat-box"><span class="label">과제</span><span class="value">${c.counts.project_cnt}</span></div>
+                  <div class="stat-box"><span class="label">심사</span><span class="value">${c.counts.assessor_cnt ?? 0}</span></div>
+                  <div class="stat-box"><span class="label">점수</span><span class="value">${c.shortlist_score.toFixed(2)}</span></div>
+                </div>
+                ${renderRetrievalTrace(c.expert_id, retrievalTraceMap)}
+              </div>
+            `).join('')}
+          `;
+        }
+        pushMessage('assistant', html);
+
+        // 서버 로그 출력 로직 추가
+        if (data.trace && data.trace.server_logs) {
+          const logConsole = $('logConsole');
+          const logContent = $('logContent');
+          logConsole.style.display = 'block';
+
+          data.trace.server_logs.forEach(msg => {
+            const line = document.createElement('div');
+            line.className = 'log-line';
+
+            // 레벨에 따른 색상 결정
+            const levelMatch = msg.match(/\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\]/);
+            if (levelMatch) line.classList.add(`log-${levelMatch[1]}`);
+
+            line.textContent = msg;
+            logContent.appendChild(line);
+          });
+          logConsole.scrollTop = logConsole.scrollHeight;
+        }
+      } catch (err) {
+        pushMessage('assistant', `<p style="color: var(--error)"><b>오류 발생:</b> ${escapeHtml(err.message)}</p>`, true);
+      } finally {
+        state.loading = false;
+        submitButton.disabled = false;
+        submitButton.textContent = '쿼리 실행';
+      }
+    }
+
+    modeButtons.forEach(b => b.addEventListener('click', () => setMode(b.dataset.endpoint)));
+    $('chatForm').addEventListener('submit', handleSearch);
+    $('clearButton').addEventListener('click', clearLog);
+    $('refreshStatusButton').addEventListener('click', updateStatus);
+    $('queryInput').addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') $('chatForm').requestSubmit();
+    });
+
+    clearLog();
+    updateStatus();
+  </script>
+</body>
+</html>

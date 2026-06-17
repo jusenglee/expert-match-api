@@ -2,7 +2,7 @@
 
 ## 범위
 
-- 대상 엔드포인트: `/recommend`, `/search/candidates`, `/feedback`, `/health`, `/health/ready`
+- 대상 엔드포인트: `/recommend`, `/search/candidates`, `/feedback`, `/health`, `/health/ready`, `/openAPI`
 - 포함 범위: HTTP 상태 코드, 응답 본문 필드, 하위 객체 필드, `trace` 계약, 하위 호환 alias
 - 제외 범위: 내부 구현 변경만 있는 커밋, 요청 파라미터만 바뀐 커밋
 
@@ -12,6 +12,7 @@
 
 | 날짜 | 커밋 | 영향도 | 변경 내용 |
 |---|---|---|---|
+| 2026-06-17 | `pending` | 신규 엔드포인트 | 외부 중계용 단순 추천 엔드포인트 `POST /openAPI`가 추가되었습니다. 자연어 질의(`{query}`)만 받아 내부 `/recommend`(기본 `multiview`)를 인프로세스로 호출하고, 외부용으로 단순화한 `{ totalCount, items[{ researcherId, score, reason, evidences[{type, title, date}] }] }`만 반환합니다. `score`는 내부 `rank_score`(0~100 정규화)를 0~1로 환산(`rank_score/100`)한 값이고, `evidences`는 질의 매칭 근거(`evidence`)만 포함합니다(`profile_evidence` 제외). `trace`/`applied_filters`/`score_explanation` 등 내부 디버깅 필드는 노출하지 않습니다. 인증 없음(내부망 전용)·스트리밍 미지원. 기존 엔드포인트의 응답 계약 변경은 없습니다. |
 | 2026-06-08 | `pending` | 확장/동작 | `/recommend.recommendations[*]`에 UI 설명 보조 필드 `match_badges`, `match_summary`, `match_details`, `score_explanation`, `evidence_summary`가 추가되었습니다. 기존 `recommendation_reason`, `evidence`, `rank_score`, `reasons`는 유지됩니다. `/recommend` 기본 추천 목록은 required concept 미충족 후보를 제외하고, `/recommend.trace.strict_filter`와 `/search/candidates.trace.strict_filter`는 required concept gate 활성 여부, required concept, `relevance_concepts_missing`으로 제외된 후보별 matched/missing concept를 노출합니다. |
 | 2026-06-08 | `pending` | 동작/trace 변경 | 사용자 노출 결과 수를 `/recommend`와 `/search/candidates` 모두 최대 15명으로 고정했습니다. 요청 `top_k`는 1~15만 허용하고, planner가 15 초과 값을 내도 `trace.top_k_used`가 15로 clamp됩니다. dense 검색은 `planner.semantic_query`를 우선 사용하고, concept 확정/gate는 `chunk_text`/`doc_id` 직접 evidence만 사용합니다(`doc_attrs` 값 제외). `/search/candidates.trace.top_k_used`가 추가되었습니다. |
 | 2026-06-04 | `v2.1.1` | **정책 정정** | hard_filter와 payload index 대상을 flat root 필드로 제한했습니다. `doc_attrs.*`는 유동 상세 필드이므로 `journal_class`→`doc_attrs.indexing_database` 매핑과 project `performing_organization`/`managing_agency` 기반 기관 필터를 제거했습니다. 기관 include/exclude는 root `affiliated_organization` 앱단 post-filter만 사용합니다. |

@@ -143,3 +143,45 @@ class ReadinessResponse(BaseModel):
     sample_point_id: str | None = Field(
         None, description="Optional validation sample point id"
     )
+
+
+# ---------------------------------------------------------------------------
+# [외부 중계 API] /openAPI 계약
+# 내부 /recommend(RecommendationResponse) 결과를 외부 소비자용 단순 형태로
+# 변환해 노출한다. trace/applied_filters 등 내부 디버그 필드는 제외하고,
+# 외부 계약에 명시된 필드(camelCase)만 그대로 사용한다.
+# ---------------------------------------------------------------------------
+class OpenApiRecommendRequest(BaseModel):
+    """[외부 중계 API] 요청. 자연어 질의(query)만 받는다."""
+
+    query: str = Field(..., description="Natural-language recommendation query")
+
+
+class OpenApiEvidence(BaseModel):
+    """외부 노출용 근거 1건. 내부 EvidenceItem의 type/title/date만 노출한다."""
+
+    type: Literal[
+        "paper", "patent", "project", "assessor_activity", "specialty", "profile"
+    ] = Field(..., description="근거 유형")
+    title: str = Field(..., description="근거 제목")
+    date: str | None = Field(None, description="근거 날짜 (없으면 null)")
+
+
+class OpenApiRecommendItem(BaseModel):
+    """외부 노출용 추천 항목 1건."""
+
+    researcherId: str = Field(..., description="추천 연구자 식별자")
+    score: float = Field(..., description="추천 점수 (0~1 정규화)")
+    reason: str = Field(..., description="추천 사유")
+    evidences: list[OpenApiEvidence] = Field(
+        default_factory=list, description="추천 근거 객체 배열"
+    )
+
+
+class OpenApiRecommendResponse(BaseModel):
+    """[외부 중계 API] 응답. 추천 항목 수와 항목 목록만 노출한다."""
+
+    totalCount: int = Field(..., description="추천 항목 수")
+    items: list[OpenApiRecommendItem] = Field(
+        default_factory=list, description="추천 항목 목록"
+    )

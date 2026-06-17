@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,10 +18,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from qdrant_client import QdrantClient
 import uvicorn
 
-from apps.api.playground import PLAYGROUND_HTML
 from apps.api.schemas import (
     FeedbackRequest,
     FeedbackResponse,
+    OpenApiEvidence,
+    OpenApiRecommendItem,
+    OpenApiRecommendRequest,
+    OpenApiRecommendResponse,
     ReadinessResponse,
     RecommendationRequest,
     RecommendationResponse,
@@ -67,6 +71,11 @@ from apps.search.sparse_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+_PLAYGROUND_HTML_PATH = Path(__file__).with_name("playground.html")
+
+
+def load_playground_html() -> str:
+    return _PLAYGROUND_HTML_PATH.read_text(encoding="utf-8")
 
 
 def _normalize_query_text(query: str) -> str:
@@ -98,6 +107,32 @@ def _log_api_query_received(
         _preview_items(request.exclude_orgs),
         normalized_query,
     )
+
+
+def _to_openapi_recommend_response(
+    response: RecommendationResponse,
+) -> OpenApiRecommendResponse:
+    """내부 추천 결과(RecommendationResponse)를 외부 중계 계약(/openAPI)으로 변환한다.
+
+    - researcherId ← expert_id
+    - score        ← rank_score(0~100 상대 정규화)를 0~1로 환산
+    - reason       ← recommendation_reason
+    - evidences    ← 질의 매칭 근거(evidence)만 type/title/date로 노출
+                     (profile_evidence 등 질의 무관 참고 실적은 제외)
+    """
+    items = [
+        OpenApiRecommendItem(
+            researcherId=decision.expert_id,
+            score=round(decision.rank_score / 100.0, 4),
+            reason=decision.recommendation_reason,
+            evidences=[
+                OpenApiEvidence(type=ev.type, title=ev.title, date=ev.date)
+                for ev in decision.evidence
+            ],
+        )
+        for decision in response.recommendations
+    ]
+    return OpenApiRecommendResponse(totalCount=len(items), items=items)
 
 
 def build_dense_encoder(settings: Settings):
@@ -347,7 +382,7 @@ def create_app(
     @app.get("/", include_in_schema=False, response_class=HTMLResponse)
     @app.get("/playground", include_in_schema=False, response_class=HTMLResponse)
     def playground() -> HTMLResponse:
-        return HTMLResponse(PLAYGROUND_HTML)
+        return HTMLResponse(load_playground_html())
 
     @app.get("/health/ready", response_model=ReadinessResponse)
     def readiness() -> ReadinessResponse | JSONResponse:
@@ -455,6 +490,43 @@ def create_app(
                 yield f"event: error\ndata: {json.dumps({'detail': str(e)})}\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @app.post("/openAPI", response_model=OpenApiRecommendResponse)
+    async def open_api_recommend(
+        request: OpenApiRecommendRequest,
+    ) -> OpenApiRecommendResponse:
+        """
+        [외부 중계 API]
+        내부 /recommend를 인프로세스로 호출한 뒤, 외부 소비자용 단순 응답
+        (totalCount/items[researcherId, score, reason, evidences])으로 변환해 반환합니다.
+        요청은 자연어 질의(query)만 받으며, 검색 옵션은 /recommend 기본값을 그대로 사용합니다.
+        """
+        service = get_service()
+        normalized_query = _normalize_query_text(request.query)
+        # 검색 옵션은 /recommend 기본값과 동일하게 사용한다(질의만 외부에서 받음).
+        internal_request = RecommendationRequest(query=normalized_query)
+        _log_api_query_received(
+            endpoint="/openAPI",
+            raw_query=request.query,
+            normalized_query=normalized_query,
+            request=internal_request,
+        )
+        result = await service.recommend(
+            query=normalized_query,
+            filters_override=internal_request.filters_override,
+            include_orgs=internal_request.include_orgs,
+            exclude_orgs=internal_request.exclude_orgs,
+            top_k=internal_request.top_k,
+            search_mode=internal_request.search_mode,
+        )
+        response = _to_openapi_recommend_response(
+            RecommendationResponse.model_validate(result)
+        )
+        logger.info(
+            "외부 중계 응답 준비 완료: endpoint=/openAPI items=%d",
+            response.totalCount,
+        )
+        return response
 
     @app.post("/search/candidates", response_model=SearchCandidatesResponse)
     async def search_candidates(
