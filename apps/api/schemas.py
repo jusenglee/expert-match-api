@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from apps.domain.models import RecommendationDecision
+
+# 사용자 선택형 검색 모드(요청별). 기본=multiview(현행 멀티뷰 하이브리드).
+# · multiview: dense_full + sparse_raw/focus + concept 멀티뷰 RRF 융합(기존).
+# · hybrid: dense + SPLADE 단일 뷰 단순 RRF 융합.
+# · keyword_similarity: SPLADE 키워드 1차 후보 → 그 안에서 dense 유사도로만 재정렬(2단계).
+SearchMode = Literal["multiview", "hybrid", "keyword_similarity"]
 
 
 class RecommendationRequest(BaseModel):
@@ -15,6 +21,14 @@ class RecommendationRequest(BaseModel):
     query: str = Field(..., description="Natural-language recommendation query")
     top_k: int | None = Field(
         default=None, ge=1, le=15, description="Maximum number of returned results"
+    )
+    search_mode: SearchMode = Field(
+        default="multiview",
+        description=(
+            "Retrieval strategy: 'multiview'(default multiview hybrid), "
+            "'hybrid'(dense+SPLADE simple RRF), "
+            "'keyword_similarity'(SPLADE keyword shortlist then dense-similarity rerank)"
+        ),
     )
     filters_override: dict[str, Any] = Field(
         default_factory=dict, description="Explicit search filter overrides"
@@ -63,6 +77,10 @@ class RecommendationResponse(BaseModel):
     searched_branches: list[str] = Field(
         ..., description="Branches used during retrieval"
     )
+    doc_type_coverage: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Global doc_type coverage: searched vs matched vs missing across recommendations",
+    )
     retrieved_count: int = Field(..., description="Total retrieved candidate count")
     recommendations: list[RecommendationDecision] = Field(
         ..., description="Final recommendation decisions"
@@ -80,18 +98,13 @@ class SearchCandidateItem(BaseModel):
     expert_id: str = Field(..., description="Expert identifier")
     name: str = Field(..., description="Expert name")
     organization: str | None = Field(None, description="Affiliated organization")
-    branch_presence_flags: dict[str, bool] = Field(
-        ..., description="Per-branch data presence flags"
+    doc_types_present: list[str] = Field(
+        default_factory=list, description="doc_type 종류(회수된 chunk 기준)"
     )
     counts: dict[str, int] = Field(..., description="Evidence counts by category")
     data_gaps: list[str] = Field(..., description="Candidate-specific data gaps")
     risks: list[str] = Field(..., description="Candidate-specific risks")
     shortlist_score: float = Field(..., description="Search shortlist score")
-    
-    # Support Rule 추적 정보
-    stable_hits: int = 0
-    expanded_hits: int = 0
-    support_branches: list[str] = Field(default_factory=list)
 
 
 class SearchCandidatesResponse(BaseModel):
@@ -129,4 +142,46 @@ class ReadinessResponse(BaseModel):
     collection_name: str = Field(..., description="Target Qdrant collection name")
     sample_point_id: str | None = Field(
         None, description="Optional validation sample point id"
+    )
+
+
+# ---------------------------------------------------------------------------
+# [외부 중계 API] /openAPI 계약
+# 내부 /recommend(RecommendationResponse) 결과를 외부 소비자용 단순 형태로
+# 변환해 노출한다. trace/applied_filters 등 내부 디버그 필드는 제외하고,
+# 외부 계약에 명시된 필드(camelCase)만 그대로 사용한다.
+# ---------------------------------------------------------------------------
+class OpenApiRecommendRequest(BaseModel):
+    """[외부 중계 API] 요청. 자연어 질의(query)만 받는다."""
+
+    query: str = Field(..., description="Natural-language recommendation query")
+
+
+class OpenApiEvidence(BaseModel):
+    """외부 노출용 근거 1건. 내부 EvidenceItem의 type/title/date만 노출한다."""
+
+    type: Literal[
+        "paper", "patent", "project", "assessor_activity", "specialty", "profile"
+    ] = Field(..., description="근거 유형")
+    title: str = Field(..., description="근거 제목")
+    date: str | None = Field(None, description="근거 날짜 (없으면 null)")
+
+
+class OpenApiRecommendItem(BaseModel):
+    """외부 노출용 추천 항목 1건."""
+
+    researcherId: str = Field(..., description="추천 연구자 식별자")
+    score: float = Field(..., description="추천 점수 (0~1 정규화)")
+    reason: str = Field(..., description="추천 사유")
+    evidences: list[OpenApiEvidence] = Field(
+        default_factory=list, description="추천 근거 객체 배열"
+    )
+
+
+class OpenApiRecommendResponse(BaseModel):
+    """[외부 중계 API] 응답. 추천 항목 수와 항목 목록만 노출한다."""
+
+    totalCount: int = Field(..., description="추천 항목 수")
+    items: list[OpenApiRecommendItem] = Field(
+        default_factory=list, description="추천 항목 목록"
     )
